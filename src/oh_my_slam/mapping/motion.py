@@ -66,6 +66,7 @@ HUBER_SCALE = 1.5
 MAX_EVALUATIONS = 60  # per least-squares pass
 MIN_PRIOR_SIGMA_ROT_DEG = 0.05
 MIN_PRIOR_SIGMA_POS_M = 0.0005
+RANSAC_CONFIDENCE = 0.999  # the essential matrix's RANSAC (the image start)
 MIN_BASELINE_M = 1e-4  # a shorter sent translation gives no epipolar geometry
 
 STATUSES = ("used", "baseline_short", "too_few_points", "pose_inconsistent", "no_overlap")
@@ -174,7 +175,8 @@ def image_start(ra: Array, rb: Array, f: float, t0: Array) -> tuple[Array, Array
     """The relative pose the matches give alone (essential matrix, RANSAC within ``INLIER_PX``,
     the chirality-consistent decomposition), its translation of the sent length; None
     without one."""
-    E, mask = cv2.findEssentialMat(rb[:, :2], ra[:, :2], np.eye(3), cv2.RANSAC, 0.999,
+    E, mask = cv2.findEssentialMat(rb[:, :2], ra[:, :2], np.eye(3), cv2.RANSAC,
+                                   RANSAC_CONFIDENCE,
                                    INLIER_PX / f)
     if E is None:
         return None
@@ -211,12 +213,13 @@ def pair(index: int, ref: Features, other: Features, K: Intrinsics, o: Other) ->
     T[:3, :3], T[:3, 3] = best.R, best.t
     change = rot_deg(best.R @ R0.T)
     out = Pair(index, "used", T, math.degrees(best.sigma_rot_rad), change)
+    ra_in = ra[best.inliers]
+    tri = triangulate(ra_in, rb[best.inliers], best.R, best.t, float(K.fx), best.sigma_rot_rad)
+    out.points = int(np.count_nonzero(tri.sigma < BASELINE_POINT_SIGMA_MAX))
     if change > POSE_K_SIGMA * o.sigma_rot_deg:
-        out.status = "pose_inconsistent"
+        out.status = "pose_inconsistent"  # its points are counted, never pooled
         return out
-    out.ra = ra[best.inliers]
-    out.tri = triangulate(out.ra, rb[best.inliers], best.R, best.t, f, best.sigma_rot_rad)
-    out.points = int(np.count_nonzero(out.tri.sigma < BASELINE_POINT_SIGMA_MAX))
+    out.ra, out.tri = ra_in, tri
     out.sigma_t_rel = o.sigma_pos_m / float(np.linalg.norm(t0))
     if out.sigma_t_rel > BASELINE_SIGMA_REL_MAX:
         out.status = "baseline_short"

@@ -18,9 +18,10 @@ import numpy as np
 import pytest
 
 from oh_my_slam.core.types import Intrinsics
-from oh_my_slam.mapping import motion
+from oh_my_slam.mapping import analysis, motion
 from oh_my_slam.mapping.anchored import Features, exp_so3, rot_deg
 from oh_my_slam.reconstruction import stereo
+from oh_my_slam.segmentation.api import Detection
 from tests.synth import stereo as syn
 from tests.unit.test_service_analyse import An, _knobs, an, decode, png
 
@@ -60,7 +61,7 @@ def frame(T: np.ndarray, part: str, sigma_pos_m: float = 0.002, sigma_rot_deg: f
 
 def analyse(an: An, v: dict[str, syn.Shot], frames: list[dict[str, Any]], height: float | None = None,
             outputs: tuple[str, ...] = ("depth", "depth_sigma", "range_scan"), ref: str = "ref",
-            status: int = 200, **extra: Any) -> dict[str, Any]:
+            status: int = 200, pose: bool = True, send_frames: bool = False, **extra: Any) -> dict[str, Any]:
     """The analysis of view ``ref`` in the client frame of its pose, with ``frames`` (their
     ``image`` the names of ``v``'s views)."""
     an.backend.mono_depth[hashlib.sha256(v[ref].jpeg).hexdigest()] = syn.model_depth(v[ref].depth)
@@ -68,9 +69,10 @@ def analyse(an: An, v: dict[str, syn.Shot], frames: list[dict[str, Any]], height
     cam: dict[str, Any] = dict(syn.HUMANOID)
     if height is not None:
         cam["height_above_floor_m"] = height
-    req = {"image": "ref", "camera": cam, "T_map_cam": v[ref].T.tolist(), "outputs": list(outputs),
-           "voxel_m": 0, **extra}
-    if frames:
+    req = {"image": "ref", "camera": cam, "outputs": list(outputs), "voxel_m": 0, **extra}
+    if pose:
+        req.setdefault("T_map_cam", v[ref].T.tolist())
+    if frames or send_frames:
         req["frames"] = frames
     files = {"ref": v[ref].jpeg, **{f["image"]: v[f["image"]].jpeg for f in frames
                                     if f["image"] in v}}
@@ -113,7 +115,12 @@ def test_a_side_step_with_its_exact_pose_gives_baseline_scale_and_metric_depth(
     refined = np.asarray(f["T_ref_frame_refined"])
     assert np.linalg.norm(refined[:3, 3]) == pytest.approx(0.10, abs=1e-6)  # |t| is the client's
     assert rot_deg(refined[:3, :3] @ T[:3, :3].T) < 0.1
-    assert 0.02 <= doc["scale_sigma_rel"] < 0.08 and "baseline_check" not in doc
+    m = motion.motion_stereo(views["ref"].rgb, None, K, others_of(views, "step10"),
+                             syn.model_depth(views["ref"].depth), K)
+    assert m.stereo is not None and m.frames[0].sigma_t_rel == pytest.approx(0.02, rel=0.02)
+    assert doc["scale_sigma_rel"] == pytest.approx(math.hypot(
+        m.frames[0].sigma_t_rel, m.stereo.fit.sigma_a, m.stereo.fit.spread), abs=2e-5)
+    assert "baseline_check" not in doc
     err = errors(depth_m(doc), views["ref"])
     assert err[0] < 0.01 and err[1] < 0.015 and err[2] < 0.03, err
     near = beam(doc, 0.0)
@@ -147,14 +154,15 @@ def test_a_head_pan_s_rotation_is_refined_on_the_images(an: An, views: dict[str,
 def test_a_rotation_10_degrees_off_is_inconsistent_unless_its_sigma_allows_it(
         an: An, views: dict[str, syn.Shot]) -> None:
     """The pan sent 10 degrees off: with sigma 1 degree the images' rotation lies beyond 3
-    sigma, ``pose_inconsistent`` (its refined pose reported, no points used, the frame's own
+    sigma, ``pose_inconsistent`` (its refined pose and points counted, none pooled, the frame's own
     scale); with sigma 5 degrees it is refined to the truth and used."""
     T = rel(views, "pan30")
     sent = T.copy()
     sent[:3, :3] = exp_so3(np.radians([0.0, 10.0, 0.0])) @ T[:3, :3]
     doc = analyse(an, views, [frame(sent, "pan30", 0.001, 1.0)])
     f = doc["motion"]["frames"][0]
-    assert (f["status"], f["points"], doc["scale_source"]) == ("pose_inconsistent", 0, "monocular")
+    assert (f["status"], doc["scale_source"]) == ("pose_inconsistent", "monocular")
+    assert f["points"] > 0  # the triangulated matches are counted whatever the status
     assert f["rotation_change_deg"] == pytest.approx(10.0, abs=0.2)
     assert rot_deg(np.asarray(f["T_ref_frame_refined"])[:3, :3] @ T[:3, :3].T) < 0.1
     assert depth_m(doc) == pytest.approx(depth_m(analyse(an, views, [])))  # as one frame
@@ -404,3 +412,228 @@ def test_without_a_pair_or_a_floor_the_baseline_check_says_monocular(
     assert doc["scale_source"] == "monocular"
     assert doc["baseline_check"] == {"baseline_scale_ratio": None, "sigma": None,
                                      "used": "monocular"}
+
+
+# -- the pooled scale, the status order, the boundaries -----------------------------------------
+
+
+def others_of(v: dict[str, syn.Shot], *names: str, sigma_pos_m: float = 0.002,
+              sigma_rot_deg: float = 0.5) -> list[motion.Other]:
+    return [motion.Other(v[n].rgb, None, rel(v, n), sigma_pos_m, sigma_rot_deg) for n in names]
+
+
+def test_the_pooled_scale_sigma_is_the_pairs_combined_by_their_points(
+        views: dict[str, syn.Shot]) -> None:
+    """One used pair: hypot(σ_t/|t|, the fit's standard error, its spread), exactly. Two used
+    pairs: σ_t/|t| the pairs' values combined by their shares of the pooled points,
+    sqrt(Σ (n_i/N)² (σ_t,i/|t_i|)²), and the one fit holds both pairs' points."""
+    v = views
+    mono = syn.model_depth(v["ref"].depth)
+    single = []
+    for name in ("step10", "pan30"):
+        m = motion.motion_stereo(v["ref"].rgb, None, K, others_of(v, name), mono, K)
+        p = m.frames[0]
+        assert p.status == "used" and m.stereo is not None and m.qualified
+        fit = m.stereo.fit
+        assert p.sigma_t_rel == pytest.approx(0.002 / np.linalg.norm(rel(v, name)[:3, 3]))
+        assert m.scale_sigma_rel == math.hypot(p.sigma_t_rel, fit.sigma_a, fit.spread)
+        single.append((p, fit.n))
+    both = motion.motion_stereo(v["ref"].rgb, None, K, others_of(v, "step10", "pan30"), mono, K)
+    assert [p.status for p in both.frames] == ["used", "used"] and both.stereo is not None
+    n = np.array([p.points for p in both.frames], np.float64)
+    assert [p.points for p in both.frames] == [p.points for p, _ in single]
+    want = math.sqrt(float(np.sum((n / n.sum()) ** 2 * np.array(
+        [p.sigma_t_rel for p in both.frames]) ** 2)))
+    fit = both.stereo.fit
+    assert both.scale_sigma_rel == math.hypot(want, fit.sigma_a, fit.spread)
+    assert max(k for _, k in single) < fit.n <= sum(k for _, k in single)  # both pairs' points
+    assert min(p.sigma_t_rel for p in both.frames) < want < max(p.sigma_t_rel
+                                                                  for p in both.frames)
+
+
+def test_status_precedence_and_the_boundaries_of_qualification(
+        monkeypatch: pytest.MonkeyPatch, views: dict[str, syn.Shot]) -> None:
+    """The first status that applies, in the order no_overlap, pose_inconsistent,
+    baseline_short, too_few_points; a pair qualifies at σ_t/|t| = 0.10 exactly, at 30 points
+    (29 does not) and at a rotation change of exactly 3 σ (a hair beyond does not)."""
+    v = views
+    assert (motion.BASELINE_SIGMA_REL_MAX, motion.BASELINE_MIN_POINTS, motion.POSE_K_SIGMA) == (
+        0.10, 30, 3.0)
+
+    def status(*frames: motion.Other, ref: str = "ref") -> list[motion.Pair]:
+        return motion.motion_stereo(v[ref].rgb, None, K, list(frames), None, K).frames
+
+    # pose_inconsistent over baseline_short: the pan 10 degrees off, σ_t/|t| 1.7
+    T = rel(v, "pan30")
+    off = T.copy()
+    off[:3, :3] = exp_so3(np.radians([0.0, 10.0, 0.0])) @ T[:3, :3]
+    p, = status(motion.Other(v["pan30"].rgb, None, off, 0.05, 1.0))
+    assert p.status == "pose_inconsistent" and p.sigma_t_rel == math.inf and p.points > 0
+    # baseline_short over too_few_points: the far wall's few points, σ_t/|t| 0.4
+    p, = status(motion.Other(v["far5"].rgb, None, rel(v, "far5", "far"), 0.02, 0.5), ref="far")
+    assert (p.status, p.points < 30) == ("baseline_short", True)
+    # no_overlap over baseline_short: no features, a translation too short to refine
+    tiny = np.eye(4)
+    tiny[0, 3] = 1e-5
+    p, = status(motion.Other(v["grey"].rgb, None, tiny, 0.002, 0.5))
+    assert (p.status, p.points) == ("no_overlap", 0)
+    # σ_t/|t| exactly at the bound qualifies, a hair over it does not
+    step = motion.Other(v["step10"].rgb, None, rel(v, "step10"), 0.002, 0.5)
+    p, = status(step)
+    assert p.status == "used"
+    monkeypatch.setattr(motion, "BASELINE_SIGMA_REL_MAX", p.sigma_t_rel)
+    assert status(step)[0].status == "used"
+    monkeypatch.setattr(motion, "BASELINE_SIGMA_REL_MAX", p.sigma_t_rel * (1 - 1e-9))
+    assert status(step)[0].status == "baseline_short"
+    monkeypatch.undo()
+    # the points: the bound itself qualifies, one more does not
+    monkeypatch.setattr(motion, "BASELINE_MIN_POINTS", p.points)
+    assert status(step)[0].status == "used"
+    monkeypatch.setattr(motion, "BASELINE_MIN_POINTS", p.points + 1)
+    assert status(step)[0].status == "too_few_points"
+    monkeypatch.undo()
+    # the rotation: the change equal to K x σ is within it, a hair less is not
+    sent = T.copy()
+    sent[:3, :3] = exp_so3(np.radians([0.6, 0.8, 0.0])) @ T[:3, :3]
+    pan = motion.Other(v["pan30"].rgb, None, sent, 0.001, 1.0)
+    p, = status(pan)
+    assert p.status == "used" and p.rotation_change_deg is not None
+    exact = p.rotation_change_deg
+    monkeypatch.setattr(motion, "POSE_K_SIGMA", exact)  # σ = 1: the bound is the change itself
+    assert status(pan)[0].status == "used"
+    monkeypatch.setattr(motion, "POSE_K_SIGMA", exact * (1 - 1e-9))
+    assert status(pan)[0].status == "pose_inconsistent"
+
+
+def test_four_frames_are_accepted_and_empty_frames_are_none(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """The most frames, four, are all analysed (and the used ones pooled); an empty ``frames``
+    is no frames: no ``motion``, the frame's own scale."""
+    v = views
+    frames = [frame(rel(v, "step10"), "step10"), frame(rel(v, "pan30"), "pan30", 0.002),
+              frame(rel(v, "step1"), "step1", 0.005), frame(rel(v, "step10"), "step10", 0.004)]
+    assert len(frames) == motion.MAX_MOTION_FRAMES
+    doc = analyse(an, v, frames)
+    assert [f["index"] for f in doc["motion"]["frames"]] == [0, 1, 2, 3]
+    assert [f["status"] for f in doc["motion"]["frames"]] == ["used", "used", "baseline_short",
+                                                              "used"]
+    assert doc["scale_source"] == "baseline"
+    empty = analyse(an, v, [], send_frames=True)
+    assert "motion" not in empty and "baseline_check" not in empty
+    assert empty["scale_source"] == "monocular"
+    with_height = analyse(an, v, [], send_frames=True, height=syn.HEAD_M)
+    assert "baseline_check" not in with_height and with_height["scale_source"] == "camera_height"
+
+
+def test_frames_without_a_pose_in_the_gravity_camera_frame(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """Without ``T_map_cam`` the frames still give the scale (``baseline``) and, with the
+    height, the baseline check against the gravity-aligned floor; a baseline far off takes the
+    height's scale; a baseline too short for its sigma gives the height's with a null ratio."""
+    v = views
+    an.backend.up = v["ref"].T[:3, :3].T @ np.array([0.0, 0.0, 1.0])
+    T = rel(v, "step10")
+    doc = analyse(an, v, [frame(T, "step10")], height=syn.HEAD_M, pose=False)
+    assert doc["frame"] == "gravity_camera" and doc["scale_source"] == "baseline"
+    assert doc["motion"]["frames"][0]["status"] == "used"
+    bc = doc["baseline_check"]
+    assert bc["used"] == "baseline" and bc["baseline_scale_ratio"] == pytest.approx(1.0, abs=0.05)
+    assert bc["sigma"] == pytest.approx(math.hypot(doc["scale_sigma_rel"], 0.02 / syn.HEAD_M),
+                                        abs=1e-4)
+    assert max(errors(depth_m(doc), v["ref"])) < 0.04
+    long = T.copy()
+    long[:3, 3] *= 1.4
+    off = analyse(an, v, [frame(long, "step10")], height=syn.HEAD_M, pose=False)
+    assert (off["scale_source"], off["baseline_check"]["used"]) == ("camera_height",
+                                                                   "camera_height")
+    short = analyse(an, v, [frame(rel(v, "step1"), "step1", 0.005)], height=syn.HEAD_M,
+                    pose=False)
+    assert short["scale_source"] == "camera_height"
+    assert short["baseline_check"] == {"baseline_scale_ratio": None, "sigma": None,
+                                       "used": "camera_height"}
+    assert short["scale_sigma_rel"] == pytest.approx(0.02 / syn.HEAD_M, abs=1e-5)
+    plain = analyse(an, v, [frame(T, "step10")], pose=False)
+    assert plain["scale_source"] == "baseline" and "baseline_check" not in plain
+
+
+def test_the_scale_sigma_of_the_depth_sigma_follows_the_scale_taken(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """The camera-height fallback (a baseline too short): ``depth_sigma`` combines the height's
+    sigma (0.02 m over the height, floored) with the correction's local one, never below the
+    scale's and not the single frame's constant."""
+    v = views
+    doc = analyse(an, v, [frame(rel(v, "step1"), "step1", 0.005)], height=syn.HEAD_M)
+    assert doc["scale_source"] == "camera_height"
+    assert doc["scale_sigma_rel"] == pytest.approx(0.02 / syn.HEAD_M, abs=1e-5)
+    d, s = decode(doc["depth"]), decode(doc["depth_sigma"]).astype(np.int64)
+    assert not s[d == 0].any() and (s[d > 0] > 0).all()
+    assert s[d > 0].min() >= round(doc["scale_sigma_rel"] * 1000) - 1
+    assert np.unique(s[d > 0]).size > 1
+    one = decode(analyse(an, v, [], height=syn.HEAD_M)["depth_sigma"])
+    assert np.unique(one[one > 0]).size == 1
+
+
+def test_in_the_map_frame_the_scale_and_its_sigma_are_the_map_s(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """The map's ``scale_source`` and sigma stand whatever the baseline says (no check), and
+    ``depth_sigma`` takes that sigma with the correction's local one."""
+    v = views
+    summary = an.get("/api/maps/t", "MapSummary")
+    doc = analyse(an, v, [frame(rel(v, "step10"), "step10")], map="t",
+                  outputs=("depth", "depth_sigma"), height=syn.HEAD_M)
+    assert doc["frame"] == "map" and "baseline_check" not in doc
+    assert (doc["scale_source"], doc["scale_sigma_rel"]) == (summary["scale_source"],
+                                                             summary["scale_sigma_rel"])
+    d, s = decode(doc["depth"]), decode(doc["depth_sigma"]).astype(np.int64)
+    assert not s[d == 0].any() and (s[d > 0] > 0).all()
+    assert s[d > 0].min() >= round(doc["scale_sigma_rel"] * 1000) - 1
+    assert np.unique(s[d > 0]).size > 1
+
+
+def test_a_turned_horizontal_in_the_map_frame_with_motion_stereo(
+        an: An, views: dict[str, syn.Shot], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pose pitched 7 degrees off the truth: the stereo depth's floor is turned onto the
+    pose's up axis (the rotation the height factor takes is the turned one) while the map
+    cloud's factor takes the pose as sent; the objects' ``centre_m`` land where the true pose
+    puts them and ``centre_cam_m`` (the camera's own frame) does not move."""
+    v = views
+    ref = v["ref"]
+    stool = ref.ids == 3
+    rows, cols = np.nonzero(stool)
+    det = Detection("stool", 0.9, "test", stool,
+                    (float(cols.min()), float(rows.min()), float(cols.max() + 1),
+                     float(rows.max() + 1)))
+    an.backend.detections[hashlib.sha256(ref.jpeg).hexdigest()] = [det]
+    sent = ref.T.copy()
+    sent[:3, :3] = ref.T[:3, :3] @ exp_so3(np.radians([7.0, 0.0, 0.0]))
+    seen: dict[str, list[np.ndarray]] = {"map": [], "height": []}
+    real_map, real_height = analysis.map_factor, analysis.height_factor
+
+    def spy_map(depth: Any, K_: Any, T: np.ndarray, cloud: Any) -> Any:
+        seen["map"].append(np.asarray(T))
+        assert real_map(depth, K_, T, cloud) is not None  # the cloud is seen as the pose has it
+        return None  # ... and left, so the height's factor decides (the turned rotation)
+
+    def spy_height(depth: Any, K_: Any, R: np.ndarray, *a: Any) -> Any:
+        seen["height"].append(np.asarray(R))
+        return real_height(depth, K_, R, *a)
+
+    frames = [frame(rel(v, "step10"), "step10")]
+    outputs = ("objects", "depth")
+    monkeypatch.setattr(analysis, "map_factor", spy_map)
+    monkeypatch.setattr(analysis, "height_factor", spy_height)
+    straight = analyse(an, v, frames, map="t", outputs=outputs)
+    assert seen["map"] and seen["height"]
+    seen["map"].clear()
+    seen["height"].clear()
+    turned = analyse(an, v, frames, map="t", outputs=outputs, T_map_cam=sent.tolist())
+    assert turned["frame"] == "map" and turned["motion"]["frames"][0]["status"] == "used"
+    assert seen["map"] and all(np.array_equal(T, sent) for T in seen["map"])  # as sent
+    assert seen["height"] and all(rot_deg(R @ ref.T[:3, :3].T) < 1.0 for R in seen["height"])
+    assert all(rot_deg(R @ sent[:3, :3].T) > 5.0 for R in seen["height"])  # the turned one
+    a, b = straight["objects"], turned["objects"]
+    assert len(a) == len(b) == 1 and a[0]["label"] == "stool"
+    assert b[0]["centre_cam_m"] == pytest.approx(a[0]["centre_cam_m"], abs=0.02)
+    assert b[0]["centre_m"] == pytest.approx(a[0]["centre_m"], abs=0.05)
+    untouched = ref.T[:3, :3] @ np.array(b[0]["centre_cam_m"]) + ref.T[:3, 3]
+    assert b[0]["centre_m"] == pytest.approx(untouched, abs=0.05)

@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.10) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.11) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -2200,22 +2200,31 @@ It is an update's own code on one frame, kept nowhere.
      takes the camera height's scale (`camera_height`); without a sent height, or without a
      floor plane in that shape to take it on, the frame is analysed exactly as one frame
      (`monocular` or `camera_height` on the model's depth).
+  * *Constants* (`mapping/motion.py`, `reconstruction/stereo.py`): `GATE_PX` = 4 (first inliers:
+    within 3 prior rotation sigmas as pixels + this), `MAX_EVALUATIONS` = 60 per least-squares
+    pass, `MIN_PRIOR_SIGMA_ROT_DEG` = 0.05, `MIN_PRIOR_SIGMA_POS_M` = 0.0005,
+    `RANSAC_CONFIDENCE` = 0.999 (the essential matrix), `CAUCHY_SCALE` = 3, `HUBER_SCALE` = 1.5;
+    `MIN_TRIANGULATED_Z_M` = 0.05, `PARALLAX_STEP` = 0.01, `FIT_MIN_POINTS` = 6,
+    `FIT_ITERATIONS` = 8, `FIT_HUBER` = 1.5, `FIT_SLOPE_MAX` = 0.6, `SPREAD_MIN` = 0.02,
+    `S2D_NEIGHBOURS` = 16, `S2D_POINT_FLOOR` = 0.03 (a point's σ(ln z) in the correction's
+    weights is at least this), `S2D_RADIUS_PX` = 25, `S2D_LNZ` = 0.15, `S2D_PRIOR` = 0.10.
   7. **Baseline check** (outside the map frame, with `frames` and `height_above_floor_m`):
      `baseline_scale_ratio` is `height_factor` of the baseline depth (the sent height over the
      camera's height above its floor plane: the camera-height scale over the baseline one) and
-     `sigma` = hypot(`scale_sigma_rel`, `height_sigma_m` / height) — both the sigma of ln of
-     the ratio; when |ln ratio| > `BASELINE_CHECK_K_SIGMA` = 3 × sigma the outputs take the
+     `sigma` = hypot(`scale_sigma_rel`, max((`height_sigma_m` or `DEFAULT_HEIGHT_SIGMA_M`) /
+     height, `MIN_SCALE_SIGMA_REL`)) — both the sigma of ln of the ratio (that second term is the
+     `scale_sigma_rel` the outputs take with the camera height); when |ln ratio| > `BASELINE_CHECK_K_SIGMA` = 3 × sigma the outputs take the
      ratio (`camera_height`, σ the height's, `used: camera_height`). Without a floor plane (or a
      ratio outside 0.2–5) the ratio and sigma are null and the baseline stays. Without a used
      pair the check is `{null, null, used}` with `used` what the outputs use: `camera_height`,
      or `monocular` when no floor lets the height scale the frame (`scale_source` the same).
   * **Beside a depth image** the depth is the sensor's: the frames are matched, refined and
     reported, the depth is not changed, `scale_source` stays `depth` and there is no
-    `baseline_check` (*spec doubt*: api.md does not say). **In the map frame** the stereo
+    `baseline_check` (api.md §7 "Beside other depth"). **In the map frame** the stereo
     depth (or shape) is brought onto the map as a monocular depth is (by the map's own rules
     above; its camera-height factor is then compared with the map's monocular scale k, which
     a near-metric stereo depth may fall outside of, leaving the cloud's factor): the scale
-    stays the map's and there is no `baseline_check` (*spec doubt*).
+    stays the map's and there is no `baseline_check` (api.md §7 "Beside other depth").
   * *Evaluation* (synthetic AiNex scenes with exact truth, `reports/motion_stereo_eval.md`
     §4–§8): obstacles 1.0 / 3.0 / 4.9 % median error at 0.2–0.5 / 0.5–1.0 / 1.0–1.5 m on side
     steps with an exact pose, 2.6 / 9.0 / 16.3 % on head pans of the 5.7 cm neck, against 5.2 /
