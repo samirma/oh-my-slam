@@ -563,6 +563,12 @@ The versions read, revert and `--keep-versions` are O2.
     `camera_height`, `used` `camera_height`.
   * Without a qualifying pair or a camera height, `scale_source` is `monocular`, as for one
     frame.
+  * **Beside other depth.** With a depth image, the frames are matched and reported in
+    `motion`, but the depth image is used as is, `scale_source` stays `depth` and there is no
+    `baseline_check`. In the map frame (`map` and `T_map_cam`), the motion-stereo depth takes
+    the map's scale rules like a monocular frame's, without `baseline_check`.
+  * A frame's `points` counts its triangulated matches with σ(ln z) below the bound, whatever
+    its status.
 * **Depth sigma** (oms/2.11). The output `depth_sigma` is σ(ln z) per pixel of `depth`, base64
   `uint16`, value × 0.001, 0 where `depth` is 0; also for a single frame (then the scale's sigma
   combined with the frame's own spread).
