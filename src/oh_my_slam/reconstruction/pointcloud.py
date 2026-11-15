@@ -47,6 +47,44 @@ def pixel_mask(depth: NDArray[Any], valid: NDArray[Any] | None = None,
     return m
 
 
+def supported_pixels(depth: NDArray[Any], margin_px: int, border_px: int,
+                     edge: float = _DEFAULT.edge) -> NDArray[np.bool_]:
+    """Pixels whose depth a surface may rest on (api.md §7 "Unsupported beams"): a valid depth
+    (finite, above 0) farther than ``margin_px`` pixels (Chebyshev) from every pixel without one
+    (the model's low-confidence pixels, which its validity mask leaves at 0, a sensor's holes,
+    ignored pixels) and from every depth edge (``depth_edge_mask`` at the relative jump
+    ``edge``, the flying-pixel rule of ``pixel_mask``), and outside the image's outer
+    ``border_px`` pixels on each side. A model's depth blends across an occlusion over a few
+    pixels, more than the 3 x 3 flying-pixel window sees, and bends at the image border."""
+    d = np.asarray(depth, np.float64)
+    valid = np.isfinite(d) & (d > 0)
+    bad = ~valid | depth_edge_mask(np.where(valid, d, 0.0), rel_threshold=edge)
+    if margin_px > 0:
+        bad = _grow(bad, margin_px)
+    out: NDArray[np.bool_] = ~bad
+    if border_px > 0:
+        out[:border_px] = False
+        out[-border_px:] = False
+        out[:, :border_px] = False
+        out[:, -border_px:] = False
+    return out
+
+
+def _grow(mask: NDArray[np.bool_], r: int) -> NDArray[np.bool_]:
+    """``mask`` dilated by a (2 ``r`` + 1)-pixel square (separable: rows, then columns)."""
+    out = np.asarray(mask, bool).copy()
+    for axis in (0, 1):
+        src = out.copy()
+        n = src.shape[axis]
+        for s in range(1, r + 1):
+            lo: list[slice] = [slice(None)] * 2
+            hi: list[slice] = [slice(None)] * 2
+            lo[axis], hi[axis] = slice(min(s, n), None), slice(None, max(n - s, 0))
+            out[tuple(lo)] |= src[tuple(hi)]
+            out[tuple(hi)] |= src[tuple(lo)]
+    return out
+
+
 def pixel_points(depth: NDArray[Any], K: Intrinsics, mask: NDArray[Any]) -> tuple[NDArray[Any], NDArray[Any]]:
     """Camera-frame points for ``mask`` pixels and their flat pixel indices (row-major)."""
     v, u = np.nonzero(mask)

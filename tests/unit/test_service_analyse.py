@@ -144,7 +144,7 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
                       "T_map_cam": T.tolist(), "outputs": ALL,
                       "labels": [" Apple ", "cup", "apple"]}, {"i": img, "d": dep})
     summary = before[0]
-    assert doc["frame"] == "map" and doc["schema"] == "oms/2.9"
+    assert doc["frame"] == "map" and doc["schema"] == "oms/2.10"
     assert (doc["scale_source"], doc["scale_sigma_rel"]) == (summary["scale_source"],
                                                              summary["scale_sigma_rel"])
     # a depth image with a pose asks the detector alone, as an interactive request, with the
@@ -196,9 +196,13 @@ def test_a_frame_in_the_map_frame_gets_the_map_s_ids_and_changes_nothing(
     assert len(hits) > 40 and all(on_a_surface(p) for p in hits)
     assert any(abs(p[0] + 3.0) < 0.06 for p in hits) and any(0 < p[0] < 1.2 for p in hits)
     ends = beam_points(doc, c, "floor_end")
-    assert len(ends) > 5 and (np.abs(ends[:, 0]) < 3.0).all() and (np.abs(ends[:, 1]) < 2.5).all()
+    # (a wall's foot within the floor band is floor: at the image's border, where no wall pixel
+    # is a supported one, it ends the floor)
+    assert len(ends) > 5 and (np.abs(ends[:, 0]) < 3.01).all() \
+        and (np.abs(ends[:, 1]) < 2.51).all()
     unseen = [b for b in scan if b["kind"] == "unseen"]
-    assert len(unseen) > 200 and all(b["range_m"] is None for b in unseen)
+    assert len(unseen) > 200 and all(b["range_m"] is None and b["support"] == 0 for b in unseen)
+    assert all(b["support"] >= analysis.MIN_BEAM_SUPPORT for b in scan if b["kind"] != "unseen")
     yaw = math.degrees(math.atan2(T[1, 2], T[0, 2]))  # nothing behind the camera is seen
     assert all(abs((b["bearing_deg"] - yaw + 180) % 360 - 180) < 60 for b in scan
                if b["kind"] != "unseen")
@@ -681,7 +685,9 @@ def test_an_analysis_answers_while_an_update_of_the_map_runs(
 
 
 def test_range_scan_beams() -> None:
-    def ring(bearing: float, r: float, z: float, n: int = 5) -> np.ndarray:
+    M = analysis.MIN_BEAM_SUPPORT
+
+    def ring(bearing: float, r: float, z: float, n: int = M) -> np.ndarray:
         b = math.radians(bearing)
         return np.tile([1.0 + r * math.cos(b), 2.0 + r * math.sin(b), z], (n, 1))
 
@@ -691,14 +697,18 @@ def test_range_scan_beams() -> None:
         ring(-90.0, 1.0, 2.5), ring(-90.0, 2.0, 0.055),  # above the band; within the floor band
         ring(45.0, 2.0, 0.0), ring(45.0, 1.5, 1.8),  # the floor, then an obstacle nearer
         ring(179.9, 2.0, 0.3), ring(-179.9, 1.0, 0.3),  # either side of ±180
-        ring(135.0, 1.0, 0.5, 2)])  # too few points
+        ring(135.0, 1.0, 0.5, M - 1)])  # too few points
     scan = analysis.range_scan(pts, np.array([1.0, 2.0, 1.3]), 0.0, 0.06, (0.05, 1.8), 45.0)
     got = {b["bearing_deg"]: (b["kind"], b["range_m"]) for b in scan}
+    held = {b["bearing_deg"]: b["support"] for b in scan}
     assert list(got) == [-135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0]
     assert got[0.0] == ("obstacle", 3.0) and got[90.0] == ("floor_end", 2.5)
     assert got[-90.0] == ("floor_end", 2.0) and got[45.0] == ("obstacle", 1.5)
     assert got[180.0] == ("obstacle", 1.0) and got[135.0] == ("unseen", None)
     assert got[-45.0] == ("unseen", None) and got[-135.0] == ("unseen", None)
+    # a return's support: the points within its window; a floor's: all its points
+    assert (held[0.0], held[45.0], held[180.0]) == (M, M, M)
+    assert (held[90.0], held[-90.0], held[135.0], held[-45.0]) == (2 * M + 2, M, 0, 0)
     # a step that does not divide 360: the end beams share what is left at ±180
     scan = analysis.range_scan(pts, np.array([1.0, 2.0, 1.3]), 0.0, 0.06, (0.05, 1.8), 70.0)
     got = {b["bearing_deg"]: (b["kind"], b["range_m"]) for b in scan}
@@ -709,7 +719,41 @@ def test_range_scan_beams() -> None:
     assert {b["bearing_deg"]: b["kind"] for b in scan} == {
         -90.0: "obstacle", 0.0: "unseen", 90.0: "unseen", 180.0: "unseen"}
     scan = analysis.range_scan(np.zeros((0, 3)), np.zeros(3), 0.0, 0.06, (0.05, 1.8), 360.0)
-    assert scan == [{"bearing_deg": 0.0, "range_m": None, "kind": "unseen"}]
+    assert scan == [{"bearing_deg": 0.0, "range_m": None, "kind": "unseen", "support": 0}]
+
+
+def test_unsupported_returns_hold_no_beam() -> None:
+    """api.md §7 "Unsupported beams" (oms/2.10): only supported points hold a return; a beam
+    whose returns are all unsupported is unseen, never a short-range obstacle; one return is
+    the points within its window, however they spread in it."""
+    M = analysis.MIN_BEAM_SUPPORT
+
+    def ring(bearing: float, r: float, z: float, n: int = M) -> np.ndarray:
+        b = math.radians(bearing)
+        return np.tile([r * math.cos(b), r * math.sin(b), z], (n, 1))
+
+    phantom, wall = ring(0.0, 0.4, 0.3, 50), ring(0.0, 2.0, 0.5, 2 * M)
+    floor_only = ring(90.0, 0.5, 0.3, 50)  # unsupported, before a supported floor
+    pts = np.vstack([phantom, wall, ring(-90.0, 0.4, 0.3, 50), floor_only,
+                     ring(90.0, 1.5, 0.0, M), ring(180.0, 2.0, 0.5, M // 2),
+                     ring(180.0, 2.08, 0.5, M - M // 2)])
+    ok = np.ones(len(pts), bool)
+    ok[:50] = False  # the phantom at 0.4 m: border, edge or low-confidence pixels
+    ok[50 + 2 * M:50 + 2 * M + 100] = False  # the beam at -90: all its returns; at 90: the near
+    scan = {b["bearing_deg"]: b for b in analysis.range_scan(
+        pts, np.zeros(3), 0.0, 0.06, (0.05, 1.8), 90.0, ok)}
+    assert (scan[0.0]["kind"], scan[0.0]["range_m"], scan[0.0]["support"]) == (
+        "obstacle", 2.0, 2 * M)
+    assert (scan[-90.0]["kind"], scan[-90.0]["range_m"], scan[-90.0]["support"]) == (
+        "unseen", None, 0)
+    assert (scan[90.0]["kind"], scan[90.0]["range_m"]) == ("floor_end", 1.5)
+    # 2.0 and 2.08 m: one return (its window 0.10 m), held by both
+    assert (scan[180.0]["kind"], scan[180.0]["range_m"], scan[180.0]["support"]) == (
+        "obstacle", 2.0, M)
+    # every point supported: the phantom is the nearest return
+    every = {b["bearing_deg"]: b for b in analysis.range_scan(
+        pts, np.zeros(3), 0.0, 0.06, (0.05, 1.8), 90.0)}
+    assert (every[0.0]["range_m"], every[0.0]["support"]) == (0.4, 50)
 
 
 def _floor_and_wall() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -807,7 +851,9 @@ def test_objects_of_a_view_are_boxed_filtered_and_matched() -> None:
     thin = analysis.thinned(pts, 0.1)
     assert len(thin.xyz) < len(pts.xyz) / 10 and len(thin.rgb) == len(thin.object_id) == len(thin.xyz)
     assert analysis.thinned(pts, 0.0) is pts
-    empty = analysis.FramePoints(np.zeros((0, 3)), np.zeros(0, np.uint32), np.zeros((0, 3), np.uint8))
+    assert len(thin.supported) == len(thin.xyz) and pts.supported.any()
+    empty = analysis.FramePoints(np.zeros((0, 3)), np.zeros(0, np.uint32), np.zeros((0, 3), np.uint8),
+                                 np.zeros(0, bool))
     assert analysis.thinned(empty, 0.1) is empty
     assert analysis.objects(View("frame", T, 0.0, K_TABLE, z, rgb, []), None, 0.02, 0.5, []) == []
 
@@ -873,4 +919,5 @@ def test_the_scale_check_is_absent_in_the_map_frame_and_empty_without_a_floor_pl
     doc = an.analyse({"image": "i", "outputs": ["depth"], "T_map_cam": T.tolist(),
                       "camera": {**CAM, "height_above_floor_m": 0.9}}, {"i": flat})
     assert doc["scale_check"] == {"sent_height_m": 0.9, "model_height_m": None, "ratio": None,
-                                  "floor_inlier_share": 0.0, "depth_source": "monocular"}
+                                  "floor_inlier_share": 0.0, "depth_source": "monocular",
+                                  "floor_tilt_deg": None}

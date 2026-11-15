@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.9) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.10) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.8; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.10; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -2039,6 +2039,43 @@ It is an update's own code on one frame, kept nowhere.
   decimals. A depth image with no value is none: the source is then `monocular`. It is not
   produced in the map frame (the map's floor is the version's, and the depth is aligned onto the
   map), nor when the sent height is not above the floor (<= 0, ignored as for the scale).
+  `floor_tilt_deg` (oms/2.10) is the angle between that plane's normal, in the raw depth, and
+  the up axis used (the pose's; the estimated gravity in `gravity_camera`), rounded to 3
+  decimals, null without the plane: the tilt measured before any turn (below). Only a plane
+  within `FLOOR_TILT_DEG` = 10° of the up axis is a floor plane at all, so a depth tilted
+  further shows none and is used as measured.
+* **Horizontal from the pose** (oms/2.10, api.md §7; `analysis.horizontal`). With `T_map_cam`
+  (frame `map` or `client`) and a monocular depth, the frame's floor plane is found in the raw
+  depth levelled by the pose's rotation (the floor check's choice, `own_floor_plane`, near the
+  sent height within its `floor_band`; the lowest plane without a sent height). When its normal
+  lies more than `TILT_K_SIGMA` × `sigma_tilt_deg` (3 × 2° by default,
+  `SIGMA_TILT_DEFAULT_DEG`) from the pose's up axis, the depth is lifted with the pose's
+  rotation preceded by the smallest rotation taking that normal onto +z (`onto_up`, about a
+  horizontal axis): a turn about the camera centre, so every range and the plane's distance
+  stay, and the scale is still the sent height over that distance (only the floor's height is
+  fitted, now along the up axis). The turned rotation replaces the pose's for everything the
+  depth gives: the scale on the floor (`height_factor`), the floor (`own_floor_z`), objects,
+  points, the range scan, and `centre_cam_m` (taken back through the same rotation, so it is
+  the box centre in the frame the depth's pixels were lifted from). It does not replace it for
+  `map_factor`, where the map's cloud is projected into the image: that compares ranges, which
+  the turn keeps, at the pixels the image really sees them. The depth output is the depth per
+  pixel, unchanged by the turn. A sensor depth, a depth without a measurable floor plane and
+  the `gravity_camera` frame (whose up axis is the gravity the model estimates, already refined
+  by the floor plane) are used as measured. The update path (map.md §2) is unchanged: this is
+  frame analysis only.
+  *Measured* (2026-11-15, M3 Pro, a scratch service on the resident inference server, the 15
+  keyframes of `dev_ainex_loop9` — the humanoid's head camera, 0.37 m high, 18.7° down — at
+  their robot poses, with their per-frame ignore masks, `range_scan` alone): the floor of
+  MoGe's depth tilted 2.9–8.1° from the robot's up axis (median 5.2°). The four beyond 6° were
+  turned: their median obstacle range went from 0.50–0.62 m as measured (the floor rising into
+  the obstacle band, 27–48 beams under 0.5 m in two of them) to 1.02–1.85 m, the as-measured
+  ranges 0.32–0.44 × the turned ones per beam, and the turned medians within 0.02–0.30 m of
+  those of the same frames analysed without a pose (GeoCalib's gravity refined by the floor)
+  but one (1.02 against 1.71 m). With `sigma_tilt_deg` 1 (3° bound) 13 of the 15 frames were
+  turned, and the medians of the 4.4–5.7° frames went from 0.62–0.79 m to 1.07–1.68 m, nearer
+  their gravity-frame ones (1.05–2.72 m): a client whose pose's tilt is good to 1° should send
+  it. A range scan with a pose took 0.87–0.99 s per frame (0.74 s before, *Measured* below:
+  the floor plane is now looked for once more, before the scale).
 * **Objects.** The detections are lifted and filtered as a keyframe's
   (`anchored_objects.observe`: exclusive masks, no support fringe, no floor named as an object,
   no opening, nothing nearer than 12 cm, no mask over 40 % of the image), boxed as a sighting is
@@ -2082,6 +2119,28 @@ It is an update's own code on one frame, kept nowhere.
   map.md §6); else `floor_end`: the farthest point within the floor band; nearest and farthest
   are the beam's third point, so one or two flying pixels are no surface. Ranges are horizontal,
   from the camera, with no cap. `z_band_m` needs its top above its bottom.
+  **Unsupported beams** (oms/2.10; `reconstruction.pointcloud.supported_pixels`,
+  `analysis.range_scan`). Only the points of supported pixels hold a return: a valid depth more
+  than `BEAM_MARGIN_PX` = 3 px (Chebyshev) from every pixel without depth (the model's
+  low-confidence pixels, which MoGe's validity mask leaves at 0 — its mask is binary, so this
+  is the confidence there is; a sensor's holes; ignored pixels, whose edge is the model's blend
+  with what they hide) and from every depth edge (the flying-pixel rule, a 4 % jump in a 3 × 3
+  window), and outside the image's outer `BEAM_BORDER_REL` = 2 % of its larger side (13 px on
+  the 640 px grid). A model's depth blends across an occlusion over a few pixels, wider than
+  the 3 × 3 window, and its depth bends at the border (`reconstruction.borders`: up to 6 % in
+  the outer 15 %, which is a scale error, not a phantom; the band here only drops the outer
+  rows and columns where the bend and the resampling are largest, keeping the beams of the
+  whole field of view). An obstacle return is the nearest point whose window — itself and the
+  points up to max(`RETURN_TOL_M` = 0.05 m, `RETURN_TOL_REL` = 5 % of its range) beyond it —
+  holds at least `MIN_BEAM_SUPPORT` = 12 supported points, its range that window's third point
+  and its `support` their number; a floor end needs as many supported floor points in the
+  beam, all of which hold it (`support`). A beam whose returns are all unsupported is
+  `unseen`, `support` 0, never a short-range `obstacle`; one with no supported obstacle return
+  but a supported floor is a `floor_end`. 12 pixels: a 1° beam is 4–5 px wide at the image
+  centre on the 640 px grid at fx 270 (0.5 px at the 0.1° minimum step), so a wall or a chair
+  leg at a few metres holds tens to hundreds of pixels, while a phantom of a few pixels along
+  an edge does not; the table scene's and the humanoid's walls hold 30–900 (the smoke test
+  above: median support 24–879 a frame).
 * **Depth output.** The schema's `Binary` (`uint16`, the image's rows × columns, 0 = no value)
   in millimetres (metres = value × 0.001, fixed, whatever the camera's `depth_scale_m`, with
   which the input is read; a non-finite value is 0, beyond 65.535 m it saturates), at the outputs' scale, on the pixels of the image
