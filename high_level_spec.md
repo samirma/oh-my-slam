@@ -225,6 +225,11 @@ the images, triangulates, and gives the reference frame metric depth with `scale
 height, a `motion` report per frame, and the `depth_sigma` output (api.md §7). `ScaleSource`
 gains `baseline`.
 
+**oms/2.12** changes behaviour with no change of shape: `monocular` `scale_sigma_rel` is a
+constant measured against truth, as one sigma of the scale's logarithm (map.md §1); a located
+pose's position sigma includes the reference depth's scale error, and locate forms hypotheses
+from separate groups of reference keyframes, so a biased solution meets a rival (api.md §6).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

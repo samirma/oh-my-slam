@@ -390,6 +390,11 @@ The versions read, revert and `--keep-versions` are O2.
   client that fuses the answer with its own prior does not count the prior twice.
   * σ_rel = hypot(scale × covariance σ, floor[depth kind / none]), for position and rotation
     separately: the registration covariance sigma in map metres, and the noise floor below.
+  * **Reference scale** (oms/2.12). When the located pose rests on points lifted from stored
+    depth, the position sigma also holds the reference depth's scale error: hypot(σ_rel,
+    s × d), with s the `scale_sigma_rel` of the depth those points came from (the map's, or a
+    monocular keyframe's own) and d the median distance from the located camera to its inlier
+    points. A pose on triangulated points only has no such term.
   * σ_rel is combined with the reference keyframe's map sigma only while
     `locate.sigma_containment` and `locate.sigma_tightness_bound` (evaluation.md) both hold.
     If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported
@@ -421,7 +426,9 @@ The versions read, revert and `--keep-versions` are O2.
     Locate uses the `none` column.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
-    it.
+    it. Hypotheses come from separate groups of reference keyframes (oms/2.12), each
+    solved on its own correspondences, as well as from subsets of one group, so that one biased
+    solution meets a rival when another group of references disagrees.
   * A hypothesis's support is its inlier count over the best hypothesis's inlier count (at most
     1). A rival is supported when its support is at least 0.25, whatever else its inliers
     explain.
