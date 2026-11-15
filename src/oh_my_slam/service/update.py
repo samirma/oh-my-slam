@@ -64,6 +64,7 @@ from oh_my_slam.mapping.anchored import (
     coverage,
     duplicate_among,
     features,
+    floor_band,
     floor_spread,
     floor_verdict,
     lowest_layer,
@@ -1192,7 +1193,9 @@ class Updater:
                 return None
             depth = np.asarray(d, np.float32)
             K = fr.cam.canonical().resized(depth.shape[1], depth.shape[0])
-        own = own_floor(depth, K, fr.pose[:3, :3], h)
+        hs = fr.work.height_sigma_m if fr.work.height_m is not None else fr.cam.height_sigma_m
+        own = own_floor(depth, K, fr.pose[:3, :3], h,
+                        floor_band("sensor" if _has_depth(fr) else "mono", h, hs))
         return None if own is None else h / own
 
     @staticmethod

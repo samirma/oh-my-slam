@@ -176,6 +176,7 @@ def test_the_older_mapper_measures_a_registered_frames_floor() -> None:
 
     class Cam:
         height_above_floor_m = 0.5
+        height_sigma_m = None
 
         @staticmethod
         def canonical() -> Intrinsics:
@@ -183,6 +184,7 @@ def test_the_older_mapper_measures_a_registered_frames_floor() -> None:
 
     class Work:
         height_m: float | None = None
+        height_sigma_m: float | None = None
 
     class Fr:
         internal = type("I", (), {"name": "k"})()
@@ -203,7 +205,7 @@ def test_the_older_mapper_measures_a_registered_frames_floor() -> None:
     assert Updater._floor_ratio(fr, internal) == pytest.approx(0.5, abs=0.02)  # type: ignore[arg-type]
     fr.depth_m = None
     # the frame's own height over the camera's
-    fr.work = type("W", (), {"height_m": 1.0})()
+    fr.work = type("W", (), {"height_m": 1.0, "height_sigma_m": None})()
     assert Updater._floor_ratio(fr, internal) == pytest.approx(2.5, abs=0.1)  # type: ignore[arg-type]
     fr.work = Work()
     # none: no depth in the mapper, no floor plane, no height, no pose

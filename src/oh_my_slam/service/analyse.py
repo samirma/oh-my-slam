@@ -12,9 +12,13 @@
   (``mapping.analysis.gravity_pose`` of the gravity the model sees).
 * **Scale** (``scale_source``, ``scale_sigma_rel``). In the map frame, the version's: a depth
   image is taken as it is (an anchored map fuses depth images as they are), a monocular depth is
-  brought onto the map (``mapping.analysis.map_factor``; when the pose sees too little of the
-  map's cloud, by the camera's height above the map's floor, ``height_factor``; else left as the
-  model gives it). Elsewhere ``depth`` with a depth image; else ``camera_height`` when the
+  brought onto the map: on a map whose scale is its camera heights', by the camera's sent
+  height over its own floor plane (``height_factor``: the scale an update gives the same
+  frame's content, map.md §2, so the map and the analysis of one view agree); else, and without
+  a sent height or a floor plane, onto the map's cloud as the pose sees it
+  (``mapping.analysis.map_factor``); when the pose sees too little of it, by the camera's
+  height above the map's floor at that pose (``height_factor``); else left as the
+  model gives it. Elsewhere ``depth`` with a depth image; else ``camera_height`` when the
   camera gives its height and its own floor plane is measurable (``height_factor``); else
   ``monocular``.
 * **The floor** of the outputs: the version's in the map frame; elsewhere the frame's own floor
@@ -263,7 +267,12 @@ class Analyser:
             source, sigma = str(dv.record["scale_source"]), float(dv.record["scale_sigma_rel"])
             floor, floor_sigma = dv.floor_z, dv.floor_sigma
             if sensor is None:
-                factor = (analysis.map_factor(depth, K_grid, T, dv.cloud()["xyz"])
+                # on a map whose scale is its camera heights', the frame's own: the scale an
+                # update gives the same frame's content (map.md §2 "Floor check")
+                sent = analysis.height_factor(depth, K_grid, T[:3, :3], height,
+                                              cam.height_sigma_m) \
+                    if source == "camera_height" else None
+                factor = (sent or analysis.map_factor(depth, K_grid, T, dv.cloud()["xyz"])
                           or analysis.height_factor(depth, K_grid, T[:3, :3],
                                                     float(T[2, 3]) - floor) or 1.0)
             depth = (depth * factor).astype(np.float32)
@@ -271,9 +280,11 @@ class Analyser:
             source, sigma = "depth", DEPTH_SIGMA_REL
             if height is not None:  # the raw depth, before the sent height rescales it
                 scale_check = analysis.scale_check(depth, K_grid, T[:3, :3], height,
-                                                   "monocular" if sensor is None else "sensor")
+                                                   "monocular" if sensor is None else "sensor",
+                                                   cam.height_sigma_m)
             if sensor is None:
-                f = analysis.height_factor(depth, K_grid, T[:3, :3], height)
+                f = analysis.height_factor(depth, K_grid, T[:3, :3], height,
+                                           cam.height_sigma_m)
                 if f is None:
                     source, sigma = "monocular", MONOCULAR_SIGMA_REL
                 else:
