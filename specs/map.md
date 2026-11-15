@@ -242,7 +242,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   residuals cannot reveal an error common to them all. For `monocular` (oms/2.12), it is
   a constant measured against truth and recorded in `README.md` with its evidence, one sigma of the
   scale's natural logarithm, that never shrinks with the number of frames, since a scene's frames
-  share the model's error; the monocular scale bound of the floor check is a separate constant.
+  share the model's error; the monocular scale bound of the floor check is a separate constant. A version committed before oms/2.12
+  with a `monocular` scale reads with that constant too, in every response.
   It is one sigma: the relative error of any horizontal distance, in every
   direction, stays within 3 × `scale_sigma_rel`. A later update may refine the scale:
   `quality.scale_ratio_vs_prev` reports the change.

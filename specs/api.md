@@ -393,8 +393,9 @@ The versions read, revert and `--keep-versions` are O2.
   * **Reference scale** (oms/2.12). When the located pose rests on points lifted from stored
     depth, the position sigma also holds the reference depth's scale error: hypot(σ_rel,
     s × d), with s the `scale_sigma_rel` of the depth those points came from (the map's, or a
-    monocular keyframe's own) and d the median distance from the located camera to its inlier
-    points. A pose on triangulated points only has no such term.
+    monocular keyframe's own; over the pose's inliers, the mean, a triangulated point or a depth
+    point rescaled to triangulated ones counting 0) and d the median distance from the located
+    camera to its inlier points. A pose on triangulated points only has no such term.
   * σ_rel is combined with the reference keyframe's map sigma only while
     `locate.sigma_containment` and `locate.sigma_tightness_bound` (evaluation.md) both hold.
     If the combined sigma is too loose (tightness below the lower bound), σ_rel is reported

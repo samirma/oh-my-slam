@@ -72,7 +72,7 @@ up to 500 keyframes; a large commit is up to 60 frames in one update.
 | `locate.nearest_view` | C8 | Share of rejected frames with `no_overlap` and a prior that carry a `nearest_view` whose turn points toward mapped structure |
 | `locate.sigma_containment` | C8 | Share of located frames whose position error ≤ 3 × `sigma_pos_m` and rotation error ≤ 3 × `sigma_rot_deg` |
 | `locate.sigma_tightness` | C8 | Information, no target: median over located frames of error / sigma (position and rotation reported separately); near 1 means sigmas neither over- nor under-confident |
-| `locate.sigma_tightness_bound` | C8 | Median over located frames of error / sigma, position and rotation separately, two-sided |
+| `locate.sigma_tightness_bound` | C8 | Median over located frames of error / sigma, position and rotation separately, two-sided; maps whose `scale_source` is `monocular` are exempt from the lower bound, their scale sigma being a deliberately conservative constant (map.md §1) |
 | `update.sigma_tightness` | C1, C4 | Information, no target: median over registered update frames only of error / sigma (position and rotation separately) |
 | `update.sigma_tightness_bound` | C1, C4 | Median over registered update frames only of error / sigma, position and rotation separately, two-sided |
 | `update.sigma_containment` | C1, C4 | Share of registered update frames whose committed-pose position error ≤ 3 × its position sigma and rotation error ≤ 3 × its rotation sigma |
