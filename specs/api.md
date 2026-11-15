@@ -528,10 +528,27 @@ The versions read, revert and `--keep-versions` are O2.
   model_height_m, ratio, floor_inlier_share, depth_source}`. `model_height_m` is the camera's
   height above the frame's own floor plane in the raw depth (`depth_source` `sensor` with a
   depth image, else `monocular`, the model's own metres, before the sent height rescales it);
-  `ratio` is `sent_height_m / model_height_m`; `floor_inlier_share` is the share of the frame's
+  `ratio` is `sent_height_m / model_height_m`; `floor_tilt_deg` (oms/2.10) is the angle between
+  the frame's floor normal in the raw depth and the up axis used (the pose's, or the estimated
+  gravity), null without a floor plane; `floor_inlier_share` is the share of the frame's
   valid depth pixels on that plane. With no measurable floor plane, `model_height_m` and
   `ratio` are null and `floor_inlier_share` is 0. Absent in the map frame and without a sent
   height.
+* **Horizontality from the pose** (oms/2.10). With `T_map_cam` (frame `map` or `client`), the
+  pose's up axis (map +z) defines the horizontal, whatever the depth's own floor says. For
+  monocular depth, the frame's floor plane (as the floor check chooses it, map.md §2) has its
+  normal rotated onto the pose's up axis, about the camera centre, before any other use: the
+  floor band, the scale (only the floor's height is fitted, along the pose's up axis), points,
+  objects and the range scan. The request's optional `sigma_tilt_deg` (default 2°) is the pose's
+  tilt sigma: when the depth's floor normal lies within 3 × `sigma_tilt_deg` of the pose's up
+  axis, or the depth is a sensor's, the depth is used as measured; beyond it, the depth is
+  rotated. Without a measurable floor plane the depth is used as measured. In the
+  `gravity_camera` frame the estimated gravity is the up axis and nothing is rotated.
+* **Unsupported beams** (oms/2.10). A range-scan beam's nearest return counts only when it is
+  held by at least a minimum number of valid pixels (a constant in `README.md`), none of them
+  the model's low-confidence pixels, depth edges or image-border pixels; a beam whose returns
+  are all unsupported is `unseen`, never a short-range `obstacle`. Each beam carries `support`,
+  the number of pixels holding its return (0 for `unseen`).
 * **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
   the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: the map's with `map` and

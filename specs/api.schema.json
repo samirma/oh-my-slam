@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.9. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.10. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -2728,6 +2728,12 @@
           "type": "boolean",
           "default": false,
           "description": "oms/2.7: with labels, prompt with labels alone (no default or map vocabulary). Without labels it is invalid_request."
+        },
+        "sigma_tilt_deg": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 2.0,
+          "description": "oms/2.10: 1-sigma tilt (pitch/roll) uncertainty of T_map_cam; the depth's floor is rotated onto the pose's up axis when it lies beyond 3 sigma of it (monocular depth only)."
         }
       },
       "oneOf": [
@@ -2768,6 +2774,11 @@
             "floor_end",
             "unseen"
           ]
+        },
+        "support": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "oms/2.10: pixels holding the beam's return; 0 when unseen."
         }
       }
     },
@@ -2906,6 +2917,14 @@
                 "sensor",
                 "monocular"
               ]
+            },
+            "floor_tilt_deg": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "oms/2.10: angle between the raw depth's floor normal and the up axis used; null without a floor plane."
             }
           }
         }

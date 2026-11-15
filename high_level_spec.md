@@ -212,6 +212,11 @@ request's `blind_disc` (`full`, `footprint`, `none`) limits the near blind disc 
 cell that was free by rule or free over an unseen drop may now be occupied, so a robot on a
 raised surface does not plan off its edge.
 
+**oms/2.10** is additive: in frame analysis a sent pose's up axis defines the horizontal, and a
+monocular frame's floor is rotated onto it (request `sigma_tilt_deg`); `scale_check.floor_tilt_deg`
+reports how far the depth's floor was tilted; and a range-scan beam whose return no supported
+pixel holds is `unseen`, with each beam's `support` count (api.md §7).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
