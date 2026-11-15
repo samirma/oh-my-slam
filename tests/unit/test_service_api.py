@@ -921,6 +921,18 @@ def test_heights_anchor_the_scale_on_the_cloud_s_floor_when_the_mapper_has_none(
     assert client.get("/api/maps/m", "MapSummary")["floor_z_m"] == pytest.approx(0.0, abs=0.02)
 
 
+def test_agreeing_camera_heights_keep_their_own_sigma(client: Client) -> None:
+    """map.md §1: the camera_height scale_sigma_rel is never below the median of the sent
+    heights' relative sigmas (0.03 / 0.37), however many frames agree."""
+    frames, files, _ = frames_of(client, 6)
+    for f in frames:
+        f["height_above_floor_m"], f["height_sigma_m"] = 0.37, 0.03
+    job = client.update("m", frames, files, {"cam": CAMERA})
+    assert job["scale_source"] == "camera_height"
+    sigma = job["scale_sigma_rel"]
+    assert sigma >= 0.081 and sigma == pytest.approx(0.03 / 0.37, abs=1e-5)
+
+
 def test_a_monocular_map_takes_the_first_height_anchor(client: Client) -> None:
     frames, files, truth = frames_of(client, 3)
     first = client.update("m", frames, files, {"cam": CAMERA})

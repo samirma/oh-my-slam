@@ -298,8 +298,10 @@ the version. A rejected or failed job leaves the map as it was.
      of the same frames: the median of the per-frame median ratios (≥ 100 common pixels);
      `σ = 1.4826 MAD(log r)/√n`, at least 0.5 %;
   3. `camera_height`: per-frame heights (else the camera's) over the mapper's camera heights above
-     its floor (`floor_z`, internal heights above 5 cm); `σ` from their spread and the given
-     sigmas (default 2 cm);
+     its floor (`floor_z`, internal heights above 5 cm); `σ = sqrt(median(σ_h / h)² +
+     (1.4826 MAD(log r))² / n)`, at least 0.5 %: the sent heights' relative sigma (default 2 cm)
+     is common to the frames and never divided by √n (map.md §1; before, the whole root was
+     divided by √n, so 17 frames sent 0.37 ± 0.03 m gave 0.02 where the sent sigma is 0.081);
   4. `monocular`: the mapper's MoGe-aligned metres, `σ = 10 %`.
   A later update keeps its map's source unless metric priors (two or more inliers) fix the scale.
 * **Quality** (map.md §4): `gauge_shift` is the alignment applied to the update's result in the
@@ -1229,8 +1231,13 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
     counters 0.2 m lower takes the worktop; when none is near, the widest whose height is
     plausible (the scale it implies within 0.2–5, `SCALE_RANGE`), because a monocular depth's
     metres are the model's (on the client's 0.355 m camera MoGe-2's floor lay at 1.1–3.2 × the
-    true height) and say nothing about which plane lies at the sent height; without a height
-    (frame analysis), the lowest. Before, the candidate nearest the sent height was taken among
+    true height) and say nothing about which plane lies at the sent height; the planes are
+    tried widest first and the first plausible one is taken, so a widest plane whose implied
+    scale lies outside `SCALE_RANGE` gives way to the next widest; without a height (frame
+    analysis), the lowest. The band is always the caller's `floor_band` (there is no default
+    band: before, frame analysis's own floor took a fixed 0.06 m, `OWN_FLOOR_BAND_M`, while its
+    scale took `floor_band`, so a sensor frame sent with a 0.1 m height sigma could take one
+    plane for its scale check and another for its floor). Before, the candidate nearest the sent height was taken among
     the planes with 25 % of the best one's sampled count: on 31 of the client's 97 keyframes
     (`dev_ainex_1/2/3/loop1/loop2/loop4`) another plane than the widest, holding a median 0.6 %
     of the frame against the widest's 30 %, whose height was about the sent one by
@@ -1353,7 +1360,8 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   drifting prior on a first update (at their priors). Its `scale_source` / `scale_sigma_rel`: the
   engine's (`AnchoredMap.scale_summary`), a mapper map's version's, else on a new mapper map
   metric priors spanning 0.3 m (σ √2 · median prior σ / span), else depth images (1 %), else
-  camera heights (median height σ over height, over √n), else monocular (10 %). On a new
+  camera heights (the median height σ over height, never divided by √n: map.md §1; before it
+  was), else monocular (10 %). On a new
   anchored map `prior_gravity_deg` is the engine's (the origin's gravity), null for a camera-only
   map.
 
@@ -1839,7 +1847,12 @@ server.
   On a camera-only map the planes are those of the whole cloud holding ≥ 50 % of the best
   one's points counted on the 5000-point sample they are fitted on (`MAP_FLOOR_SHARE`,
   `floor_candidates(sampled=True)`), at their distance below the lowest camera, as before: its
-  cameras start above its origin and its frame is levelled by that plane (map.md §1).
+  cameras start above its origin and its frame is levelled by that plane (map.md §1). Each
+  must also hold `FLOOR_MIN_SHARE` (2 %) of all the cloud's points, counted on all the points
+  on it (map.md §2: one minimum share defines a large plane everywhere, the map level too),
+  for the floor estimate and the levelling (`_floor_estimate`, `_level_by_floor`). Before, a
+  sliver far below the floor whose sample inliers reached half the floor's (both capped near
+  the 5000-point sample) was the lowest candidate and became `floor_z_m`.
   **Across versions** (oms/2.5, map.md §6, on every map and both engines): a version keeps
   the previous version's `floor_z_m` while the new estimate lies within max(0.06 m, 3 × the new
   `floor_sigma_m`) of it (`AnchoredMap.floor`, the previous one in `state.json` `floor_z_m`;
@@ -1847,8 +1860,10 @@ server.
   monocular map no longer flip the floor from version to version.
   `floor_sigma_m` is a robust standard deviation of the floor's own points' heights
   (`anchored.floor_spread`, oms/2.4 P26: 1.4826 × their median absolute deviation, over the
-  points within 0.12 m of the floor, `FLOOR_SPREAD_M`, under the robot when priors fixed the
-  frame, above; before, the half width at half maximum of
+  points within `FLOOR_SPREAD_M` = 0.12 m of the floor's level, the tolerance map.md §6 "Floor
+  sigma" leaves to this README, under the robot when priors fixed the frame (within
+  `FLOOR_NEAR_M` of a confirmed camera: walls and counters away from it at the floor's level
+  do not count), above; before, the half width at half maximum of
   their peak as a normal sigma, which a floor made of a few bad frames' sheets underestimated),
   over the kept frames' points after the floor check (above), so the floor band holds the floor's
   noise and drift; 0.02 m
@@ -1988,7 +2003,11 @@ It is an update's own code on one frame, kept nowhere.
   `dev_ainex_loop2` replayed, its 17 keyframes analysed at their odometry poses, this factor put
   the ranges at 1.04 × the truth, the sent 0.37 m over the true 0.355 m, in the 16 with a floor
   plane, where the cloud's factor gave 0.83–1.31 × and, before the floor fix, the height above
-  the version's floor 1.26–2.30 ×); else by the median ratio of
+  the version's floor 1.26–2.30 ×), while that factor lies within the monocular scale bound,
+  `MONO_FLOOR_BOUND_REL` = 0.30, of the map's monocular depth scale k (as the floor check judges
+  an update's frame, api.md §7): k is recorded with each anchored version
+  (`mono_depth_scale`, the engine's `ScaleState.k`); beyond the bound, and on a version
+  recorded before it (or by the older mapper) without k, the cloud's factor below; else by the median ratio of
   the map's cloud, as
   the pose sees it, to the frame's depth at the same pixels (`analysis.map_factor`: a cloud
   point is seen when it is the nearest of its cell of a 64-cell grid, within 5 %; at least 200
@@ -2002,8 +2021,9 @@ It is an update's own code on one frame, kept nowhere.
   is `monocular`.
 * **Floor.** The version's `floor_z_m` and `floor_sigma_m` in the map frame. Elsewhere the
   frame's own floor: the plane the floor check takes (`anchored.own_floor`, *Which plane*
-  above: with real support, the one near the camera's height, else the widest plausible), the
-  lowest one without a height; without such a plane, the camera's
+  above: with real support, the one near the camera's height within the same `floor_band` as
+  the scale and the scale check, of the depth's kind and `height_sigma_m`, else the widest
+  plausible), the lowest one without a height; without such a plane, the camera's
   height below it; else unknown: no object is grounded on it or dropped as the floor, and the
   range scan takes it 1.0 m below the camera (`analyse.DEFAULT_CAMERA_HEIGHT_M`).
 * **Scale check** (oms/2.8, api.md §7). Outside the map frame, with the camera's

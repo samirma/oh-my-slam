@@ -303,12 +303,12 @@ def test_a_wall_slice_is_no_floor(Hc: float) -> None:
     measurable floor plane (a horizontal slice of it spreads along one axis only): the frame is
     not checked, whether its depth is a sensor's or monocular."""
     z, Kw, T = _wall(Hc, 0.004)
-    assert an.own_floor(z, Kw, T[:3, :3], Hc) is None
+    assert an.own_floor(z, Kw, T[:3, :3], Hc, 0.06) is None
     for kind in ("sensor", "mono"):
         assert an.floor_verdict(kind, Hc, 0.01, T, 0.05, z, Kw) == an.FloorCheck()
     # a real floor still measures within 1 cm, and a tilted plane's own normal is no floor
     zf, Kg, Tf = _floor_points(Hc)
-    assert an.own_floor(zf, Kg, Tf[:3, :3], Hc) == pytest.approx(Hc, abs=0.01)
+    assert an.own_floor(zf, Kg, Tf[:3, :3], Hc, 0.06) == pytest.approx(Hc, abs=0.01)
     q = np.random.default_rng(1).uniform(-1.0, 1.0, (4000, 3))
     q[:, 2] = -Hc + 0.03 * q[:, 0]  # 1.7 deg: a floor
     assert an.horizontal_plane(q, Hc) is not None

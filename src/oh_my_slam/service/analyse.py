@@ -14,7 +14,9 @@
   image is taken as it is (an anchored map fuses depth images as they are), a monocular depth is
   brought onto the map: on a map whose scale is its camera heights', by the camera's sent
   height over its own floor plane (``height_factor``: the scale an update gives the same
-  frame's content, map.md §2, so the map and the analysis of one view agree); else, and without
+  frame's content, map.md §2, so the map and the analysis of one view agree) while that lies
+  within ``MONO_FLOOR_BOUND_REL`` of the map's monocular depth scale k (the version's
+  ``mono_depth_scale``; a version without one takes the cloud's); else, and without
   a sent height or a floor plane, onto the map's cloud as the pose sees it
   (``mapping.analysis.map_factor``); when the pose sees too little of it, by the camera's
   height above the map's floor at that pose (``height_factor``); else left as the
@@ -53,6 +55,7 @@ from oh_my_slam.mapping.anchored import (
     DEFAULT_HEIGHT_SIGMA_M,
     DEPTH_SIGMA_REL,
     MIN_SCALE_SIGMA_REL,
+    MONO_FLOOR_BOUND_REL,
     MONOCULAR_SIGMA_REL,
 )
 from oh_my_slam.mapping.anchored_objects import (
@@ -272,6 +275,12 @@ class Analyser:
                 sent = analysis.height_factor(depth, K_grid, T[:3, :3], height,
                                               cam.height_sigma_m) \
                     if source == "camera_height" else None
+                # within the monocular scale bound of the map's monocular depth scale k only
+                # (api.md §7): beyond it, or on a version that records no k, the map's cloud
+                k = dv.record.get("mono_depth_scale")
+                if sent is not None and not (
+                        k and abs(sent / float(k) - 1.0) <= MONO_FLOOR_BOUND_REL):
+                    sent = None
                 factor = (sent or analysis.map_factor(depth, K_grid, T, dv.cloud()["xyz"])
                           or analysis.height_factor(depth, K_grid, T[:3, :3],
                                                     float(T[2, 3]) - floor) or 1.0)
@@ -293,7 +302,10 @@ class Analyser:
                     sigma = max((cam.height_sigma_m or DEFAULT_HEIGHT_SIGMA_M) / height,
                                 MIN_SCALE_SIGMA_REL)
             depth = (depth * factor).astype(np.float32)
-            floor = analysis.own_floor_z(depth, K_grid, T, height)
+            # the plane the scale was taken on (``height_factor``, ``scale_check``): one band
+            floor = analysis.own_floor_z(depth, K_grid, T, height,
+                                         "mono" if sensor is None else "sensor",
+                                         cam.height_sigma_m)
             if floor is None and height is not None:
                 floor = float(T[2, 3]) - height
         shape = (depth.shape[0], depth.shape[1])

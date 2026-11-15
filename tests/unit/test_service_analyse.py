@@ -736,9 +736,10 @@ def test_a_monocular_depth_s_scale() -> None:
     assert analysis.height_factor(z, K_TABLE, R, 0.1) is None  # a tenth of its floor's: no scale
     assert analysis.height_factor(np.full_like(z, 2.0), K_TABLE, np.eye(3), 1.0) is None
     # the floor of the frame: the plane nearest the height, the lowest without one
-    assert analysis.own_floor_z(z, K_TABLE, T, 1.0) == pytest.approx(0.0, abs=0.01)
-    assert analysis.own_floor_z(z, K_TABLE, T, None) == pytest.approx(0.0, abs=0.01)
-    assert analysis.own_floor_z(np.full_like(z, 2.0), K_TABLE, np.eye(4), None) is None
+    assert analysis.own_floor_z(z, K_TABLE, T, 1.0, "sensor") == pytest.approx(0.0, abs=0.01)
+    assert analysis.own_floor_z(z, K_TABLE, T, None, "sensor") == pytest.approx(0.0, abs=0.01)
+    assert analysis.own_floor_z(np.full_like(z, 2.0), K_TABLE, np.eye(4), None,
+                               "mono") is None
     # onto a map: the cloud as the pose sees it, what lies behind its nearest points hidden
     hidden = cloud + np.array([0.0, 0.0, -1.5])  # another floor below: seen through nothing
     both = np.vstack([cloud[::3], hidden[::3]])

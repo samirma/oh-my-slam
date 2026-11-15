@@ -283,8 +283,7 @@ def _scale(prev: dict[str, Any] | None, am: AnchoredMap | None, frames: list[_Fr
         if h:
             rel.append((sig or HEIGHT_SIGMA_M) / h)
     if rel:
-        return "camera_height", max(float(np.median(rel)) / math.sqrt(len(rel)),
-                                    MIN_SCALE_SIGMA_REL)
+        return "camera_height", max(float(np.median(rel)), MIN_SCALE_SIGMA_REL)
     return "monocular", MONOCULAR_SIGMA_REL
 
 
