@@ -534,6 +534,38 @@ The versions read, revert and `--keep-versions` are O2.
   valid depth pixels on that plane. With no measurable floor plane, `model_height_m` and
   `ratio` are null and `floor_inlier_share` is 0. Absent in the map frame and without a sent
   height.
+* **Motion stereo** (oms/2.11). A request may carry `frames[]`: other images of the same
+  camera, each `{image, T_ref_frame, sigma_pos_m, sigma_rot_deg}`, `image` a part name and
+  `T_ref_frame` the pose of that frame's optical frame in the reference frame's (the request's
+  `image`), in metres. At most 4 entries (a constant in `README.md`); a part of another size is
+  `invalid_request`. The service matches each frame to the reference and refines each relative
+  pose on the images, with the sent pose and sigmas as a prior: the rotation and the
+  translation's direction, never its length |t|, which stays the client's. It triangulates the
+  matches and fits the reference frame's depth (the monocular model's shape) to them, then
+  corrects it towards the triangulated points locally, so that every output of the request
+  (`depth`, `points`, `objects`, `range_scan`) uses that depth. The response carries `motion`:
+  `{frames: [{index, status, T_ref_frame_refined, sigma_rot_deg_post, rotation_change_deg,
+  points}]}`, `status` one of `used`, `baseline_short`, `too_few_points`, `pose_inconsistent`,
+  `no_overlap`. A frame that cannot be used is a status, never an error.
+  * **A pair qualifies** for `baseline` scale when its `sigma_pos_m` along the translation over
+    |t| is at most a bound, at least a minimum number of triangulated points have σ(ln z) below a
+    bound, and its refined rotation lies within 3 × `sigma_rot_deg` of the sent one (constants
+    in `README.md`); otherwise its status says why.
+  * **Baseline scale.** With at least one qualifying pair, `scale_source` is `baseline` and
+    `scale_sigma_rel` is hypot(σ_t / |t|, the fit's standard error, the spread of the
+    triangulated points about the fitted depth), as one sigma of the scale's natural logarithm.
+    The triangulated points of all qualifying pairs are pooled into one fit.
+  * **Baseline check.** With `frames` and the camera's `height_above_floor_m`, the response
+    carries `baseline_check: {baseline_scale_ratio, sigma, used}`: the camera-height scale over
+    the baseline scale (null without a measurable floor or a qualifying pair), its sigma, and
+    the scale the outputs use. When the two differ by more than 3 sigma, or no pair qualifies,
+    the outputs take the camera-height scale with the motion-stereo shape, `scale_source`
+    `camera_height`, `used` `camera_height`.
+  * Without a qualifying pair or a camera height, `scale_source` is `monocular`, as for one
+    frame.
+* **Depth sigma** (oms/2.11). The output `depth_sigma` is σ(ln z) per pixel of `depth`, base64
+  `uint16`, value × 0.001, 0 where `depth` is 0; also for a single frame (then the scale's sigma
+  combined with the frame's own spread).
 * **Horizontality from the pose** (oms/2.10). With `T_map_cam` (frame `map` or `client`), the
   pose's up axis (map +z) defines the horizontal, whatever the depth's own floor says. For
   monocular depth, the frame's floor plane (as the floor check chooses it, map.md §2) has its

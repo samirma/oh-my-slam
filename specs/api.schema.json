@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.10. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.11. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -87,7 +87,8 @@
         "priors",
         "depth",
         "camera_height",
-        "monocular"
+        "monocular",
+        "baseline"
       ]
     },
     "Scale": {
@@ -2682,7 +2683,8 @@
               "masks",
               "points",
               "range_scan",
-              "depth"
+              "depth",
+              "depth_sigma"
             ]
           }
         },
@@ -2734,6 +2736,38 @@
           "exclusiveMinimum": 0,
           "default": 2.0,
           "description": "oms/2.10: 1-sigma tilt (pitch/roll) uncertainty of T_map_cam; the depth's floor is rotated onto the pose's up axis when it lies beyond 3 sigma of it (monocular depth only)."
+        },
+        "frames": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "oms/2.11: other images of the same camera for motion stereo.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "image",
+              "T_ref_frame",
+              "sigma_pos_m",
+              "sigma_rot_deg"
+            ],
+            "properties": {
+              "image": {
+                "$ref": "#/$defs/PartName"
+              },
+              "T_ref_frame": {
+                "$ref": "#/$defs/Mat4",
+                "description": "Pose of this frame's optical frame in the reference frame's, metres."
+              },
+              "sigma_pos_m": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "sigma_rot_deg": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
         }
       },
       "oneOf": [
@@ -2925,6 +2959,104 @@
               ],
               "minimum": 0,
               "description": "oms/2.10: angle between the raw depth's floor normal and the up axis used; null without a floor plane."
+            }
+          }
+        },
+        "depth_sigma": {
+          "$ref": "#/$defs/Binary",
+          "description": "oms/2.11: uint16 sigma of ln depth per pixel, value x 0.001; 0 where depth is 0."
+        },
+        "motion": {
+          "type": "object",
+          "required": [
+            "frames"
+          ],
+          "description": "oms/2.11, with frames.",
+          "properties": {
+            "frames": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "index",
+                  "status",
+                  "T_ref_frame_refined",
+                  "sigma_rot_deg_post",
+                  "rotation_change_deg",
+                  "points"
+                ],
+                "properties": {
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "status": {
+                    "enum": [
+                      "used",
+                      "baseline_short",
+                      "too_few_points",
+                      "pose_inconsistent",
+                      "no_overlap"
+                    ]
+                  },
+                  "T_ref_frame_refined": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/$defs/Mat4"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "sigma_rot_deg_post": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rotation_change_deg": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "points": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        "baseline_check": {
+          "type": "object",
+          "required": [
+            "baseline_scale_ratio",
+            "sigma",
+            "used"
+          ],
+          "additionalProperties": false,
+          "description": "oms/2.11, with frames and a sent camera height.",
+          "properties": {
+            "baseline_scale_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "sigma": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "used": {
+              "enum": [
+                "baseline",
+                "camera_height"
+              ]
             }
           }
         }

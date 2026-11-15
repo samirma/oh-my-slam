@@ -217,6 +217,13 @@ monocular frame's floor is rotated onto it (request `sigma_tilt_deg`); `scale_ch
 reports how far the depth's floor was tilted; and a range-scan beam whose return no supported
 pixel holds is `unseen`, with each beam's `support` count (api.md §7).
 
+**oms/2.11** is additive: frame analysis takes `frames[]`, other images of the same camera with
+client-given relative poses and sigmas, for motion stereo: the service refines the rotations on
+the images, triangulates, and gives the reference frame metric depth with `scale_source`
+`baseline` when a pair's known translation qualifies, a `baseline_check` against a sent camera
+height, a `motion` report per frame, and the `depth_sigma` output (api.md §7). `ScaleSource`
+gains `baseline`.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
