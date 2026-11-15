@@ -176,6 +176,7 @@ def test_the_older_mapper_measures_a_registered_frames_floor() -> None:
 
     class Cam:
         height_above_floor_m = 0.5
+        height_sigma_m = None
 
         @staticmethod
         def canonical() -> Intrinsics:

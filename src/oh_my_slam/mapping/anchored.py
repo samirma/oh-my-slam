@@ -289,7 +289,11 @@ FLOOR_TILT_DEG = 10.0
 FLOOR_EXTENT_REL = 0.05
 FLOOR_FLAT_RATIO = 8.0
 FLOOR_RANSAC = 100
-FLOOR_SAMPLE = 5000  # points a plane is fitted on
+FLOOR_SAMPLE = 5000  # points a plane is fitted on (its support is counted on all of them)
+# a frame's own floor plane holds at least this share of its points (``floor_planes``): on the
+# client's 97 monocular keyframes the widest plane held 3-56 % where a floor was level within
+# ``FLOOR_TILT_DEG``, and 0.4-0.7 % (slices of a floor tilted further) where none was
+FLOOR_MIN_SHARE = 0.02
 HEIGHT_VOTE_BIN = 0.03  # log scale: the frames' floor candidates vote in bins this wide
 HEIGHT_VOTE_TOL = 0.15  # a frame's candidate this near the vote counts
 DIRECTION_SECTORS = 4  # camera heights' scale compared between this many viewing directions
@@ -334,6 +338,9 @@ MONOCULAR_REGISTRATION_SIGMA_REL = 0.30  # raw monocular units: a camera this lo
 # depth scale against the map's (three monocular sigmas)
 FLOOR_DEPTH_SIGMA_REL = 0.01
 MONO_FLOOR_BOUND_REL = 3.0 * MONOCULAR_SIGMA_REL
+# a frame's own floor plane is "near" its expected camera height within this, by default (3
+# sigma of the default height sigma; ``own_floor_plane``)
+OWN_FLOOR_BAND_M = K_SIGMA * DEFAULT_HEIGHT_SIGMA_M
 
 
 # -- small geometry -------------------------------------------------------------------------------
@@ -488,21 +495,33 @@ def first_camera(up_cam: Any, height_m: float | None = None) -> Array:
     return pose(M, np.array([0.0, 0.0, height_m or 0.0]))
 
 
-def floor_candidates(p: Array, share: float = 0.25) -> list[float]:
+def floor_candidates(p: Array, share: float = 0.25, level: bool = False,
+                     min_share: float = 0.0, sampled: bool = False) -> list[float]:
     """The camera's heights above every strong horizontal plane below it, in its own points
     ``p`` (camera-centred, z up along gravity, unscaled), best supported first
-    (``floor_planes``)."""
-    return [h for h, _ in floor_planes(p, share)]
+    (``floor_planes``). With ``level``, each plane's own level below z 0 instead (the mean depth
+    of its points below it): the height of a plane among points that are not centred on a
+    camera, as a map's cloud (``AnchoredMap._floor_estimate``)."""
+    return [h for h, _ in floor_planes(p, share, level, min_share, sampled)]
 
 
-def floor_planes(p: Array, share: float = 0.25) -> list[tuple[float, Array]]:
+def floor_planes(p: Array, share: float = 0.25, level: bool = False, min_share: float = 0.0,
+                 sampled: bool = False) -> list[tuple[float, Array]]:
     """The strong horizontal planes below the camera, in its own points ``p`` (camera-centred, z
     up along gravity, unscaled), best supported first, as (distance to the camera, unit normal
     with z up): the peaks of the points' log heights, each tried as a plane
-    (``_horizontal_plane``), kept when it holds ``share`` of the best one's points. Which one is
+    (``_horizontal_plane``), kept when it holds ``share`` of the best one's points and
+    ``min_share`` of all the points ``p``, a plane's points being all those that lie on it
+    (``horizontal_plane``: never a sample's count, under which every plane with more points
+    than the sample counted the same and a sliver passed for the floor). Which one is
     the floor is decided across frames (``ScaleState._height_votes``): fitted per frame, so a
     frame that sees a lower floor through a door or a counter offers it without moving the
-    others."""
+    others. With ``level``, each plane's level below z 0 (``horizontal_plane``) instead of its
+    distance to the origin: a plane is never exactly level (a monocular depth's bend, a
+    rotation's error), and its distance to an origin that its points do not surround is the
+    height it would have there, not the height of what was seen. With ``sampled``, a plane's
+    points are the inliers of the sample it was fitted on, as before the support was counted:
+    the floor of a camera-only map, whose rules are as they were (``_floor_estimate``)."""
     out: list[tuple[float, Array]] = []
     q = p[np.isfinite(p).all(axis=1) & (p[:, 2] < -MIN_CAMERA_HEIGHT)]
     if len(q) < FLOOR_MIN_POINTS:
@@ -514,25 +533,35 @@ def floor_planes(p: Array, share: float = 0.25) -> list[tuple[float, Array]]:
              if smooth[i] >= FLOOR_PEAK_MIN and smooth[i] == smooth[max(i - 2, 0):i + 3].max()]
     centres = (edges[:-1] + edges[1:]) / 2.0
     planes = [got for i in sorted(peaks, key=lambda j: -smooth[j])[:FLOOR_CANDIDATES]
-              if (got := _horizontal_plane(q, math.exp(centres[i]))) is not None]
+              if (got := _horizontal_plane(q, math.exp(centres[i]), level, sampled)) is not None]
     if planes:
-        top = max(n for _, n, _ in planes)
-        out = [(h, nrm) for h, n, nrm in sorted(planes, key=lambda hn: -hn[1])
-               if n >= share * top]
+        least = max(share * max(n for _, n, _ in planes), min_share * len(p))
+        out = [(h, nrm) for h, n, nrm in sorted(planes, key=lambda hn: -hn[1]) if n >= least]
     return out
 
 
-def _horizontal_plane(q: Array, h0: float) -> tuple[float, int, Array] | None:
+def _horizontal_plane(q: Array, h0: float, level: bool = False, sampled: bool = False
+                      ) -> tuple[float, int, Array] | None:
     """The plane (RANSAC, normal within ``FLOOR_TILT_DEG`` of vertical) among the points near
-    height ``-h0``: its distance to the camera, its inliers and its unit normal, or None."""
+    height ``-h0``: its distance to the camera (with ``level``, its level below z 0), the
+    number of points on it (with ``sampled``, of the fit's sample) and its unit normal, or
+    None."""
     got = horizontal_plane(q, h0)
-    return None if got is None else (got[1], got[2], got[0])
+    return None if got is None else (got[3] if level else got[1],
+                                     got[4] if sampled else got[2], got[0])
 
 
 def horizontal_plane(q: Array, h0: float, band: float = FLOOR_BAND_REL
-                     ) -> tuple[Array, float, int] | None:
-    """``_horizontal_plane`` with the plane's unit normal (z up) first, among the points within
-    ``band`` of ``h0`` (relative). A plane is a large one only (map.md §2 "Floor check": a
+                     ) -> tuple[Array, float, int, float, int] | None:
+    """``_horizontal_plane`` with the plane's unit normal (z up) first, fitted among the points
+    within ``band`` of ``h0`` (relative; a sample of ``FLOOR_SAMPLE`` of them), then its
+    distance to the origin, its support (all the points of ``q`` within the fit's tolerance of
+    the plane, wherever they lie along it: the slice near ``h0`` of a plane that tilts counts
+    the whole plane), its level and last the fit's inliers among its sample. Its level: how far its inliers lie below z 0 on
+    average (their centre's depth: the plane's height where it was seen, at the points' most
+    common height ``h0``, whatever its tilt and wherever the origin is; never the height of
+    other points that the plane, carried on, would cross). A plane is a large one only (map.md
+    §2 "Floor check": a
     measurable floor plane): its inliers spread over two axes (the second singular value of
     their spread at least ``FLOOR_EXTENT_REL`` × ``h0`` and ``FLOOR_FLAT_RATIO`` times the
     third) and their own normal (the SVD's) within ``FLOOR_TILT_DEG`` of vertical; a horizontal
@@ -567,7 +596,8 @@ def horizontal_plane(q: Array, h0: float, band: float = FLOOR_BAND_REL
     if sv[1] / math.sqrt(len(inl)) < FLOOR_EXTENT_REL * h0 or sv[1] < FLOOR_FLAT_RATIO * sv[2] \
             or abs(nrm[2]) < math.cos(math.radians(FLOOR_TILT_DEG)):
         return None
-    return nrm, float(abs(nrm @ c0)), len(inl)
+    support = int((np.abs((q - c0) @ nrm) < tol).sum())
+    return nrm, float(abs(nrm @ c0)), support, float(-c0[2]), len(inl)
 
 
 def version_floor(prev: float | None, z: float | None, sigma: float) -> float | None:
@@ -1296,27 +1326,60 @@ def prior_pick(centres: list[Array], prior_c: Array, sigma_m: float) -> int | No
     return one_position(near, centres)
 
 
-def own_floor_plane(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
+def own_floor_plane(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array,
+                    expected: float | None, band_m: float = OWN_FLOOR_BAND_M
                     ) -> tuple[float, Array] | None:
-    """A frame's own floor plane (map.md §2 "Floor check"): among the large horizontal planes
-    below the camera in its depth (map metres) levelled by its rotation ``R`` (``floor_planes``),
-    the one nearest the ``expected`` height (relative), as its distance to the camera and its
-    unit normal (z up) in the levelled frame. None without one: no measurable floor plane."""
+    """A frame's own floor plane (map.md §2 "Floor check"), among the large horizontal planes
+    below the camera in its depth levelled by its rotation ``R``: the planes that hold
+    ``FLOOR_MIN_SHARE`` of the frame's points (``floor_planes``, their support counted on all
+    of them; a sliver is none, however near the height it lies). With an ``expected`` camera
+    height:
+
+    * the one nearest it among those within ``band_m`` of it (``floor_band``: the sent
+      height's sigma band, a monocular depth's scale bound): a robot on a worktop that also
+      sees wider counters below takes the worktop;
+    * when none is near, the widest whose height is plausible for it (the scale it implies
+      within ``SCALE_RANGE``): a monocular depth's metres are the model's (0.3-3.5 x the truth
+      on the client's low camera), so the floor is where the widest plane is, not at the sent
+      height.
+
+    Without an expected height, the lowest. As its distance to the camera and its unit normal
+    (z up) in the levelled frame. None without one: no measurable floor plane."""
     from oh_my_slam.reconstruction.pointcloud import pixel_points
 
     ok = edge_free(depth)
     if not ok.any():
         return None
     pts, _ = pixel_points(depth, K_grid, ok)
-    planes = floor_planes(pts @ R.T)
-    return min(planes, key=lambda hn: abs(math.log(hn[0] / expected))) if planes else None
+    planes = floor_planes(pts @ R.T, 0.0, min_share=FLOOR_MIN_SHARE)  # best supported first
+    if expected is None:
+        return max(planes, key=lambda hn: hn[0], default=None)
+    near = [hn for hn in planes if abs(hn[0] - expected) <= band_m]
+    if near:
+        return min(near, key=lambda hn: abs(hn[0] - expected))
+    return next((hn for hn in planes
+                 if SCALE_RANGE[0] <= expected / hn[0] <= SCALE_RANGE[1]), None)
 
 
-def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float
-              ) -> float | None:
+def floor_band(kind: str, height_m: float, height_sigma_m: float | None,
+               sigma_pos_m: float = 0.0) -> float:
+    """How near its expected camera height ``height_m`` a frame's own floor plane is looked for
+    before the widest one is taken (``own_floor_plane``): the floor check's bound, ``K_SIGMA``
+    x sqrt(height_sigma² + (σ_depth H)² + σ_z²) (σ_depth ``FLOOR_DEPTH_SIGMA_REL``, σ_z =
+    ``sigma_pos_m`` / √3; the height sigma defaults to ``DEFAULT_HEIGHT_SIGMA_M``); for a
+    monocular depth (``kind`` not ``sensor``) at least the monocular scale bound,
+    ``MONO_FLOOR_BOUND_REL`` x the height: a plane the frame could be judged on."""
+    hs = height_sigma_m if height_sigma_m else DEFAULT_HEIGHT_SIGMA_M
+    bound = K_SIGMA * math.sqrt(hs ** 2 + (FLOOR_DEPTH_SIGMA_REL * height_m) ** 2
+                                + sigma_pos_m ** 2 / 3.0)
+    return bound if kind == "sensor" else max(bound, MONO_FLOOR_BOUND_REL * height_m)
+
+
+def own_floor(depth: NDArray[np.float32], K_grid: Intrinsics, R: Array, expected: float | None,
+              band_m: float = OWN_FLOOR_BAND_M) -> float | None:
     """A frame's own camera height above its floor (map.md §2 "Floor check"): the distance of
     ``own_floor_plane``. None without a measurable floor plane."""
-    got = own_floor_plane(depth, K_grid, R, expected)
+    got = own_floor_plane(depth, K_grid, R, expected, band_m)
     return None if got is None else got[0]
 
 
@@ -1371,14 +1434,12 @@ def floor_verdict(kind: str, height_m: float | None, height_sigma_m: float | Non
     defaults to ``DEFAULT_HEIGHT_SIGMA_M``. The caller decides whether the map has a floor."""
     if height_m is None or height_m <= 0 or kind == "none":
         return FloorCheck()
-    h = own_floor(depth, K_grid, T[:3, :3], height_m)
+    h = own_floor(depth, K_grid, T[:3, :3], height_m,
+                  floor_band(kind, height_m, height_sigma_m, sigma_pos_m))
     if h is None:
         return FloorCheck()
-    hs = height_sigma_m if height_sigma_m else DEFAULT_HEIGHT_SIGMA_M
     if kind == "sensor":
-        bound = K_SIGMA * math.sqrt(hs ** 2 + (FLOOR_DEPTH_SIGMA_REL * height_m) ** 2
-                                    + sigma_pos_m ** 2 / 3.0)
-        if abs(h - height_m) > bound:
+        if abs(h - height_m) > floor_band(kind, height_m, height_sigma_m, sigma_pos_m):
             log.info("floor check: its own floor %.3f m below the camera, %.3f m sent", h,
                      height_m)
             return FloorCheck(False)
@@ -1837,9 +1898,12 @@ class ScaleState:
             self.k = float(np.clip(np.exp(np.median(lr)), *SCALE_RANGE))
             self.source = "camera_height"
             # one sigma that holds in every horizontal direction: the spread between viewing
-            # directions is not averaged away (README "Prior-first registration")
-            self.sigma_rel = max(math.hypot(math.sqrt(mad ** 2 + float(np.median(rel)) ** 2)
-                                            / math.sqrt(len(lr)), self.direction_spread()),
+            # directions is not averaged away (README "Prior-first registration"), and neither
+            # is the sent heights' own sigma: a camera's height is one number sent with every
+            # frame, so its error is common to them all and no count of frames reduces it; only
+            # the frames' spread about their median is averaged
+            self.sigma_rel = max(math.sqrt(float(np.median(rel)) ** 2 + mad ** 2 / len(lr)
+                                           + self.direction_spread() ** 2),
                                  MIN_SCALE_SIGMA_REL)
             return
         got = self._baselines(self.priors, prior_span)
@@ -3491,7 +3555,8 @@ class AnchoredMap:
             assert k.grid is not None and k.K_grid is not None  # a job keyframe keeps its grid
             raw = k.grid if k.depth_kind == "sensor" \
                 else (k.grid / (k.grid_scale or k.k_used)).astype(np.float32)
-            h = own_floor(raw, k.K_grid, k.T[:3, :3], k.height_m)
+            h = own_floor(raw, k.K_grid, k.T[:3, :3], k.height_m,
+                          floor_band(k.depth_kind, k.height_m, k.height_sigma_m))
             if h is not None:
                 out.append(k.height_m / h)
         return out
@@ -3690,7 +3755,7 @@ class AnchoredMap:
         if f.prior is None and f.mono is not None and f.mono()[3] is not None:
             # a camera-only frame: along its own gravity, not the chain of registrations
             R = first_camera(f.mono()[3])[:3, :3]
-        planes = floor_candidates(pts @ R.T)
+        planes = floor_candidates(pts @ R.T, 0.0, min_share=FLOOR_MIN_SHARE)
         if not planes:
             return
         sig = f.height_sigma_m if f.height_sigma_m else DEFAULT_HEIGHT_SIGMA_M
@@ -4644,7 +4709,7 @@ class AnchoredMap:
         centres = np.array([k.centre for k in self.keyframes])
         below = float(centres[:, 2].min())
         q = pts - np.array([0.0, 0.0, below])
-        planes = floor_candidates(q, MAP_FLOOR_SHARE)
+        planes = floor_candidates(q, MAP_FLOOR_SHARE, sampled=True)
         got = None if not planes else horizontal_plane(
             q[np.isfinite(q).all(axis=1) & (q[:, 2] < -MIN_CAMERA_HEIGHT)], planes[0],
             LEVEL_BAND_REL)
@@ -4774,7 +4839,11 @@ class AnchoredMap:
         """A version's floor estimate by the rules of map.md §6, before the previous version's
         is kept (``floor``). The floor is the surface the robot stands on, among the large
         horizontal planes of the cloud below every image-confirmed camera
-        (``floor_candidates``, holding at least ``MAP_FLOOR_SHARE`` of the best one's points):
+        (``floor_candidates``). Where priors fixed the frame, every one of them, each at its own
+        level, the height of its points (never its distance to the map's origin: a plane tilted
+        by 1.8° reads 0.10 m lower 3 m from where it was seen, and the cameras of such a map
+        are anywhere); on a camera-only map, those holding ``MAP_FLOOR_SHARE`` of the best
+        one's sampled points, at their distance below the origin's camera:
 
         * priors fixed the map frame: z 0 (their origin is where the robot stands), unless the
           plane nearest it (not a lower floor seen past a worktop's edge; without a plane, the
@@ -4794,20 +4863,29 @@ class AnchoredMap:
                 # the observed plane nearest the height's floor, accepted within
                 # FLOOR_BAND_SIGMAS of its own points' spread (map.md §6)
                 planes = [below - h for h in floor_candidates(
-                    pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)]
+                    pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE, sampled=True)]
                 if planes:
                     z = min(planes, key=abs)
                     if abs(z) <= FLOOR_BAND_SIGMAS * floor_spread(pts[:, 2], z):
                         floor = z
         elif len(pts):
-            planes = floor_candidates(pts - np.array([0.0, 0.0, below]), MAP_FLOOR_SHARE)
-            if planes and self.created_with in ("metric", "drifting"):
+            # priors fixed the frame: the plane nearest z 0 is looked for among every large
+            # plane (map.md §6), not only those with a share of the best supported one's points
+            # (the surface a robot stands on is often smaller than what it sees around it: a
+            # worktop among counters), each at its level (the cameras are anywhere in the
+            # frame). A camera-only map's rules are as they were: its cameras start above the
+            # origin, where a plane's distance to the origin is the camera's height above it
+            fixed = self.created_with in ("metric", "drifting")
+            q = pts - np.array([0.0, 0.0, below])
+            planes = floor_candidates(q, 0.0, level=True) if fixed \
+                else floor_candidates(q, MAP_FLOOR_SHARE, sampled=True)
+            if planes and fixed:
                 # priors fixed the frame: the plane the robot stands on, nearest their origin
                 # height (z 0), not a lower floor seen past a worktop's edge (map.md §6)
                 floor = below - min(planes, key=lambda h: abs(below - h))
             else:
                 floor = below - max(planes) if planes else lowest_layer(pts[:, 2], below)
-            if floor is not None and self.created_with in ("metric", "drifting") \
+            if floor is not None and fixed \
                     and abs(floor) <= floor_band_m(floor_spread(pts[:, 2], floor)):
                 floor = 0.0  # z 0 itself within the floor band of it (map.md §6, oms/2.5)
         if floor is None:

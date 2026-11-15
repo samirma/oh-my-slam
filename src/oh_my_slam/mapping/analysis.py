@@ -36,6 +36,7 @@ from oh_my_slam.mapping.anchored import (
     MIN_DEPTH_M,
     SCALE_RANGE,
     first_camera,
+    floor_band,
     floor_share,
     own_floor,
     own_floor_plane,
@@ -62,7 +63,6 @@ KNOWN_POINTS = 2000  # cloud points kept per map object for the association
 RANGE_MIN_POINTS = 3  # a beam's range: its third point (one or two flying pixels are no surface)
 MIN_BEARING_STEP_DEG = 0.1  # at most 3600 beams
 MIN_CAMERA_HEIGHT_M = 0.05  # a camera this near the floor measures no scale from its height
-LOWEST_PLANE_M = 1e6  # ``own_floor``'s expected height that picks the lowest plane
 RENDER_SIDE = 64  # map_factor: the map's cloud is rendered on a grid of this side
 VISIBLE_TOL = 0.05  # ... a point this far (relative) behind its cell's nearest one is hidden
 MAP_ALIGN_MIN_POINTS = 200  # ... and this many visible points with depth give the factor
@@ -78,16 +78,18 @@ def gravity_pose(up_cam: Any) -> Array:
 # -- scale ---------------------------------------------------------------------------------------
 
 
-def height_factor(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m: float | None
-                  ) -> float | None:
+def height_factor(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m: float | None,
+                  sigma_m: float | None = None) -> float | None:
     """The factor bringing a frame's monocular depth onto a known camera height above the floor
-    (``height_m``), as the floor check gives a monocular frame its own scale (map.md §2): the
-    height over the camera's height above its own floor plane (``anchored.own_floor``, the depth
-    levelled by ``R``). None without a height above ``MIN_CAMERA_HEIGHT_M``, without a measurable
-    floor plane, or outside ``anchored.SCALE_RANGE``."""
+    (``height_m``, its sigma ``sigma_m``), as the floor check gives a monocular frame its own
+    scale (map.md §2): the height over the camera's height above its own floor plane
+    (``anchored.own_floor``, the depth levelled by ``R``: the supported plane near that height,
+    ``anchored.floor_band``, else the widest plausible one, since the model's metres do not say
+    which plane lies at that height). None without a height above ``MIN_CAMERA_HEIGHT_M``, without a
+    measurable floor plane, or outside ``anchored.SCALE_RANGE``."""
     if height_m is None or height_m <= MIN_CAMERA_HEIGHT_M:
         return None
-    h = own_floor(depth, K, R, height_m)
+    h = own_floor(depth, K, R, height_m, floor_band("mono", height_m, sigma_m))
     if h is None:
         return None
     f = height_m / h
@@ -95,16 +97,18 @@ def height_factor(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m:
 
 
 def scale_check(depth: NDArray[np.float32], K: Intrinsics, R: Array, height_m: float,
-                source: str) -> dict[str, Any]:
+                source: str, sigma_m: float | None = None) -> dict[str, Any]:
     """A frame's ``scale_check`` (api.md §7, oms/2.8): the sent camera height ``height_m``
     against the camera's height above the frame's own floor plane (``anchored.own_floor_plane``,
     the floor check's rule, in the raw ``depth`` levelled by ``R``), the ratio of the two and
     the share of the frame's valid depth pixels on that plane (``anchored.floor_share``).
     Without a measurable plane: no model height or ratio, a share of 0. ``source``: the raw
-    depth's, ``sensor`` or ``monocular``."""
+    depth's, ``sensor`` or ``monocular``; ``sigma_m``: the sent height's sigma (the band in
+    which a plane is the one at that height)."""
     out: dict[str, Any] = {"sent_height_m": round(float(height_m), 4), "model_height_m": None,
                            "ratio": None, "floor_inlier_share": 0.0, "depth_source": source}
-    got = own_floor_plane(depth, K, R, height_m)
+    got = own_floor_plane(depth, K, R, height_m, floor_band(
+        "sensor" if source == "sensor" else "mono", height_m, sigma_m))
     if got is not None:
         h, normal = got
         out.update(model_height_m=round(h, 4), ratio=round(height_m / h, 4),
@@ -117,7 +121,7 @@ def own_floor_z(depth: NDArray[np.float32], K: Intrinsics, T: Array, height_m: f
     """The floor's z in the frame of the pose ``T``, from the frame's own depth: the large
     horizontal plane below the camera nearest ``height_m`` under it, the lowest one without a
     height; None without such a plane."""
-    h = own_floor(depth, K, T[:3, :3], height_m if height_m else LOWEST_PLANE_M)
+    h = own_floor(depth, K, T[:3, :3], height_m if height_m else None)
     return None if h is None else float(T[2, 3]) - h
 
 

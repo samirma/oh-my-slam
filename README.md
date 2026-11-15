@@ -1073,7 +1073,12 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   yaw (`ScaleState.height_yaws`); the per-frame log scales are binned in 4 yaw sectors and the
   standard deviation of the sectors' medians (`direction_spread`) is added in quadrature to the
   heights' sigma, never averaged over the frames. A map stored before this records no yaws and
-  adds nothing.
+  adds nothing. The sent heights' own relative sigma (the median of `height_sigma_m` / height)
+  is not averaged either: a camera's height is one number sent with every frame, its error
+  common to them all, so `scale_sigma_rel` = sqrt(that sigma² + the frames' robust spread² / n
+  + `direction_spread`²) and never falls below the sent sigma (`ScaleState.estimate`). Before,
+  the sent sigma was divided by √n with the spread: 17 frames sent 0.37 ± 0.03 m (0.081) gave
+  0.039, where the height itself was 4 % off (true 0.355 m) and the client's ranges 12 %.
 * **`scale_sigma_rel` from the source's residuals** (map.md §1). Metric priors: √2 × the larger
   of the RMS distance between the confirmed keyframes' committed centres and their priors and the
   priors' median sigma over √n, over the priors' span. Depth images: each registered depth
@@ -1209,6 +1214,31 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   real floor) passed on depth noise, so a frame with no floor in view was judged on a wall
   ribbon (a depth image excluded, a monocular frame given an arbitrary own scale); now it is
   not checked.
+  * *Which plane* (`anchored.own_floor_plane`; the client's AiNex maps and the worktop scene,
+    2026-11-14). A plane's support is every point of the frame on it
+    (`horizontal_plane`: within the fit's tolerance of the plane, wherever along it), never the
+    inliers of the 5000-point sample it is fitted on (`FLOOR_SAMPLE`): on that count every
+    plane larger than the sample held about 2000 points, so a sliver passed for a large plane.
+    A frame's own floor is a plane holding at least `FLOOR_MIN_SHARE` = 2 % of its points (on
+    the client's 97 monocular keyframes the widest plane held 3–56 % where the floor was level
+    within `FLOOR_TILT_DEG` in the frame its rotation levels, and 0.4–0.7 % in the 7 frames
+    where it was not; wall slabs that a plane crosses held up to 1.6 % in the table scene).
+    Among those: the one nearest the sent height when one lies near it (`floor_band`: the
+    floor check's bound, 3 × sqrt(height_sigma² + (σ_depth H)² + σ_z²); for a monocular depth
+    at least the monocular scale bound, 0.30 × H), so a robot on a worktop that sees wider
+    counters 0.2 m lower takes the worktop; when none is near, the widest whose height is
+    plausible (the scale it implies within 0.2–5, `SCALE_RANGE`), because a monocular depth's
+    metres are the model's (on the client's 0.355 m camera MoGe-2's floor lay at 1.1–3.2 × the
+    true height) and say nothing about which plane lies at the sent height; without a height
+    (frame analysis), the lowest. Before, the candidate nearest the sent height was taken among
+    the planes with 25 % of the best one's sampled count: on 33 of the client's 97 keyframes a
+    plane holding under 2 % of the frame (median 0.6 %, the floor holding 30 %), whose height
+    was the sent one by construction, so `scale_check` read about 1 and the frame's content
+    took the map's k for its own scale. With the rule 90 of the 97 have a floor (the widest
+    plane in 88) and 7 none. Frame analysis (`analysis.height_factor`, `scale_check`,
+    `own_floor_z`), `quality.scale_check` (`AnchoredMap.floor_ratios`) and the older mapper's
+    check use the same function. The camera-height vote (`add_height_evidence`) is offered the
+    planes with that share only.
   * A depth image whose |h_f − H| exceeds 3 × sqrt(height_sigma² + (σ_depth · H)² + σ_z²)
     (σ_depth `FLOOR_DEPTH_SIGMA_REL` = 0.01, the depth images' relative sigma; σ_z = the
     committed `sigma_pos_m` / √3) gives no content.
@@ -1708,7 +1738,19 @@ server.
   version record's, estimated once at commit, before the objects are fused, which use the same
   two (`AnchoredMap.floor`): the surface the robot stands on, among the large horizontal planes
   of the fused cloud (image-confirmed frames only) below every confirmed camera holding ≥ 50 %
-  of the best one's points, when priors fixed the frame z 0 itself unless the one nearest z 0
+  of the best one's points, each taken at its own level, the mean height of the points it was
+  fitted on
+  (`anchored.horizontal_plane`, `floor_candidates(level=True)`: a plane is never exactly level
+  in the map frame, and its distance to the map's origin, which the estimate took before, is
+  the height it would have there: the client's `dev_ainex_loop2`, cameras 2.6 m from the origin
+  of its priors' frame, first frame's floor tilted by 1.8°, read `floor_z_m` −0.112 m for a
+  floor at −0.01 m, the sent heights were then measured from it and every later camera sagged
+  0.06 m, the floor band missed the floor and frame analysis scaled by the height above it,
+  1.30 ×), when priors fixed the frame, or a camera height did, the one nearest z 0 among
+  every large plane and not only those with half the best one's points (a robot on a worktop
+  among counters 0.2 m lower that held 30 × its points got `floor_z_m` −0.2 m, the counters:
+  the frames it then sent from the worktop failed the height gate and gave no content, so
+  nothing on the worktop reached the map), z 0 itself unless the one nearest z 0
   (without a plane, the lowest dense layer) lies beyond max(0.06 m, 3 × its own spread) of it
   (oms/2.5: the origin is then not on it, as an arm's on a worktop): then that plane; for a camera-only
   map whose first frame had a camera height, z 0 (the floor that height defines, map.md §1),
@@ -1838,12 +1880,19 @@ It is an update's own code on one frame, kept nowhere.
   `Analysis` body has no `map_version` field.
 * **Scale.** In the map frame the version's `scale_source` and `scale_sigma_rel`. A depth image
   is taken as it is (an anchored map fuses depth images as they are: their correction to the map
-  is 1). A monocular depth is brought onto the map by the median ratio of the map's cloud, as
+  is 1). A monocular depth is brought onto the map: on a map whose `scale_source` is
+  `camera_height`, when the camera gives `height_above_floor_m` and the frame shows a measurable
+  floor plane, by that height over the camera's height above its own floor plane
+  (`analysis.height_factor`, the floor check's scale of map.md §2: the scale an update gives the
+  same frame's content, so the analysis of a view on the map and without it agree; on
+  `dev_ainex_loop2` rebuilt, the cloud's factor of the frames the map does not hold lay 0.64–1.29
+  × this one, the client's pose and the monocular cloud both in it); else by the median ratio of
+  the map's cloud, as
   the pose sees it, to the frame's depth at the same pixels (`analysis.map_factor`: a cloud
   point is seen when it is the nearest of its cell of a 64-cell grid, within 5 %; at least 200
   such points, a factor within 0.5–2); when the pose sees too little of the cloud, by the
-  camera's height above the version's floor over its height above its own floor plane
-  (`analysis.height_factor`, the floor check's scale of map.md §2); else it stays the model's
+  camera's height above the version's floor at that pose over its height above its own floor
+  plane (`analysis.height_factor`); else it stays the model's
   metres. Without a map frame: `depth` (σ 0.01, `DEPTH_SIGMA_REL`) with a depth image; else
   `camera_height` when the camera gives `height_above_floor_m` and the frame shows a measurable
   floor plane (the same factor; σ = `height_sigma_m`, default 0.02 m, over the height); else
