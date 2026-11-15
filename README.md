@@ -2154,8 +2154,10 @@ It is an update's own code on one frame, kept nowhere.
   `invalid_request`, `details.field` `frames[i].image`; a missing part too; a `T_ref_frame`
   that is no rigid transform is `frames[i].T_ref_frame`). Each is rectified to the canonical
   pinhole as the reference is and loses the **camera's** ignored pixels (its inline or stored
-  `ignore_mask`, and what the canonical pinhole does not reach); a frame of `frames` carries no
-  mask of its own in the schema, so the request's own `ignore_mask` is the reference's alone.
+  `ignore_mask`, and what the canonical pinhole does not reach) combined with its own optional
+  `ignore_mask` (oms/2.11: a part name, 8-bit PNG, non-zero = ignore, the camera's size, else
+  `invalid_request` with `details.field` `frames[i].ignore_mask`; a missing part too), as the
+  request's own `ignore_mask` is for the reference (the request's is the reference's alone).
   No model runs on the other frames: MoGe-2 runs once, on the reference, as before.
   1. **Matches.** Registration's SIFT (`anchored.features`: RootSIFT, 4000 features, contrast
      0.01, none on ignored pixels) and ratio-test matches (`anchored.match`, ratio 0.8, one per
@@ -2205,8 +2207,8 @@ It is an update's own code on one frame, kept nowhere.
      the ratio; when |ln ratio| > `BASELINE_CHECK_K_SIGMA` = 3 × sigma the outputs take the
      ratio (`camera_height`, σ the height's, `used: camera_height`). Without a floor plane (or a
      ratio outside 0.2–5) the ratio and sigma are null and the baseline stays. Without a used
-     pair the check is `{null, null, camera_height}` (*spec doubt*: also when no floor lets the
-     height scale the frame and `scale_source` is `monocular`; `used` has no third value).
+     pair the check is `{null, null, used}` with `used` what the outputs use: `camera_height`,
+     or `monocular` when no floor lets the height scale the frame (`scale_source` the same).
   * **Beside a depth image** the depth is the sensor's: the frames are matched, refined and
     reported, the depth is not changed, `scale_source` stays `depth` and there is no
     `baseline_check` (*spec doubt*: api.md does not say). **In the map frame** the stereo

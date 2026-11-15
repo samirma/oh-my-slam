@@ -363,3 +363,44 @@ def test_the_pair_s_edge_cases(monkeypatch: pytest.MonkeyPatch,
     assert motion.image_start(np.ones((12, 3)), np.ones((12, 3)), 270.0, T[:3, 3]) is None
     m = motion.motion_stereo(v["ref"].rgb, None, K, others, syn.model_depth(v["ref"].depth), K)
     assert m.frames[0].status == "used" and m.qualified
+
+
+# -- per-frame ignore_mask and the baseline check's ``used`` ------------------------------------
+
+
+def test_a_frame_s_own_ignore_mask_hides_its_pixels_from_the_matches(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """A frame's ``ignore_mask`` (combined with the camera's) leaves it no features: with the
+    whole image ignored the frame is ``no_overlap``, an empty mask changes nothing, and the
+    other frame of the request is used as without any mask."""
+    T = rel(views, "step10")
+    full = png(np.full((syn.H, syn.W), 255, np.uint8))
+    none = png(np.zeros((syn.H, syn.W), np.uint8))
+    plain = analyse(an, views, [frame(T, "step10")])["motion"]["frames"]
+    assert plain[0]["status"] == "used"
+    doc = analyse(an, views, [{**frame(T, "step10"), "ignore_mask": "m0"},
+                              {**frame(T, "step10"), "ignore_mask": "m1"}],
+                  _files={"m0": none, "m1": full})
+    a, b = doc["motion"]["frames"]
+    assert a["status"] == "used" and a["points"] == plain[0]["points"]
+    assert b["status"] == "no_overlap" and b["points"] == 0
+
+
+def test_a_frame_s_ignore_mask_is_validated(an: An, views: dict[str, syn.Shot]) -> None:
+    one = {**frame(rel(views, "step10"), "step10"), "ignore_mask": "m"}
+    out = analyse(an, views, [one], status=400)["error"]
+    assert out["code"] == "invalid_request" and out["details"]["field"] == "frames[0].ignore_mask"
+    wrong = png(np.zeros((10, 12), np.uint8))
+    out = analyse(an, views, [one], status=400, _files={"m": wrong})["error"]
+    assert out["code"] == "invalid_request" and out["details"]["field"] == "frames[0].ignore_mask"
+
+
+def test_without_a_pair_or_a_floor_the_baseline_check_says_monocular(
+        an: An, views: dict[str, syn.Shot]) -> None:
+    """A height is sent but the frame shows no floor to take it on and no pair is used: the
+    scale is ``monocular`` and so is the check's ``used``."""
+    doc = analyse(an, views, [frame(rel(views, "far5", "far"), "far5", 0.001)], ref="far",
+                  height=syn.HEAD_M)
+    assert doc["scale_source"] == "monocular"
+    assert doc["baseline_check"] == {"baseline_scale_ratio": None, "sigma": None,
+                                     "used": "monocular"}

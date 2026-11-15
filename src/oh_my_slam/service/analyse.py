@@ -35,8 +35,8 @@
   ``map_factor``, a rotation keeping every range). ``scale_check.floor_tilt_deg`` is that
   plane's tilt from the up axis used (the pose's, or the estimated gravity, which nothing
   turns).
-* **Motion stereo** (oms/2.11, ``mapping.motion``): ``frames`` (the camera's other images, its
-  own mask only) are matched to the frame and their relative poses refined; a monocular depth
+* **Motion stereo** (oms/2.11, ``mapping.motion``): ``frames`` (the camera's other images, each
+  with the camera's mask and its own) are matched to the frame and their relative poses refined; a monocular depth
   is replaced by the one fitted to their triangulated points for every output. Outside the map
   frame a ``used`` pair's scale is ``baseline``; with a sent height ``baseline_check`` compares
   it with the height's and takes that one beyond ``BASELINE_CHECK_K_SIGMA`` sigmas; without a
@@ -130,6 +130,7 @@ class MotionFrame:
     T_ref_frame: Array
     sigma_pos_m: float
     sigma_rot_deg: float
+    mask: NDArray[np.bool_] | None = None  # the camera's mask combined with the frame's own
 
 
 @dataclass
@@ -227,8 +228,14 @@ def work(store: Store, req: dict[str, Any], parts: dict[str, bytes]) -> Work:
         if not _rotation_ok(f["T_ref_frame"]):
             raise invalid(f"{at}.T_ref_frame", f"{at}.T_ref_frame is not a rigid transform "
                           "(orthonormal rotation, last row 0 0 0 1)")
+        fmask = camera_mask
+        if "ignore_mask" in f:
+            own_f = decode_mask(part(f"{at}.ignore_mask", f["ignore_mask"]),
+                                f"{at}.ignore_mask")
+            sized(f"{at}.ignore_mask", own_f, cam)
+            fmask = own_f if fmask is None else (fmask | own_f)
         others.append(MotionFrame(other, np.asarray(f["T_ref_frame"], np.float64),
-                                  float(f["sigma_pos_m"]), float(f["sigma_rot_deg"])))
+                                  float(f["sigma_pos_m"]), float(f["sigma_rot_deg"]), fmask))
     return Work(cam, image, rgb, depth, mask, T, frozenset(req["outputs"]), labels, only,
                 (lo, hi), step, float(req.get("voxel_m", DEFAULT_VOXEL_M)),
                 float(req.get("min_score", DEFAULT_MIN_SCORE)),
@@ -402,7 +409,7 @@ class Analyser:
                     factor, source, sigma = f, "camera_height", by_height
                 if ms is not None and by_height is not None and not qualified:
                     baseline_check = {"baseline_scale_ratio": None, "sigma": None,
-                                      "used": "camera_height"}
+                                      "used": source}
             depth = (depth * factor).astype(np.float32)
             # the plane the scale was taken on (``height_factor``, ``scale_check``): one band
             floor = analysis.own_floor_z(depth, K_grid, T, height,
@@ -478,17 +485,19 @@ class Analyser:
         """The motion stereo of a request with ``frames`` (``mapping.motion``; None without):
         the reference's image ``rgb`` on the canonical pinhole ``K`` with its ignored pixels,
         each other frame's taken there as the reference's is, its ignored pixels the camera's
-        alone (a frame of ``frames`` carries no mask of its own), and the reference's
+        combined with the frame's own ``ignore_mask``, and the reference's
         monocular ``depth`` on its grid (None beside a depth image)."""
         if not w.frames:
             return None
         cam = w.camera
-        ignore_other = cam.beyond()
-        if w.camera_mask is not None and w.camera_mask.any():
-            own = cam.rectify(w.camera_mask.astype(np.uint8), nearest=True) > 0
-            ignore_other = own if ignore_other is None else (ignore_other | own)
-        others = [motion.Other(mapper_image(f.rgb, cam, w.camera_mask), ignore_other,
-                               f.T_ref_frame, f.sigma_pos_m, f.sigma_rot_deg) for f in w.frames]
+        others = []
+        for f in w.frames:
+            ignore_other = cam.beyond()
+            if f.mask is not None and f.mask.any():
+                own = cam.rectify(f.mask.astype(np.uint8), nearest=True) > 0
+                ignore_other = own if ignore_other is None else (ignore_other | own)
+            others.append(motion.Other(mapper_image(f.rgb, cam, f.mask), ignore_other,
+                                       f.T_ref_frame, f.sigma_pos_m, f.sigma_rot_deg))
         return motion.motion_stereo(rgb, ignore, K, others, depth, K_grid)
 
     def _infer(self, w: Work, dv: DerivedVersion | None, K: Any, geometry: bool
