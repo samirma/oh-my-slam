@@ -838,14 +838,16 @@ def locate(q: Query, index: Index) -> Outcome:
                 hyps.append(hypothesis(got[0]))
         # a degenerate solve is no hypothesis (a wrong pose is worse than none)
         hyps = [h for h in hyps if plausible(h, kfs, index)]
-        # only a hypothesis standing off the floor can be reported (oms/2.13); a floor-dominated
-        # one stays a rival
-        cands = [h for h in hyps if standing(h)]
-        if not cands:
-            return out
         # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
-        sig = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
-                       _on_depth(h, kfs, index), srel) for h in cands]
+        every = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
+                         _on_depth(h, kfs, index), srel) for h in hyps]
+        # only a hypothesis standing off the floor, or one on the floor that only confirms the
+        # prior, can be reported (oms/2.13); a floor-dominated one stays a rival
+        keep = [j for j, h in enumerate(hyps) if standing(h) or confirms(q, h.T, every[j])]
+        if not keep:
+            return out
+        cands = [hyps[j] for j in keep]
+        sig = [every[j] for j in keep]
         zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in cands]
         k = choose(q, [h.T for h in cands], [h.inliers for h in cands], sig, zs)
         if k is None:
@@ -857,7 +859,8 @@ def locate(q: Query, index: Index) -> Outcome:
         sp, sr = _sigmas(main, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index),
                          _on_depth(main, kfs, index), srel)
         # the refinement left the prior, or the off-floor points: as it was
-        if not within_prior(q, main.T, (sp, sr)) or not standing(main):
+        if not within_prior(q, main.T, (sp, sr)) or not (standing(main)
+                                                         or confirms(q, main.T, (sp, sr))):
             main, (sp, sr) = cands[k], sig[k]
         others = [h for h in hyps if h is not cands[k]]
         best = max([main.inliers, *(h.inliers for h in others)])
@@ -869,8 +872,10 @@ def locate(q: Query, index: Index) -> Outcome:
             sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
         out.height_sigma_m = _ref_z_sigma(q, kfs[main.mask], index)
-        out.floor_share = None if index.floor is None \
-            else round(float(on_floor[main.mask].mean()), 4)
+        # (query keypoints, as support counts them)
+        kps = np.unique(iq[main.mask]).size
+        out.floor_share = None if index.floor is None or not kps \
+            else round(np.unique(iq[main.mask & on_floor]).size / kps, 4)
         return _finish(q, out)
     if ray_q:
         turned = _turn(q, index, np.concatenate(ray_q), np.concatenate(ray_k),
@@ -878,6 +883,16 @@ def locate(q: Query, index: Index) -> Outcome:
         if turned is not None:
             return _with_votes(turned, out)
     return out
+
+
+def confirms(q: Query, T: Array, sig: tuple[float, float]) -> bool:
+    """Whether a hypothesis resting on floor points only confirms the frame's prior (api.md §6
+    "Floor points", oms/2.13): its position within min(the prior's position sigma, ``K_SIGMA`` ×
+    its own position sigma ``sig``) of the prior's. False without a prior."""
+    if q.prior is None:
+        return False
+    d = float(np.linalg.norm(T[:3, 3] - q.prior[:3, 3]))
+    return d <= min(q.prior_sigma_pos_m, K_SIGMA * sig[0])
 
 
 def floor_points(xyz: Array, floor: tuple[float, float] | None, point_sigma: Any = 0.0

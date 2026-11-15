@@ -443,15 +443,20 @@ The versions read, revert and `--keep-versions` are O2.
   repeated floor texture (planks, tiles, carpet) must not place a frame alone:
   * the hypotheses also include a fit on the off-floor correspondences alone;
   * only a hypothesis with at least the registration minimum of off-floor inliers can be the
-    reported pose; support and the conflict bound are as below, the support counted against the
-    best such hypothesis;
+    reported pose, or one on the floor that only confirms the frame's prior (its position within
+    min(the prior's position sigma, 3 × its own position sigma) of the prior's); support and the
+    conflict bound are as below, the support counted against the best such hypothesis;
   * every other supported hypothesis, a fit dominated by floor points included, can be a rival:
     one that disagrees with the reported pose by more than the rival distances makes it
     `ambiguity`;
-  * when no hypothesis has enough off-floor inliers, a floor-only fit is no pose: the frame is
-    `rejected` `no_overlap` (with `nearest_view`).
+  * when no hypothesis qualifies, a floor-only fit is no pose: the frame is `rejected`
+    `no_overlap` (with `nearest_view`).
 
-  Without a map floor there are no floor points and this rule does not apply.
+  Without a map floor there are no floor points and this rule does not apply. The locate
+  index's points are lifted from each keyframe's content depth, the depth at its own scale
+  (map.md §2, Floor check: a monocular keyframe's own scale when the floor check gave it one),
+  so its floor lies at the map floor: unlike registration, which lifts at the map's k, no
+  per-keyframe floor ratio remains.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
     it. Hypotheses come from separate groups of reference keyframes (oms/2.12), each

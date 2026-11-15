@@ -121,6 +121,23 @@ def test_a_floor_only_fit_is_no_pose(tmp_path: Path) -> None:
     assert image_pose(mapper(tmp_path), uv, X) is None
 
 
+def test_a_floor_fit_may_confirm_its_prior_never_move_it(tmp_path: Path) -> None:
+    """A fit on the floor alone within the prior's sigma and the images' own noise confirms the
+    prior; one tile away (the alias) it is no pose (map.md §2, oms/2.13)."""
+    uv, X, is_floor = scene(np.random.default_rng(2), wall=0)
+    ref = ref_keyframe()
+    f = FrameIn("q", "cam", np.zeros((K.height, K.width, 3), np.uint8), K,
+                prior={"trust": "drifting", "T_map_cam": A.tolist(), "sigma_pos_m": 0.5,
+                       "sigma_rot_deg": 10.0})
+    feats = an.Features(uv.astype(np.float32), np.zeros((len(uv), 128), np.uint8))
+    m = mapper(tmp_path)
+    true = corr_of(uv, X - TILE, ref)  # the floor matched to its own texture
+    got = m._image_pose(f, feats, true, [ref], A, 0.5)
+    assert got is not None and np.linalg.norm(got[0][0].c - A[:3, 3]) < 0.02 and got[2] == 1.0
+    assert m._image_pose(f, feats, corr_of(uv, X, ref), [ref], A, 0.5) is None  # the alias
+    assert m._image_pose(f, feats, true, [ref], A, 0.0) is None  # a prior sigma of 0 confirms nothing
+
+
 def test_a_correct_mixed_fit_keeps_its_floor_inliers(tmp_path: Path) -> None:
     """Floor points that agree with the off-floor ones support the pose: the share reports them."""
     uv, X, is_floor = scene(np.random.default_rng(3))
@@ -216,6 +233,73 @@ def test_the_guards_also_test_a_hypothesis_near_the_prior(tmp_path: Path) -> Non
     assert near((grid * 2.0, K, "sensor")) is None
 
 
+def _near(m: AnchoredMap, uv: np.ndarray, X: np.ndarray, best: int, sp: float = 0.5) -> Any:
+    ref = ref_keyframe()
+    f = FrameIn("q", "cam", np.zeros((K.height, K.width, 3), np.uint8), K,
+                prior={"trust": "metric", "T_map_cam": A.tolist(), "sigma_pos_m": sp,
+                       "sigma_rot_deg": 2.0})
+    return m._near_prior(f, corr_of(uv, X, ref), [ref], A, sp, 2.0, best)
+
+
+def test_a_hypothesis_near_the_prior_is_refitted_off_the_floor(tmp_path: Path) -> None:
+    """The near-prior hypothesis takes the off-floor refit as any fit (map.md §2, oms/2.13)."""
+    uv, X, _ = scene(np.random.default_rng(8), wall=20)
+    got = _near(mapper(tmp_path), uv, X, 40)
+    assert got is not None and np.linalg.norm(got[0].c - A[:3, 3]) < 0.02
+    uv, X, _ = scene(np.random.default_rng(8), wall=10)
+    assert _near(mapper(tmp_path), uv, X, 40) is None  # too few off the floor to refit
+
+
+def _twin_of(m: AnchoredMap, keep: Any, shift: np.ndarray | None = None) -> None:
+    """``depth_confirms`` picking a twin: the same pose on the correspondences ``keep`` takes."""
+    def confirms(f: Any, s: Any, ref_of: Any, cands: Any, corr: Any = None, feats: Any = None,
+                 prior: Any = None) -> Any:
+        sel = keep(corr)
+        sub = (corr.uv[sel], corr.X[sel], corr.d[sel], corr.kf[sel])
+        c = s.c if shift is None else s.c + shift
+        return an.dataclasses.replace(s, c=c, inliers=np.ones(int(sel.sum()), bool)), sub
+
+    m.depth_confirms = confirms  # type: ignore[method-assign]
+
+
+def test_a_twin_passes_the_guards_too(tmp_path: Path) -> None:
+    uv, X, is_floor = scene(np.random.default_rng(3))
+    X = np.where(is_floor[:, None], X - TILE, X)  # a correct mixed fit
+    m = mapper(tmp_path)
+    _twin_of(m, lambda c: np.ones(len(c.uv), bool))
+    got = image_pose(m, uv, X)
+    assert got is not None and got[2] is not None and got[2] > 0.7
+    # a twin resting on the floor alone, a tile away from the prior
+    _twin_of(m, lambda c: c.X[:, 2] < 0.05, TILE)
+    assert image_pose(m, uv, X) is None
+    assert _near(m, uv, X, 40, sp=0.05) is None
+    _twin_of(m, lambda c: np.ones(len(c.uv), bool))
+    assert _near(m, uv, X, 40, sp=0.05) is not None
+
+
+def test_locate_points_are_at_each_keyframes_own_scale(tmp_path: Path) -> None:
+    """The locate index lifts content depth (a monocular keyframe's own floor-check scale): a
+    floor seen 0.5 m below a camera stays on the floor, where registration's lifting at k (twice
+    the keyframe's own scale here) puts it 0.5 m lower (api.md §6 "Floor points")."""
+    from oh_my_slam.service.backend import read_anchored
+
+    m = AnchoredMap(tmp_path / "map")
+    k = ref_keyframe((0.0, 0.0, 0.5))
+    k.k_used, k.floor_factor, k.K_grid = 0.5, 1.0, K
+    m.keyframes = [k]
+    m.scale.k = 1.0
+    m.save()
+    grid = np.full((K.height, K.width), 0.5 / math.sin(math.radians(25.0)), np.float32)
+    np.save(m.root / an.KF_DIR / f"{k.id}.depth.npy", grid.astype(np.float16))
+    centre = np.array([[K.cx, K.cy]], np.float32)  # the optical axis: down 25 deg to the floor
+    content = read_anchored(m.root).depth(k.id)
+    assert content is not None
+    on = rl.keyframe_points(centre, K.K(), content, k.T)
+    assert abs(float(on[0, 2])) < 0.01 and rl.floor_points(on.astype(np.float64), (0.0, 0.0))[0]
+    lifted = rl.keyframe_points(centre, K.K(), m.depth_of(k.id), k.T)
+    assert float(lifted[0, 2]) == pytest.approx(-0.5, abs=0.01)
+
+
 def test_own_depth_sources(tmp_path: Path) -> None:
     m = mapper(tmp_path)
     m.scale.k = 2.0
@@ -239,8 +323,11 @@ def test_own_depth_sources(tmp_path: Path) -> None:
 # -- locate ------------------------------------------------------------------------------------
 
 
-def _index(rng: np.random.Generator, wall: int = 40, floor: bool = True) -> tuple[rl.Index, rl.Query]:
+def _index(rng: np.random.Generator, wall: int = 40, floor: bool = True, alias: bool = True
+           ) -> tuple[rl.Index, rl.Query]:
     uv, X, is_floor = scene(rng, wall=wall)
+    if not alias:
+        X = np.where(is_floor[:, None], X - TILE, X)
     desc = rng.integers(0, 256, (len(uv), 128)).astype(np.uint8)
     kfs = []
     for j, c in enumerate(((-0.2, 0.15, 0.5), (-0.2, -0.15, 0.5))):
@@ -408,17 +495,19 @@ def test_a_change_without_robust_support_is_still_refused(tmp_path: Path) -> Non
     assert got is None and sorted(outliers) == [0, 1] and not m.drift_rule()["held"]
 
 
-def test_rotation_only_views_by_rotation(tmp_path: Path) -> None:
+def test_the_rule_tests_positions_not_rotations(tmp_path: Path) -> None:
+    """Repeated texture aliases where a camera is: a rotation the images measure (a robot's yaw
+    27 deg off its odometry at its start look) is the conflict bound's, never held alone."""
     m = mapper(tmp_path)
     m.created_with = "drifting"
     f, pl = _drift_frame("r", (2.0, 0.0, 0.5), np.zeros(3))
-    pl.method = "rotation"
+    pl.align_T = cam((2.0, 0.0, 0.5), 27.0)
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert m.drift_rule() == {"held": False, "agreeing_frames": []}
+    pl.method = "rotation"  # a rotation-only view never moves its prior's position
     V = cam((2.0, 0.0, 0.5), 30.0)
     pl.align_T = V
-    got, outliers = m._fit_drift([f], {0: pl}, m.drift)
-    assert sorted(outliers) == [0] and m.drift_rule()["held"]
     o = m._drift_evidence([f], {0: pl})[0]
-    o.T = cam((2.0, 0.0, 0.5), 1.0)
     assert an._correction(m.drift, o) is None
     # agreement: a rotation-only view is judged by its rotation only
     v = an.DriftView("v", V, cam((2.0, 0.0, 0.5)), (0.05, 0.5), True)
@@ -472,9 +561,9 @@ def test_locate_results_validate() -> None:
 # -- the client's map (oms/2.13 evidence, offline replay on small copies) ----------------------
 
 
-def _replay(q: str, r: str) -> Placement:
-    meta = json.loads((DATA / "meta.json").read_text())
-    z = np.load(DATA / f"{q}_{r}.npz")
+def _replay(q: str, r: str, tag: str = "") -> Placement:
+    meta = json.loads((DATA / f"{tag}meta.json").read_text())
+    z = np.load(DATA / f"{tag}{q}_{r}.npz")
     m = AnchoredMap(Path("/nonexistent"))
     m.scale = an.ScaleState(float(meta["scale"]["k"]), meta["scale"]["source"],
                             float(meta["scale"]["sigma_rel"]))
@@ -514,3 +603,24 @@ def test_the_client_lap_frames_no_longer_register_at_the_start_spot(q: str, r: s
         assert np.linalg.norm(pl.T[:2, 3] - prior_c) < np.linalg.norm(pl.T[:2, 3] - start)
     else:
         assert pl.status == "kept_at_prior"
+
+
+def test_a_correct_floor_view_near_its_prior_registers() -> None:
+    """dev_ainex_j5 (oms/2.13 regression): k000001 of the start look, 90 inliers 96 % on the floor
+    and 0.17 m from its prior (sigma 0.47 m), confirms its prior and registers; the j3 lap frames
+    above, as far from their priors as those sigmas allow, still do not."""
+    pl = _replay("k000001", "k000000", "j5_")
+    assert pl.status == "registered" and pl.method == "pnp" and pl.T is not None
+    assert np.linalg.norm(pl.T[:2, 3] - np.array([-0.26, -0.03])) < 0.1
+    assert pl.inlier_floor_share is not None and pl.inlier_floor_share > 0.9
+
+
+def test_locate_on_the_floor_may_confirm_the_prior() -> None:
+    idx, q = _index(np.random.default_rng(9), wall=0, alias=False)
+    q.prior, q.prior_sigma_pos_m, q.prior_sigma_rot_deg = A.copy(), 0.5, 10.0
+    o = rl.locate(q, idx)
+    assert o.located and o.T is not None and np.linalg.norm(o.T[:3, 3] - A[:3, 3]) < 0.03
+    assert o.floor_share == 1.0
+    idx, q = _index(np.random.default_rng(9), wall=0)  # the alias, a tile from the prior
+    q.prior, q.prior_sigma_pos_m, q.prior_sigma_rot_deg = A.copy(), 0.5, 10.0
+    assert not rl.locate(q, idx).located

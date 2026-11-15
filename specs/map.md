@@ -126,15 +126,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * sigmas stay honest: the containment targets (evaluation.md) apply.
 * **Every engine.** These apply to every engine, the older mapper included: calibrated sigmas
   (every engine's sigmas mean the same thing), the `rotation_inconsistent` limit (§4), the
-  robust drift estimate across versions, drift-grown sigmas for kept frames, acceptance of an
-  update whose frames are all `kept_at_prior` (§4), and the too-close content exception
-  (api.md §4). The older mapper is exempt from
-  static-content exclusion, standpoint grouping and the match graph (§2) only. Its
-  registrations come from its own internal solve and are not depth-gated (the depth
-  confirmation of §1, Measurable pair, and §2, Match graph, step 2); this is a documented
-  limit, which `README.md` records. Nor do the texture-aliasing guards (§2, oms/2.13) and the
-  one-view drift rule (below, oms/2.13) apply to it, a documented limit too; MapAnything's
-  placements are no points fit and are not tested by the guards.
+  robust drift estimate across versions (its fit, its support rule and drift-grown sigmas, not
+  the one-view rule of oms/2.13), drift-grown sigmas for kept frames, acceptance of an update
+  whose frames are all `kept_at_prior` (§4), and the too-close content exception (api.md §4).
+  The older mapper is exempt from exactly these, all documented limits that `README.md`
+  records: static-content exclusion, standpoint grouping, the match graph (§2), the
+  texture-aliasing guards (§2, oms/2.13) and the one-view drift rule (Drift estimate below,
+  No correction from one view, oms/2.13). Its registrations come from its own internal solve
+  and are not depth-gated (the depth confirmation of §1, Measurable pair, and §2, Match graph,
+  step 2). MapAnything's placements are no points fit and are not tested by the guards.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -205,10 +205,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     their sigmas. Only frames that conflict with their priors under the identity are rejected
     with `prior_conflict`; frames consistent with their priors keep their normal status;
   * **No correction from one view** (oms/2.13). A frame's image-only pose may move its
-    `drifting` prior by more than the prior's own sigma (as sent: position, and rotation,
-    separately; a rotation-only pose by its rotation) away from the prior as placed by the
-    estimate in force only when at least `DRIFT_AGREE_MIN` (`README.md`, 3) independent views agree on that
-    correction. The move is the image-only pose's residual against the prior as placed, weighed
+    `drifting` prior's position by more than the prior's own position sigma (as sent) away from
+    the prior as placed by the estimate in force only when at least `DRIFT_AGREE_MIN` (`README.md`, 3) independent views agree on that
+    correction. Repeated texture aliases where a camera is, so only the position is tested: a
+    rotation the images measure (a robot's yaw off its odometry by more than its sigma) is the
+    conflict bound's and the fit's, as before, and a rotation-only pose (its centre the prior's)
+    is never held. The move is the image-only pose's position residual against the prior as placed, weighed
     as registration fuses the two (the image's share σ_placed² / (σ_placed² + σ_image²),
     σ_placed the drift-grown sigma): an image pose looser than its prior moves it little. The
     views are the job's frames with an image-only pose and the frames held by
@@ -432,10 +434,18 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        ratio (z = c_z + (floor − c_z) × ratio, c_z its camera height, ratio the lifting scale
        over its own scale), and its point height sigma grows by it too. A pose's
        support for acceptance counts its off-floor inliers only: a fit whose off-floor inliers
-       are fewer than the registration minimum is not a pose by itself. The fit is then made
+       are fewer than the registration minimum is not a pose by itself, unless it only
+       confirms the frame's prior: its position within min(the prior's position sigma as
+       placed, 3 × its own calibrated image-only position sigma) of the prior as placed (a
+       floor matched where the prior already puts the camera, within the images' own noise:
+       a robot's own start look, its camera low over the floor). A floor fit may refine a
+       pose, never relocate it; its rotation is the conflict bound's. Otherwise the fit is made
        again on the off-floor correspondences alone (the floor points left out), and that fit,
        with the same guards, is the frame's candidate; when it has none the frame has no image
-       pose. A map without a floor has no floor points, and this guard does not apply.
+       pose. A candidate pose near the prior (api.md §4, Choosing a status) is refitted the same
+       way. A translational twin picked over a fit by the depth confirmation (§1) is a
+       candidate only when it passes both guards itself; it is not refitted. A map without a
+       floor has no floor points, and this guard does not apply.
     The input status's `inlier_floor_share` (api.md §4) is the share of the committed image
     pose's inliers that are floor points (null without a points fit or without a map floor).
   * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame of

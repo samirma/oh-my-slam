@@ -2284,21 +2284,18 @@ class DriftView:
 
 
 def _correction(d: Drift, o: _DriftObs) -> float | None:
-    """How far a frame's image-only pose moves its prior from where the estimate ``d`` places
-    it, when beyond the prior's own sigma as sent (map.md §1 "No correction from one view",
-    oms/2.13): the image-only pose's residual against the prior as placed, weighed as the
-    registration fuses them (the image's share σ_placed² / (σ_placed² + σ_image²), σ_placed the
-    drift-grown sigma), against the prior's sigma as sent, position, and rotation by its 3-D RMS
-    sigma, separately; a rotation-only pose by its rotation. The move in metres (in degrees for
-    a rotation-only pose); None within it."""
-    T, sp, sr = d.predict(o.P, *o.sigma_prior, o.sigma_tilt)
-    dp, dr = pose_residual(o.T, T)
-    dp *= sp ** 2 / (sp ** 2 + o.sigma_image[0] ** 2)
-    dr *= sr ** 2 / (sr ** 2 + o.sigma_image[1] ** 2)
-    beyond_r = dr > sigmas.axes_rms(o.sigma_prior[1], o.sigma_tilt)
+    """How far a frame's image-only pose moves its prior's position from where the estimate
+    ``d`` places it, when beyond the prior's own position sigma as sent (map.md §1 "No correction
+    from one view", oms/2.13): the image-only pose's position residual against the prior as
+    placed, weighed as the registration fuses them (the image's share σ_placed² / (σ_placed² +
+    σ_image²), σ_placed the drift-grown sigma). The move in metres; None within it, and for a
+    rotation-only pose (its centre is the prior's). Repeated texture aliases where a camera is;
+    a rotation the images measure is the conflict bound's and the fit's to judge, as before."""
     if o.rotation_only:
-        return dr if beyond_r else None
-    return dp if dp > o.sigma_prior[0] or beyond_r else None
+        return None
+    T, sp, _ = d.predict(o.P, *o.sigma_prior, o.sigma_tilt)
+    dp = pose_residual(o.T, T)[0] * sp ** 2 / (sp ** 2 + o.sigma_image[0] ** 2)
+    return dp if dp > o.sigma_prior[0] else None
 
 
 def _agreeing(v: DriftView, pool: list[DriftView], odo_scale: float) -> list[DriftView]:
@@ -3181,9 +3178,10 @@ class AnchoredMap:
                 return None
             s = got
             off, _ = self._floor_count(s, sub, refs)
-            if off < MIN_INLIERS:
-                # floor points never support a pose alone (map.md §2, oms/2.13): the fit again
-                # without them, their texture repeating across the floor
+            if off < MIN_INLIERS and not self._confirms_prior(f, s, sub, refs, cands, T0, sp0):
+                # floor points never move a pose alone (map.md §2, oms/2.13): the fit again
+                # without them, their texture repeating across the floor; a floor fit within
+                # the prior's own sigma only confirms it
                 keep = ~self._on_floor(corr.X, corr.kf, refs)
                 log.info("%s: %d of %d inliers off the floor: fitted again on the %d off-floor "
                          "correspondences", f.name, off, int(s.inliers.sum()), int(keep.sum()))
@@ -3197,11 +3195,16 @@ class AnchoredMap:
         gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, feats,
                                    None if T0 is None else (T0[:3, 3], sp0)) \
             if n >= MIN_INLIERS else None
-        if gate and gate[1] is not None:
-            s, sub, rot_only = gate[0], gate[1], False
-            n = int(s.inliers.sum())
         if not gate:
             return None
+        if gate[1] is not None:
+            # a translational twin picked over it is a candidate only once it passes the guards
+            # too (map.md §2, oms/2.13); it is not fitted again off the floor
+            twin = self._guarded(f, gate[0], gate[1], refs, cands, (T0, sp0))
+            if twin is None:
+                return None
+            s, sub, rot_only = twin, gate[1], False
+            n = int(s.inliers.sum())
         spi, sri = s.sigmas()
         spi = max(spi, MIN_SIGMA_POS_M)
         sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -3210,6 +3213,44 @@ class AnchoredMap:
         share = None if rot_only else self._floor_count(s, sub, refs)[1]
         return ((s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri, sub,
                  refs), corr, share)
+
+    def _guarded(self, f: FrameIn, s: Solve, sub: tuple[Array, Array, Array, NDArray[np.intp]],
+                 refs: Refs, cands: list[Keyframe], pred: tuple[Array | None, float]
+                 ) -> Solve | None:
+        """A points fit through both texture-aliasing guards (map.md §2, oms/2.13): the depth
+        guard (``_depth_guard``), then at least ``MIN_INLIERS`` off-floor inliers unless it lies
+        within the prior's own sigma (``pred``: the prior as placed and its sigmas,
+        ``_confirms_prior``); None when it fails either (no off-floor refit: the caller's)."""
+        got = self._depth_guard(f, s, sub, refs)
+        if got is None or (self._floor_count(got, sub, refs)[0] < MIN_INLIERS
+                           and not self._confirms_prior(f, got, sub, refs, cands, *pred)):
+            return None
+        return got
+
+    def _confirms_prior(self, f: FrameIn, s: Solve,
+                        sub: tuple[Array, Array, Array, NDArray[np.intp]], refs: Refs,
+                        cands: list[Keyframe], T0: Array | None, sp0: float) -> bool:
+        """Whether a fit resting on floor points only confirms the prior (map.md §2, oms/2.13):
+        its position lies within min(the prior's position sigma as placed ``sp0``, ``K_SIGMA`` ×
+        its own calibrated image-only position sigma) of the prior as placed ``T0``. Such a fit
+        agrees with where the prior puts the camera within the images' own noise; a repeating
+        floor could equally match it a period away, so it may refine a pose, never relocate it.
+        Its rotation is the conflict bound's to judge. False without a prior."""
+        if T0 is None:
+            return False
+        assert f.prior is not None
+        ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
+                               f.prior["trust"])
+        return float(np.linalg.norm(s.c - T0[:3, 3])) <= min(sp0, K_SIGMA * ci[0])
+
+    def _near_fit(self, f: FrameIn, corr: _Corr, sel: NDArray[np.bool_], refs: Refs, T0: Array
+                  ) -> tuple[Solve, tuple[Array, Array, Array, NDArray[np.intp]]] | None:
+        """``_near_prior``'s fit on the correspondences ``sel``, from the prior as placed ``T0``,
+        through the depth guard (map.md §2, oms/2.13); None when the guard leaves no fit."""
+        sub = (corr.uv[sel], corr.X[sel], corr.d[sel], corr.kf[sel])
+        s, _ = refine_pose(T0[:3, :3].copy(), T0[:3, 3].copy(), *sub, refs, f.K)
+        got = self._depth_guard(f, s, sub, refs)
+        return None if got is None else (got, sub)
 
     def _floor(self) -> tuple[float, float] | None:
         """The running job's map floor and its sigma (``begin_job``: ``map_floor``), which
@@ -3479,13 +3520,16 @@ class AnchoredMap:
         if near.sum() < need:
             return None
         refs = self._refs(cands)
-        sub = (corr.uv[near], corr.X[near], corr.d[near], corr.kf[near])
-        s, _ = refine_pose(T0[:3, :3].copy(), T0[:3, 3].copy(), *sub, refs, f.K)
-        # the texture-aliasing guards of any points fit (map.md §2, oms/2.13)
-        got = self._depth_guard(f, s, sub, refs)
-        if got is None or self._floor_count(got, sub, refs)[0] < MIN_INLIERS:
+        # the texture-aliasing guards of any points fit (map.md §2, oms/2.13): fewer than
+        # MIN_INLIERS off-floor inliers is fitted again without the floor points, as ``_image_pose``
+        got = self._near_fit(f, corr, near, refs, T0)
+        if got is not None and self._floor_count(got[0], got[1], refs)[0] < MIN_INLIERS \
+                and not self._confirms_prior(f, got[0], got[1], refs, cands, T0, sp0):
+            near = near & ~self._on_floor(corr.X, corr.kf, refs)
+            got = self._near_fit(f, corr, near, refs, T0) if near.sum() >= need else None
+        if got is None:
             return None
-        s = got
+        s, sub = got
         n = int(s.inliers.sum())
         dp, dr = pose_residual(s.T, T0)
         trust = None if f.prior is None else f.prior["trust"]
@@ -3499,7 +3543,10 @@ class AnchoredMap:
         if not gate:
             return None
         if gate[1] is not None:
-            s, sub = gate[0], gate[1]
+            twin = self._guarded(f, gate[0], gate[1], refs, cands, (T0, sp0))  # guarded too
+            if twin is None:
+                return None
+            s, sub = twin, gate[1]
             n = int(s.inliers.sum())
         return s, n, sub, refs
 

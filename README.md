@@ -1400,13 +1400,31 @@ place with hundreds of inliers. map.md §1-§2 and api.md §6 define three guard
   than 15 off-floor inliers is fitted again on the off-floor correspondences; locate adds that
   fit as a hypothesis and reports only hypotheses with 15 off-floor inliers. No map floor (a
   first update, a version record without `floor_z_m`): no floor points.
-* **One view never moves the drift** (map.md §1, `AnchoredMap._one_view_rule`): a frame's move
-  (its image-only residual against the prior as placed times σ_placed² / (σ_placed² + σ_image²))
-  beyond its prior's sigma as sent needs `DRIFT_AGREE_MIN` = **3** independent agreeing views:
+* **A floor fit may confirm a prior, never move it** (`AnchoredMap._confirms_prior`,
+  `relocalize.confirms`): a fit with fewer than 15 off-floor inliers stands when its position
+  lies within min(the prior's position sigma as placed, 3 × its calibrated image-only position
+  sigma) of the prior as placed; its rotation is left to the conflict bound.
+* **One view never moves the drift** (map.md §1, `AnchoredMap._one_view_rule`): a frame's
+  position move (its image-only position residual against the prior as placed times
+  σ_placed² / (σ_placed² + σ_image²)) beyond its prior's position sigma as sent needs `DRIFT_AGREE_MIN` = **3** independent agreeing views:
   priors `DRIFT_INDEPENDENT_M` = **0.5 m** apart or optical axes `DRIFT_INDEPENDENT_DEG` =
   **10°** apart. Agreement: 3 × hypot(both image sigmas, `DRIFT_POS_REL` 0.10 × distance) in
   position, 3 × hypot(both, `DRIFT_ROT_DEG_PER_M` 2°/m × distance) in rotation. Held views are
   kept in `state.json` (`drift.pending`), the newest `DRIFT_PENDING_MAX` = **20**.
+* **Details** (as implemented):
+  * `_correction` tests the position only, against `sigma_pos_m` as sent (an earlier draft also
+    tested the rotation against `sigmas.axes_rms(sigma_rot_deg, sigma_tilt_deg)`: see the j5
+    regression below); a rotation-only view is never tested (its centre is the prior's).
+  * `agreeing_frames` reports the views agreeing on the largest position move tested (metres);
+    ties keep the first in name order. Agreement itself still compares rotations too.
+  * `_depth_guard` leaves the contradicted inliers out of the inlier set without refitting the
+    pose (the robust refinement already down-weighted them); the off-floor refit, by contrast,
+    fits again.
+  * A translational twin picked by the depth confirmation passes both guards itself (no
+    refit); the candidate pose near the prior is refitted off the floor like any fit.
+  * Locate needs no per-keyframe floor ratio: its index lifts each keyframe's content depth
+    (`AnchoredMap.content_depth`: a monocular keyframe's own floor-check scale), so its floor is
+    the map floor (`tests/unit/test_texture_aliasing.py`).
 
 Evidence (map `dev_ainex_j3`, replayed offline through `AnchoredMap.place` with the mapper's own
 lifting, kdepth × k / k_used; fixtures `tests/data/aliasing`): k000011 against k000002 had 286
@@ -1417,6 +1435,18 @@ k 1.01 (× 2.09), so its floor lies at z −0.37…−0.43; the frame's own dept
 lifting (median ratio 0.97), so depth consistency does not reject it, the floor guard does (all
 inliers are floor points of that reference). The 1.8-2.8 depth ratio reported for it came from
 lifting kdepth × k_used, which is not the mapper's lifting.
+
+Regression fixed on `dev_ainex_j5` (built on the first oms/2.13 commit, 4683227): 40 keyframes,
+only the origin registered. Replayed one job per keyframe through `AnchoredMap.update`, two rules
+of that commit refused every correct view of the start look (camera 0.34 m over a plank floor):
+the floor guard refused k000001's fit (90 inliers, 96 % floor, 0.17 m from its prior of sigma
+0.47 m), and the one-view rule held the same frame for its rotation (27° from its odometry yaw,
+sigma 11°). With no second confirmed keyframe nothing else could register, and the frames were
+reported `no_overlap` / `no_image_pose` (inliers 0), rotation fits included (k000000 was their only
+reference). Now a floor fit that only confirms the prior stands, and the one-view rule tests
+positions: the replayed start look registers 10 of 10 views on j5 (8 of 8 on j3), while j3's lap
+frames k000009-k000014 (floor fits 1.3-2.4 m from priors of sigma 0.9-1.4 m) stay kept at their
+priors (fixture `tests/data/aliasing/j5_*`).
 
 ### Objects, surfaces and relations (O8)
 

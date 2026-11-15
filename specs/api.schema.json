@@ -751,7 +751,7 @@
         },
         "held": {
           "type": "boolean",
-          "description": "oms/2.13. Whether the one-view rule (map.md section 1, No correction from one view) held at least one of the job's frames: its image-only pose moved its drifting prior by more than the prior's own sigma without DRIFT_AGREE_MIN independent views agreeing, so it was treated as a prior conflict. Absent on a report written before oms/2.13."
+          "description": "oms/2.13. Whether the one-view rule (map.md section 1, No correction from one view) held at least one of the job's frames: its image-only pose moved its drifting prior's position by more than the prior's own position sigma without DRIFT_AGREE_MIN independent views agreeing, so it was treated as a prior conflict. Absent on a report written before oms/2.13."
         },
         "agreeing_frames": {
           "type": "array",

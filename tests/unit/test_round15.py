@@ -734,6 +734,8 @@ def test_a_twin_the_gate_picks_is_placed(tmp_path: Any, monkeypatch: pytest.Monk
         return t, (np.zeros((len(s.inliers), 2)),) * 3 + (np.zeros(len(s.inliers), np.intp),)
 
     monkeypatch.setattr(an.AnchoredMap, "depth_confirms", twin)
+    # (this fake twin has no geometry: the guards on a twin are tested in test_texture_aliasing)
+    monkeypatch.setattr(an.AnchoredMap, "_guarded", lambda self, f, s, *a: s)
     T = base_pose(15)
     f = frame("n", T)
     feats = an.features(f.rgb)
