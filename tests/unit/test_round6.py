@@ -276,7 +276,8 @@ def test_one_strong_frame_alone_never_makes_a_drift_estimate(tmp_path: Path) -> 
     assert (p.status, p.reason) == ("rejected", "prior_conflict")
     m2 = new_map(tmp_path / "three")
     m2.update([frame("a0", base_pose(0)), frame("a1", base_pose(30))])
-    truth = [base_pose(y) for y in (10, 20, 40)]
+    # three views turned at least DRIFT_INDEPENDENT_DEG apart (oms/2.13: one view never moves it)
+    truth = [base_pose(y) for y in (5, 20, 40)]
     pls = m2.update([frame(f"d{k}", T, p=prior(_rot_z(T, 25.0), "drifting", sr=5.0))
                      for k, T in enumerate(truth)])
     assert [p.status for p in pls] == ["registered"] * 3

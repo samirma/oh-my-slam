@@ -132,7 +132,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   static-content exclusion, standpoint grouping and the match graph (§2) only. Its
   registrations come from its own internal solve and are not depth-gated (the depth
   confirmation of §1, Measurable pair, and §2, Match graph, step 2); this is a documented
-  limit, which `README.md` records.
+  limit, which `README.md` records. Nor do the texture-aliasing guards (§2, oms/2.13) and the
+  one-view drift rule (below, oms/2.13) apply to it, a documented limit too; MapAnything's
+  placements are no points fit and are not tested by the guards.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
   the same convention as with priors. The origin is straight below the first registered
   frame's optical centre; +z is up, gravity-aligned; +x is from the first camera, as above.
@@ -202,6 +204,31 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * a refused first estimate leaves the drift at the identity: priors are used as sent, with
     their sigmas. Only frames that conflict with their priors under the identity are rejected
     with `prior_conflict`; frames consistent with their priors keep their normal status;
+  * **No correction from one view** (oms/2.13). A frame's image-only pose may move its
+    `drifting` prior by more than the prior's own sigma (as sent: position, and rotation,
+    separately; a rotation-only pose by its rotation) away from the prior as placed by the
+    estimate in force only when at least `DRIFT_AGREE_MIN` (`README.md`, 3) independent views agree on that
+    correction. The move is the image-only pose's residual against the prior as placed, weighed
+    as registration fuses the two (the image's share σ_placed² / (σ_placed² + σ_image²),
+    σ_placed the drift-grown sigma): an image pose looser than its prior moves it little. The
+    views are the job's frames with an image-only pose and the frames held by
+    this rule in earlier jobs (kept with the map, at most `DRIFT_PENDING_MAX` of them, the
+    newest). A view agrees when the estimate referenced at that frame (its image-only pose at
+    its prior as sent, the odometry scale in force) predicts the view's image-only pose within
+    3 × hypot(σ_image of both, the drift-grown rate of this section over their priors'
+    distance), position and rotation separately. Views count as independent when their priors
+    lie at least `DRIFT_INDEPENDENT_M` apart or look at least `DRIFT_INDEPENDENT_DEG` apart
+    (`README.md`); the frame itself counts as one. A frame whose correction does not reach
+    that agreement is **held**: it is left out of the fit and treated as a prior conflict
+    (rejected `prior_conflict` when its image-only pose meets the measurable-pair threshold,
+    else `kept_at_prior`, `conflict_unsupported`), its view kept for later jobs; the estimate
+    in force places its prior. A held view whose correction later reaches the agreement is
+    consumed (dropped from the kept views); the kept views that agreed count as supporting
+    frames (and among the n) of the robust support below, so a robot sending one frame per job is
+    not refused for being alone. A job whose frames are spread over a lap agrees
+    with itself; one frame matched to a far place by repeated texture never moves the drift.
+    `quality.drift_correction` reports whether the rule held a frame (`held`) and the views
+    that agreed (`agreeing_frames`, §4);
   * after a change is accepted, the job's frames are re-tested under the new estimate;
   * **Drift-grown sigma.** A frame placed through the drift estimate has the root sum of
     squares of its prior's sigma and the drift estimate's own sigma at that pose. The drift
@@ -367,6 +394,50 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     images alone, it gets no depth confirmation and no scale evidence from those references, and
     the update's scale source is chosen from the evidence that remains (§1, Scale). Locate
     follows the same rule (api.md §6).
+  * **Texture-aliasing guards** (oms/2.13). Repeated texture (floor planks, tiles, carpet, a
+    wood-grain panel) matches a frame to the wrong place with hundreds of inliers. Two guards
+    apply to every points fit (PnP) of a frame against the map's lifted points, on every engine
+    but the older mapper (§1, Every engine): the registration of a new frame, its retries, the
+    candidate poses near its prior, and re-registration (below); a rotation-only fit (its centre
+    is the prior's) is exempt. A pose that a guard leaves without a fit is no image pose: the
+    frame takes its usual fallback (with a prior `kept_at_prior`, `no_overlap`, `detail`
+    `no_image_pose`; without, `rejected` `no_overlap`).
+    1. **Depth consistency.** When the frame has its own depth (a depth image; else its
+       monocular depth at the map's scale k: every update keyframe has one; a stored keyframe
+       placed again, its stored depth, which never confirms it), each inlier is
+       compared with the depth the fitted pose predicts for its map point: r = ln(own /
+       predicted). Its bound is 3 × sqrt(σ_own² + σ_ref² + σ_point²): σ_own and σ_ref the scale
+       sigmas of the frame's and of the inlier's reference keyframe's depth (a depth image's
+       `SENSOR_SCALE_SIGMA_REL`; a monocular depth's: the map's `scale_sigma_rel` once a source
+       other than `monocular` measured it, else the monocular registration sigma, `README.md`),
+       σ_point a per-point floor (`README.md`). An inlier beyond its bound is no inlier. When at
+       least the registration minimum of inliers carry both depths and |median r| exceeds the
+       median of their bounds, the whole fit is inconsistent and is no pose. A monocular frame's
+       own depth scale is not tested here: the floor check judges it (a frame beyond the
+       monocular scale bound keeps its pose, `floor_not_judged`), so for monocular depth r is
+       taken about its median (the depth's shape is tested, not its scale) and the median test
+       does not apply. A fit left below the registration minimum is no pose either. A frame without depth of its own (a locate query)
+       is not tested.
+    2. **Floor points.** With a map floor (`floor_z_m` from priors, a camera height or the base
+       version, §6; on a first update without one, none), a map point is a floor point when it
+       lies within max(0.06 m, 3 × hypot(the floor's sigma, the point's height sigma)) of the
+       floor as its reference keyframe's lifted depth places it. The point's height sigma is
+       its depth's relative sigma (its scale sigma, as in guard 1, once a source other than
+       `monocular` measured the scale, since an unmeasured scale places no floor, and a per-point noise: the
+       per-point floor σ_point for monocular depth, the depth noise of `README.md` for a depth
+       image) times that reference camera's height above the floor. A monocular reference
+       whose floor check gave it its own depth scale (map.md §2, Floor check) has its points
+       lifted at the map's scale k (registration keeps k), so its floor lies lower or higher
+       by the ratio of the two scales: the floor height used for its points is moved by that
+       ratio (z = c_z + (floor − c_z) × ratio, c_z its camera height, ratio the lifting scale
+       over its own scale), and its point height sigma grows by it too. A pose's
+       support for acceptance counts its off-floor inliers only: a fit whose off-floor inliers
+       are fewer than the registration minimum is not a pose by itself. The fit is then made
+       again on the off-floor correspondences alone (the floor points left out), and that fit,
+       with the same guards, is the frame's candidate; when it has none the frame has no image
+       pose. A map without a floor has no floor points, and this guard does not apply.
+    The input status's `inlier_floor_share` (api.md §4) is the share of the committed image
+    pose's inliers that are floor points (null without a points fit or without a map floor).
   * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame of
     the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
     reference) and matches it with at least the registration minimum of inliers (the `README.md`
@@ -397,7 +468,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        Every engine), a candidate pose of a frame that carries depth images, against a
        reference that carries them (not a `floor_not_judged` one, whose depth is not used:
        above), is placed only if it passes the depth confirmation of §1
-       (Measurable pair); a candidate failing it is not a placement. When two distinct candidate
+       (Measurable pair); a candidate failing it is not a placement. A points fit is a
+       candidate only once it passes the texture-aliasing guards (above, oms/2.13). When two distinct candidate
        poses of a frame against one reference both pass it (§1, Symmetric scenes), the pair is
        ambiguous and that reference alone places the frame in neither, unless the parallax
        separates them. Two that share the rotation but lie far apart (§1, Translational
@@ -560,7 +632,12 @@ becomes a job with a `job_id`. A job goes through these states:
     the one the job's frames were placed with, after any change the job accepted. On a dry run,
     the estimate it would place them with. Null when no frame of the job has a `drifting`
     prior; the identity estimate gives `{0, 0, 1}`. It tells a client how much of a frame's
-    `prior_residual_*` (api.md §4) is the estimate moving the prior and how much is the images;
+    `prior_residual_*` (api.md §4) is the estimate moving the prior and how much is the images.
+    It also carries (oms/2.13) `held`, whether the one-view rule of §1 (No correction from one
+    view) held at least one of the job's frames, and `agreeing_frames`, the names of the views
+    (this job's frames and earlier jobs' held ones) that agreed on the largest correction the
+    rule tested, that frame included, sorted; empty when no frame's correction exceeded its
+    prior's sigma (the older mapper: `held` false, `agreeing_frames` empty);
   * `rotation_pairs`: every measurable pair (§1) the rotation check evaluated, on dry runs as
     on jobs, each `{a, b, inliers, overlap, measured_deg, committed_deg, difference_deg}`: the
     frame names in canonical order, the pair's epipolar inliers, its 8 × 8 overlap, the

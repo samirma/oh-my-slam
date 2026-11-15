@@ -479,7 +479,8 @@ def test_the_floor_factor_applies_to_content_only(tmp_path: Path) -> None:
 def test_drift_correction_values() -> None:
     assert drift_correction([], 1.0) is None
     assert drift_correction([(0.1, 2.0), (0.3, 1.0)], 1.02) == {
-        "translation_m": 0.3, "rotation_deg": 2.0, "odo_scale": 1.02}
+        "translation_m": 0.3, "rotation_deg": 2.0, "odo_scale": 1.02, "held": False,
+        "agreeing_frames": []}
     m = AnchoredMap(Path("unused"))
     P = base_pose(0)
     moved, odo = m.drift_moves([prior(P, "drifting")])
@@ -499,7 +500,8 @@ def test_drift_correction_values() -> None:
     fr = [type("F", (), {"work": Work(prior(P, "drifting"))})(),
           type("F", (), {"work": Work(None)})()]
     assert mapper_drift_correction(fr, None) == {  # type: ignore[arg-type]
-        "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0}
+        "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0, "held": False,
+        "agreeing_frames": []}
     sim = anchor.Sim3(1.25, np.eye(3), np.array([0.1, 0.0, 0.0]))
     got = mapper_drift_correction(fr, sim)  # type: ignore[arg-type]
     assert got is not None and got["odo_scale"] == 0.8 and got["translation_m"] > 0
@@ -525,7 +527,8 @@ def test_jobs_and_dry_runs_report_the_drift_correction(client: Client) -> None: 
     fr, files = frames_for(client, [base_pose(0), base_pose(30.0)], tag="a")
     job = client.update("m", fr, files, cameras={"cam": CAM})
     assert job["state"] == "committed" and job["quality"]["drift_correction"] is None
-    poses = [base_pose(y) for y in (10.0, 20.0, 40.0, 50.0)]
+    # views turned at least DRIFT_INDEPENDENT_DEG apart (oms/2.13: one view never moves it)
+    poses = [base_pose(y) for y in (5.0, 20.0, 35.0, 50.0)]
     off = np.array([0.3, 0.0, 0.0])  # an odometry 0.3 m off the map frame
     fr, files = _drifting(client, poses, "d", off)
     d = dry(client, "m", fr, files)
@@ -544,7 +547,8 @@ def test_jobs_and_dry_runs_report_the_drift_correction(client: Client) -> None: 
     # a new map whose frame drifting priors fix: the identity
     fr, files = _drifting(client, [base_pose(0)], "n")
     assert dry(client, "n", fr, files, cameras={"cam": CAM})["quality"]["drift_correction"] == {
-        "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0}
+        "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0, "held": False,
+        "agreeing_frames": []}
 
 
 def test_a_gated_job_reports_the_poses_it_would_commit(client: Client) -> None:  # noqa: F811

@@ -1380,7 +1380,7 @@ class Updater:
 
     @staticmethod
     def _input(fr: _Frame) -> dict[str, Any]:
-        from oh_my_slam.service.prior_first import input_row
+        from oh_my_slam.service.prior_first import input_row, sent_residual
 
         ok = fr.reason is None and fr.internal is not None
         status = "registered" if ok else "kept_at_prior" if fr.reason is None \
@@ -1389,7 +1389,8 @@ class Updater:
                          fr.unconfirmed if status == "kept_at_prior" else fr.reason,
                          _inliers(fr.internal) if fr.internal is not None else 0, fr.pose,
                          fr.sigma_pos_m, fr.sigma_rot_deg, fr.prior_residual, fr.scene_m,
-                         fr.duplicate_of, fr.detail)
+                         fr.duplicate_of, fr.detail,
+                         sent=sent_residual(fr.pose, fr.work.prior, fr.work.trust))
 
     @staticmethod
     def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],

@@ -112,6 +112,7 @@ retrieval descriptor), ``cloud.npz``."""
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import hashlib
 import itertools
@@ -133,6 +134,8 @@ from numpy.typing import NDArray
 
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.constants import (
+    DEPTH_POINT_SIGMA_REL,
+    FLOOR_BAND_MIN_M,
     FLOOR_BAND_SIGMAS,
     FLOOR_SIGMA_DEFAULT_M,
     REGISTRATION_MIN,
@@ -327,6 +330,14 @@ DRIFT_MIN_SUPPORT = 3  # map.md §1 "Drift estimate": a first estimate or a larg
 # min(this, n) supporting frames, n the job's frames that can support it, ...
 DRIFT_SUPPORT_SHARE = 0.5  # ... and this share of those frames
 DRIFT_NEVER_ALONE = 2  # ... and never one frame alone
+# map.md §1 "No correction from one view" (oms/2.13; README "Texture-aliasing guards"): an image
+# pose moves its drifting prior by more than the prior's own sigma only when this many
+# independent views (priors this far apart, or looking this far apart) agree on the correction;
+# the views it holds are kept with the map for later jobs, the newest this many
+DRIFT_AGREE_MIN = 3
+DRIFT_INDEPENDENT_M = 0.5
+DRIFT_INDEPENDENT_DEG = 10.0
+DRIFT_PENDING_MAX = 20
 MEASURABLE_INLIERS = 100  # map.md §1 "Measurable pair": at least this many inliers ...
 MEASURABLE_OVERLAP = 0.10  # ... covering at least this share of the 8 x 8 cells
 STATIC_PX = 2.0  # map.md §1 "Static image content": a feature fixed within this (px) ...
@@ -972,6 +983,13 @@ class Refs:
     c: Array  # n x 3
     scale_sigma: Array  # n
     median: Array  # n
+    # each one's per-point relative depth noise (the floor points' height sigma, map.md §2,
+    # oms/2.13): a depth image's ``DEPTH_NOISE_REL``, else ``DEPTH_POINT_SIGMA_REL``; None: the
+    # latter for all
+    point_sigma: Array | None = None
+    # each one's lifting scale over its own floor-check scale (``AnchoredMap._floor_ratio``): its
+    # lifted floor lies this many times its camera height below it; None: 1 for all
+    floor_ratio: Array | None = None
 
 
 def refine_pose(R0: Array, c0: Array, uv: Array, X: Array, d: Array, ref: NDArray[np.intp],
@@ -1745,20 +1763,26 @@ class Drift:
     # §1 "Supporting frames", P19), so ``predict`` leaves them out until the next job starts
     # (``AnchoredMap.begin_job``); never written (``to_json``: the committed support has them)
     fresh: list[list[float]] = field(default_factory=list)
+    # the views the one-view rule held in earlier jobs (map.md §1 "No correction from one view",
+    # oms/2.13), the newest ``DRIFT_PENDING_MAX``: a later correction they agree on is allowed
+    pending: list[DriftView] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {"ref_T": None if self.ref_T is None else self.ref_T.tolist(),
                 "ref_prior": None if self.ref_prior is None else self.ref_prior.tolist(),
                 "odo_scale": self.odo_scale, "evidence": self.evidence,
-                "fit_sigma": list(self.fit_sigma), "support": self.support}
+                "fit_sigma": list(self.fit_sigma), "support": self.support,
+                "pending": [v.to_json() for v in self.pending]}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Drift:
-        return Drift(None if d["ref_T"] is None else np.asarray(d["ref_T"], np.float64),
-                     None if d["ref_prior"] is None else np.asarray(d["ref_prior"], np.float64),
-                     float(d["odo_scale"]), [list(e) for e in d["evidence"]],
-                     tuple(d.get("fit_sigma", (0.0, 0.0))),  # type: ignore[arg-type]
-                     [list(c) for c in d.get("support", [])])
+        out = Drift(None if d["ref_T"] is None else np.asarray(d["ref_T"], np.float64),
+                    None if d["ref_prior"] is None else np.asarray(d["ref_prior"], np.float64),
+                    float(d["odo_scale"]), [list(e) for e in d["evidence"]],
+                    tuple(d.get("fit_sigma", (0.0, 0.0))),  # type: ignore[arg-type]
+                    [list(c) for c in d.get("support", [])])
+        out.pending = [DriftView.from_json(v) for v in d.get("pending", [])]
+        return out
 
     def predict(self, P: Array, sigma_pos: float, sigma_rot: float,
                 sigma_tilt: float | None = None) -> tuple[Array, float, float]:
@@ -1983,6 +2007,10 @@ class FrameIn:
     # its features when measured already (``job_features``: static content left out over the
     # whole job); else measured by ``AnchoredMap._prepare``
     feats: Features | None = None
+    # a stored keyframe placed again (``AnchoredMap._place_again``): its stored depth grid at the
+    # map's scale, the grid's intrinsics and its depth kind, for the depth-consistency guard
+    # only (map.md §2, oms/2.13: it never confirms the frame)
+    own_depth: tuple[NDArray[np.float32], Intrinsics, str] | None = None
 
 
 @dataclass
@@ -2030,6 +2058,9 @@ class Placement:
     # the sent camera height was a z measurement of its pose (map.md §2, oms/2.4): the height
     # gate then tests its image-only pose (``align_T``, ``image_sigmas``)
     height_term: bool = False
+    # the share of its image pose's inliers that are floor points (map.md §2 "Texture-aliasing
+    # guards", oms/2.13: ``inlier_floor_share``); None without a points fit or a map floor
+    inlier_floor_share: float | None = None
 
 
 def _lifted(corr: _Corr) -> tuple[Array, Array]:
@@ -2052,6 +2083,47 @@ def depth_alignment(T: Array, X: Array, uv: Array, depth: NDArray[np.float32],
         return None
     a = float(np.median(z_map[ok] / z_own[ok]))
     return a if ALIGN_RANGE[0] <= a <= ALIGN_RANGE[1] else None
+
+
+def depth_consistency(own: Array, predicted: Array, sigma_rel: Array, free_scale: bool = False
+                      ) -> tuple[NDArray[np.bool_], bool]:
+    """The depth-consistency guard of a points fit (map.md §2 "Texture-aliasing guards",
+    oms/2.13), over its inliers: each inlier's own depth (the frame's, on its scale) against the
+    depth its fitted pose predicts for its map point, r = ln(own / predicted), within
+    ``K_SIGMA`` × hypot(``sigma_rel``, ``DEPTH_POINT_SIGMA_REL``) (``sigma_rel`` the root sum of
+    squares of both depths' scale sigmas). Returns per inlier whether it stays one (an inlier
+    missing either depth stays), and whether the fit as a whole is consistent: |median r| within
+    the median bound once at least ``MIN_INLIERS`` inliers carry both depths. With
+    ``free_scale`` (a monocular frame: its own depth scale is the floor check's to judge, map.md
+    §2) r is taken about its median and the fit as a whole is not judged."""
+    own = np.asarray(own, np.float64)
+    pred = np.asarray(predicted, np.float64)
+    with np.errstate(invalid="ignore"):
+        both = np.isfinite(own) & np.isfinite(pred) & (own > 0) & (pred > 0)
+    r = np.zeros(len(own))
+    r[both] = np.log(own[both] / pred[both])
+    if free_scale and both.any():
+        r[both] -= float(np.median(r[both]))
+    bound = K_SIGMA * np.hypot(np.broadcast_to(np.asarray(sigma_rel, np.float64), r.shape),
+                               DEPTH_POINT_SIGMA_REL)
+    keep = ~both | (np.abs(r) <= bound)
+    whole = free_scale or int(both.sum()) < MIN_INLIERS \
+        or abs(float(np.median(r[both]))) <= float(np.median(bound[both]))
+    return keep, whole
+
+
+def floor_points(X: Array, floor: tuple[float, float] | None, point_sigma: Any = 0.0
+                 ) -> NDArray[np.bool_]:
+    """Which map points ``X`` are floor points (map.md §2 "Texture-aliasing guards", oms/2.13):
+    within the floor band of the map floor ``floor`` (height, sigma), max(``FLOOR_BAND_MIN_M``,
+    ``FLOOR_BAND_SIGMAS`` × hypot(the floor's sigma, the point's own height sigma
+    ``point_sigma``: its depth's scale sigma times its reference camera's height above the
+    floor)); none without a floor or a point (a ray without depth)."""
+    if floor is None:
+        return np.zeros(len(X), bool)
+    band = np.maximum(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS * np.hypot(floor[1], point_sigma))
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(X).all(axis=1) & (np.abs(X[:, 2] - floor[0]) <= band)
 
 
 def _real_sigmas(s: Solve, refs: Refs) -> tuple[float, float]:
@@ -2181,6 +2253,86 @@ class _DriftObs:
     rotation_only: bool
     pl: Placement
     sigma_tilt: float | None = None  # its prior's ``sigma_tilt_deg`` (map.md §1)
+
+
+@dataclass
+class DriftView:
+    """A drifting-prior frame's image-only pose as the one-view rule weighs it (map.md §1 "No
+    correction from one view", oms/2.13): its name, image-only pose, prior as sent, image-only
+    sigmas (m, deg) and whether it is rotation-only; kept with the map when the rule held it
+    (``Drift.pending``)."""
+
+    name: str
+    T: Array
+    P: Array
+    sigma_image: tuple[float, float]
+    rotation_only: bool
+
+    @staticmethod
+    def of(o: _DriftObs) -> DriftView:
+        return DriftView(o.name, o.T.copy(), o.P.copy(), o.sigma_image, o.rotation_only)
+
+    def to_json(self) -> dict[str, Any]:
+        return {"name": self.name, "T": self.T.tolist(), "P": self.P.tolist(),
+                "sigma_image": list(self.sigma_image), "rotation_only": self.rotation_only}
+
+    @staticmethod
+    def from_json(d: dict[str, Any]) -> DriftView:
+        return DriftView(d["name"], np.asarray(d["T"], np.float64), np.asarray(d["P"], np.float64),
+                         (float(d["sigma_image"][0]), float(d["sigma_image"][1])),
+                         bool(d["rotation_only"]))
+
+
+def _correction(d: Drift, o: _DriftObs) -> float | None:
+    """How far a frame's image-only pose moves its prior from where the estimate ``d`` places
+    it, when beyond the prior's own sigma as sent (map.md §1 "No correction from one view",
+    oms/2.13): the image-only pose's residual against the prior as placed, weighed as the
+    registration fuses them (the image's share σ_placed² / (σ_placed² + σ_image²), σ_placed the
+    drift-grown sigma), against the prior's sigma as sent, position, and rotation by its 3-D RMS
+    sigma, separately; a rotation-only pose by its rotation. The move in metres (in degrees for
+    a rotation-only pose); None within it."""
+    T, sp, sr = d.predict(o.P, *o.sigma_prior, o.sigma_tilt)
+    dp, dr = pose_residual(o.T, T)
+    dp *= sp ** 2 / (sp ** 2 + o.sigma_image[0] ** 2)
+    dr *= sr ** 2 / (sr ** 2 + o.sigma_image[1] ** 2)
+    beyond_r = dr > sigmas.axes_rms(o.sigma_prior[1], o.sigma_tilt)
+    if o.rotation_only:
+        return dr if beyond_r else None
+    return dp if dp > o.sigma_prior[0] or beyond_r else None
+
+
+def _agreeing(v: DriftView, pool: list[DriftView], odo_scale: float) -> list[DriftView]:
+    """The views of ``pool`` (``v`` among them) that agree on the correction ``v`` implies
+    (map.md §1, oms/2.13): the estimate referenced at ``v`` (its image-only pose at its prior,
+    the odometry scale ``odo_scale``) predicts each one's image-only pose within ``K_SIGMA`` ×
+    hypot(both image sigmas, the drift-grown rate over their priors' distance), position (unless
+    either is rotation-only) and rotation separately. ``v`` first."""
+    trial = Drift(v.T, v.P, odo_scale)
+    out = [v]
+    for w in pool:
+        if w.name == v.name:
+            continue
+        T = trial.predict(w.P, 0.0, 0.0)[0]
+        dp, dr = pose_residual(w.T, T)
+        d = float(np.linalg.norm(w.P[:3, 3] - v.P[:3, 3]))
+        tp = K_SIGMA * math.hypot(v.sigma_image[0], w.sigma_image[0], DRIFT_POS_REL * d)
+        tr = K_SIGMA * math.hypot(v.sigma_image[1], w.sigma_image[1], DRIFT_ROT_DEG_PER_M * d)
+        if dr <= tr and (v.rotation_only or w.rotation_only or dp <= tp):
+            out.append(w)
+    return out
+
+
+def _independent(views: list[DriftView]) -> list[DriftView]:
+    """The independent views among ``views`` (map.md §1, oms/2.13), in their order: each counts
+    when its prior lies at least ``DRIFT_INDEPENDENT_M`` from, or looks at least
+    ``DRIFT_INDEPENDENT_DEG`` away from, every view counted before it."""
+    out: list[DriftView] = []
+    for v in views:
+        if all(float(np.linalg.norm(v.P[:3, 3] - c.P[:3, 3])) >= DRIFT_INDEPENDENT_M
+               or math.degrees(math.acos(max(-1.0, min(1.0, float(v.P[:3, 2] @ c.P[:3, 2])))))
+               >= DRIFT_INDEPENDENT_DEG for c in out):
+            out.append(v)
+    return out
 
 
 def _drift_inliers(d: Drift, obs: list[_DriftObs]) -> set[int]:
@@ -2507,6 +2659,12 @@ class AnchoredMap:
         self._close_base: Drift | None = None
         self.reran: set[str] = set()
         self._retried_drifting = False
+        # the running job's one-view rule (map.md §1, oms/2.13; ``_one_view_rule``): the views it
+        # held (kept by ``_close_drift``), their names (still observations in the next pass) and
+        # its report (held, the views agreeing on the largest correction, those consumed)
+        self._held: list[DriftView] = []
+        self._held_names: set[str] = set()
+        self._rule: tuple[bool, list[str], list[str]] = (False, [], [])
         self._pair_cache: dict[str, Any] | None = None
 
     @property
@@ -2665,6 +2823,7 @@ class AnchoredMap:
         if not self.reran:  # a second registration of the job keeps them (``_epi``)
             self._epi, self._placed, self._preps, self._digests = {}, {}, {}, {}
         self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
+        self._held, self._held_names, self._rule = [], set(), (False, [], [])
         got = self.map_floor()
         self.floor_z, self.floor_z_sigma, self.floor_z_rel = (None, 0.0, 0.0) if got is None \
             else got
@@ -2759,6 +2918,11 @@ class AnchoredMap:
             sp, sr = _prior_sigmas(p)
             out.append(pose_residual(P, est.predict(P, sp, sr, _tilt_sigma(p))[0]))
         return out, est.odo_scale if est.ref_T is not None else 1.0
+
+    def drift_rule(self) -> dict[str, Any]:
+        """The one-view rule's report of the last job (map.md §1 "No correction from one view",
+        oms/2.13): ``held`` and ``agreeing_frames`` of ``quality.drift_correction``."""
+        return {"held": self._rule[0], "agreeing_frames": list(self._rule[1])}
 
     def prior_bias(self) -> float:
         """The metric priors' own scale bias, measured against image baselines whose scale the
@@ -2890,16 +3054,24 @@ class AnchoredMap:
     def _scale_sigma(self, k: Keyframe) -> float:
         """The sigma of a reference keyframe's depth scale: a depth image's, else the monocular
         scale's while something measured it, else ``MONOCULAR_REGISTRATION_SIGMA_REL``."""
-        if k.depth_kind == "sensor":
-            return SENSOR_SCALE_SIGMA_REL
-        if self.scale.source == "monocular":
-            return MONOCULAR_REGISTRATION_SIGMA_REL
-        return max(self.scale.sigma_rel, SENSOR_SCALE_SIGMA_REL)
+        return self._kind_scale_sigma(k.depth_kind)
 
     def _refs(self, cands: list[Keyframe]) -> Refs:
         return Refs(np.array([k.centre for k in cands]),
                     np.array([self._scale_sigma(k) for k in cands]),
-                    np.array([k.median_depth or 2.0 for k in cands]))
+                    np.array([k.median_depth or 2.0 for k in cands]),
+                    np.array([DEPTH_NOISE_REL if k.depth_kind == "sensor"
+                              else DEPTH_POINT_SIGMA_REL for k in cands]),
+                    np.array([self._floor_ratio(k) for k in cands]))
+
+    def _floor_ratio(self, k: Keyframe) -> float:
+        """How a reference keyframe's lifted depth (``_depth_factor``: the map's scale k) stands
+        to its own floor-check scale (``Keyframe.floor_factor``, map.md §2), so where its lifted
+        points put the floor (map.md §2 "Texture-aliasing guards", oms/2.13): 1 for a depth image
+        or a keyframe without its own scale."""
+        if k.depth_kind != "mono" or k.floor_factor is None or k.floor_factor <= 0:
+            return 1.0
+        return self._depth_factor(k) / k.floor_factor
 
     @staticmethod
     def _thr(K: Intrinsics) -> float:
@@ -2981,42 +3153,170 @@ class AnchoredMap:
         prior's prediction (a stored kept keyframe placed again: its pose as kept). Its scale
         evidence is left in ``Placement.evidence``, recorded only when the job keeps it."""
         pred = self._predict(f) if predicted is None else predicted
-        T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         if cands is None:
             cands = self.candidates_for(f, descriptor, pred)
+        return self._place(f, feats, cands, pred)
+
+    def _image_pose(self, f: FrameIn, feats: Features, corr: _Corr, cands: list[Keyframe],
+                    T0: Array | None, sp0: float
+                    ) -> tuple[tuple[Any, ...], _Corr, float | None] | None:
+        """A frame's image-only pose on its correspondences ``corr`` (``place``): the first pose
+        (``_init``) refined, the texture-aliasing guards of a points fit (map.md §2, oms/2.13:
+        ``_depth_guard``, then the floor points: a fit with fewer than ``MIN_INLIERS`` off-floor
+        inliers is fitted again on the off-floor correspondences alone, which hold no floor point:
+        the fit ends there), and
+        the depth confirmation (``depth_confirms``). Returns the image pose (``(s, n, share,
+        method, spi, sri, sub, refs)``), the correspondences it was fitted on and its inliers'
+        floor share (None: no points fit, or no map floor); None: no image pose."""
+        init = self._init(f, corr, cands, T0) if len(corr.uv) >= MIN_INLIERS else None
+        if init is None:
+            return None
+        R, c, inl, rot_only = init
+        refs = self._refs(cands)
+        sub = (corr.uv[inl], corr.X[inl], corr.d[inl], corr.kf[inl])
+        s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
+        if not rot_only:
+            got = self._depth_guard(f, s, sub, refs)
+            if got is None:
+                return None
+            s = got
+            off, _ = self._floor_count(s, sub, refs)
+            if off < MIN_INLIERS:
+                # floor points never support a pose alone (map.md §2, oms/2.13): the fit again
+                # without them, their texture repeating across the floor
+                keep = ~self._on_floor(corr.X, corr.kf, refs)
+                log.info("%s: %d of %d inliers off the floor: fitted again on the %d off-floor "
+                         "correspondences", f.name, off, int(s.inliers.sum()), int(keep.sum()))
+                return self._image_pose(f, feats, _Corr(corr.uv[keep], corr.X[keep],
+                                                        corr.d[keep], corr.kf[keep]),
+                                        cands, T0, sp0)
+        n = int(s.inliers.sum())
+        # a candidate pose the depth images do not confirm is no placement (map.md §2 step
+        # 2): a lattice pose is never registered; a translational twin picked over it
+        # replaces it (P28)
+        gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, feats,
+                                   None if T0 is None else (T0[:3, 3], sp0)) \
+            if n >= MIN_INLIERS else None
+        if gate and gate[1] is not None:
+            s, sub, rot_only = gate[0], gate[1], False
+            n = int(s.inliers.sum())
+        if not gate:
+            return None
+        spi, sri = s.sigmas()
+        spi = max(spi, MIN_SIGMA_POS_M)
+        sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
+        if rot_only:
+            spi = sp0 if T0 is not None else UNANCHORED_SIGMA_POS_M
+        share = None if rot_only else self._floor_count(s, sub, refs)[1]
+        return ((s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri, sub,
+                 refs), corr, share)
+
+    def _floor(self) -> tuple[float, float] | None:
+        """The running job's map floor and its sigma (``begin_job``: ``map_floor``), which
+        defines its floor points (map.md §2, oms/2.13); None without a map floor."""
+        return None if self.floor_z is None else (self.floor_z, self.floor_z_sigma)
+
+    def _on_floor(self, X: Array, ref: NDArray[np.intp], refs: Refs) -> NDArray[np.bool_]:
+        """Which of the map points ``X`` (lifted from the references ``refs`` by index ``ref``)
+        are floor points (``floor_points``): each point's height sigma its reference depth's
+        relative sigma (its scale's and its per-point noise, ``Refs.point_sigma``) times that
+        reference camera's height above the floor (a floor point's height error on a depth
+        error)."""
+        floor = self._floor()
+        if floor is None:
+            return np.zeros(len(X), bool)
+        ratio = np.ones(len(ref)) if refs.floor_ratio is None else refs.floor_ratio[ref]
+        cz = refs.c[ref, 2]
+        h = np.abs(cz - floor[0]) * ratio
+        point = DEPTH_POINT_SIGMA_REL if refs.point_sigma is None else refs.point_sigma[ref]
+        # a scale nothing measured (the monocular model's metres) places no floor: only the
+        # per-point noise then
+        scale = refs.scale_sigma[ref] if self.scale.source != "monocular" else 0.0
+        # the floor where each reference's lifted depth puts it
+        lifted = X.copy()
+        lifted[:, 2] -= cz + (floor[0] - cz) * ratio - floor[0]
+        return floor_points(lifted, floor, np.hypot(scale, point) * h)
+
+    def _floor_count(self, s: Solve, sub: tuple[Array, Array, Array, NDArray[np.intp]],
+                     refs: Refs) -> tuple[int, float | None]:
+        """A points fit's off-floor inliers (map.md §2, oms/2.13) and its inliers' floor share
+        (None without a map floor or inliers): every inlier is off the floor without one."""
+        X = sub[1][s.inliers]
+        on = self._on_floor(X, sub[3][s.inliers], refs)
+        share = None if self._floor() is None or not len(X) else round(float(on.mean()), 4)
+        return int((~on).sum()), share
+
+    def _kind_scale_sigma(self, kind: str) -> float:
+        """The relative sigma of a depth's scale by its kind: a depth image's
+        ``SENSOR_SCALE_SIGMA_REL``; a monocular depth's, the map's ``scale_sigma_rel`` while a
+        source other than the monocular model measured it (at least the former), else
+        ``MONOCULAR_REGISTRATION_SIGMA_REL``."""
+        if kind == "sensor":
+            return SENSOR_SCALE_SIGMA_REL
+        if self.scale.source == "monocular":
+            return MONOCULAR_REGISTRATION_SIGMA_REL
+        return max(self.scale.sigma_rel, SENSOR_SCALE_SIGMA_REL)
+
+    def _own_depth(self, f: FrameIn) -> tuple[NDArray[np.float32], Intrinsics, str] | None:
+        """A frame's own depth for the depth-consistency guard (map.md §2, oms/2.13): its depth
+        grid in metres at the map's scale, the grid's intrinsics and its depth kind: a stored
+        keyframe placed again, its stored depth (``FrameIn.own_depth``); else its depth image;
+        else its monocular depth at the map's scale k. None without any."""
+        if f.own_depth is not None:
+            return f.own_depth
+        own = depth_image(f)
+        if own is not None:
+            return own, f.K, "sensor"
+        if f.mono is None:
+            return None
+        d, Kg, _, _ = f.mono()
+        return (d * self.scale.k).astype(np.float32), Kg, "mono"
+
+    def _depth_guard(self, f: FrameIn, s: Solve, sub: tuple[Array, Array, Array, NDArray[np.intp]],
+                     refs: Refs) -> Solve | None:
+        """The depth-consistency guard of a points fit ``s`` on ``sub`` (map.md §2, oms/2.13,
+        ``depth_consistency``): the fit with the inliers its own depth contradicts left out;
+        None when the fit as a whole is inconsistent or left below ``MIN_INLIERS``. As it is
+        when the frame has no depth of its own."""
+        own = self._own_depth(f)
+        if own is None:
+            return s
+        grid, Kg, kind = own
+        sig_own = self._kind_scale_sigma(kind)
+        uv, X, _, ref = sub
+        idx = np.flatnonzero(s.inliers)
+        z_own = sample_depth(grid, Kg, f.K, uv[idx]).astype(np.float64)
+        z_pred = ((X[idx] - s.c) @ s.R)[:, 2]
+        sig = np.hypot(sig_own, refs.scale_sigma[ref[idx]])
+        # a monocular frame's own depth scale is free (the floor check judges it, map.md §2):
+        # its depth's shape is tested, not its scale
+        keep, whole = depth_consistency(z_own, z_pred, sig, kind == "mono")
+        n = int(keep.sum())
+        if not whole or n < MIN_INLIERS:
+            log.info("%s: its own depth contradicts the fit (%d of %d inliers consistent%s): no "
+                     "image pose", f.name, n, len(idx), "" if whole else ", median beyond bound")
+            return None
+        if n == len(idx):
+            return s
+        inl = s.inliers.copy()
+        inl[idx[~keep]] = False
+        return dataclasses.replace(s, inliers=inl)
+
+    def _place(self, f: FrameIn, feats: Features, cands: list[Keyframe],
+               pred: tuple[Array, float, float] | None) -> Placement:
+        """``place``'s placement against ``cands``, from the prediction ``pred``."""
+        T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         # an unplaced frame is no_overlap: in updates few_features is only the checks' verdict
         # (api.md §4, held in ``FrameIn.unconfirmed``)
         reason = "no_overlap"
         corr = self._correspondences(feats, cands, pred, f.K) if cands and len(feats.kps) \
             else None
-        init = None
-        if corr is not None and len(corr.uv) >= MIN_INLIERS:
-            init = self._init(f, corr, cands, T0)
         img = None
-        if init is not None:
-            assert corr is not None
-            R, c, inl, rot_only = init
-            refs = self._refs(cands)
-            sub = (corr.uv[inl], corr.X[inl], corr.d[inl], corr.kf[inl])
-            s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
-            n = int(s.inliers.sum())
-            # a candidate pose the depth images do not confirm is no placement (map.md §2 step
-            # 2): a lattice pose is never registered; a translational twin picked over it
-            # replaces it (P28)
-            gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, feats,
-                                       None if T0 is None else (T0[:3, 3], sp0)) \
-                if n >= MIN_INLIERS else None
-            if gate and gate[1] is not None:
-                s, sub, rot_only = gate[0], gate[1], False
-                n = int(s.inliers.sum())
-            if gate:
-                spi, sri = s.sigmas()
-                spi = max(spi, MIN_SIGMA_POS_M)
-                sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
-                if rot_only:
-                    spi = sp0 if T0 is not None else UNANCHORED_SIGMA_POS_M
-                img = (s, n, n / len(corr.uv), "rotation" if rot_only else "pnp", spi, sri,
-                       sub, refs)
+        floor_share: float | None = None
+        if corr is not None:
+            got = self._image_pose(f, feats, corr, cands, T0, sp0)
+            if got is not None:
+                img, corr, floor_share = got
         if T0 is None:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
@@ -3039,7 +3339,7 @@ class AnchoredMap:
                              refs=_ref_ids(cands, sub[3][s.inliers]),
                              inlier_share=ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K),
                              unconstrained=method != "rotation" and self._unconstrained(
-                                 f, feats, s, sub[3], cands))
+                                 f, feats, s, sub[3], cands), inlier_floor_share=floor_share)
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
@@ -3058,7 +3358,9 @@ class AnchoredMap:
         rot_only = method == "rotation"
         tested = self._image_conflict(f, img, cands, T0, sp0, sr0)
         if tested is None:
-            return self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
+            kept = self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
+            kept.inlier_floor_share = floor_share
+            return kept
         dp, dr, ci, conflict = tested
         share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
         measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
@@ -3071,14 +3373,17 @@ class AnchoredMap:
                 kept = self.kept_at(f, "no_overlap", n, detail="conflict_unsupported",
                                     pred=pred)
                 kept.align_T, kept.image_sigmas, kept.inlier_share = s.T, ci, share
+                kept.inlier_floor_share = floor_share
                 return kept
             assert corr is not None
             hyp = None if rot_only else self._near_prior(f, corr, cands, T0, sp0, sr0, n)
             if hyp is None:
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr), align_T=s.T, image_sigmas=ci, has_prior=True,
-                                 prior_ref=ref, inlier_share=share, measurable=True)
+                                 prior_ref=ref, inlier_share=share, measurable=True,
+                                 inlier_floor_share=floor_share)
             s, n, sub, refs = hyp
+            floor_share = self._floor_count(s, sub, refs)[1]
             spi, sri = s.sigmas()
             spi, sri = max(spi, MIN_SIGMA_POS_M), max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
         assert corr is not None
@@ -3088,6 +3393,7 @@ class AnchoredMap:
         pl.inlier_share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
+        pl.inlier_floor_share = floor_share
         return pl
 
     def _image_conflict(self, f: FrameIn, img: Any, cands: list[Keyframe], T0: Array,
@@ -3175,6 +3481,11 @@ class AnchoredMap:
         refs = self._refs(cands)
         sub = (corr.uv[near], corr.X[near], corr.d[near], corr.kf[near])
         s, _ = refine_pose(T0[:3, :3].copy(), T0[:3, 3].copy(), *sub, refs, f.K)
+        # the texture-aliasing guards of any points fit (map.md §2, oms/2.13)
+        got = self._depth_guard(f, s, sub, refs)
+        if got is None or self._floor_count(got, sub, refs)[0] < MIN_INLIERS:
+            return None
+        s = got
         n = int(s.inliers.sum())
         dp, dr = pose_residual(s.T, T0)
         trust = None if f.prior is None else f.prior["trust"]
@@ -4410,7 +4721,8 @@ class AnchoredMap:
                 assert pl.T is not None
                 T, sh = pl.T, (MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG)
             elif (pl.status == "registered" or pl.reason == "prior_conflict"
-                  or (pl.detail == "conflict_unsupported" and _can_support(pl))) \
+                  or (pl.detail == "conflict_unsupported"
+                      and (_can_support(pl) or f.name in self._held_names))) \
                     and pl.align_T is not None and pl.image_sigmas is not None:
                 T, sh = pl.align_T, pl.image_sigmas
             else:
@@ -4436,11 +4748,57 @@ class AnchoredMap:
         sigmas): only the frames that conflict with their priors under it are rejected. Returns
         the new estimate (None: the one in force stays) and the observations it leaves out,
         each a ``prior_conflict`` rejection."""
-        obs = self._drift_evidence(frames, out)
+        every = self._drift_evidence(frames, out)
         able = {i for i, pl in out.items() for p in [frames[i].prior]
                 if p is not None and p["trust"] == "drifting" and _can_support(pl)}
-        if not obs:
+        if not every:
+            self._held, self._rule = [], (False, [], [])
             return None, {}
+        # no correction from one view (map.md §1, oms/2.13): a frame moving its prior beyond the
+        # prior's own sigma without enough independent views agreeing is held out of the fit
+        held = self._one_view_rule(every, used)
+        held_out = _drift_outliers(used, [o for o in every if o.index in held], set())
+        obs = [o for o in every if o.index not in held]
+        got_fit, outliers = self._fit_obs(obs, able, used)
+        return got_fit, {**outliers, **held_out}
+
+    def _one_view_rule(self, obs: list[_DriftObs], used: Drift) -> set[int]:
+        """The frames the one-view rule holds (map.md §1 "No correction from one view",
+        oms/2.13): those of ``obs`` whose image-only pose moves their prior beyond the prior's
+        own sigma from where the estimate in force (``used``) places it (``_correction``) without
+        ``DRIFT_AGREE_MIN`` independent views agreeing (``_agreeing``), the views the job's
+        observations and the earlier jobs' held ones (``Drift.pending``). Records them for
+        ``_close_drift`` (``_held``), their names for the next pass (``_held_names``) and the
+        report (``_rule``: whether it held one, the views agreeing on the largest correction
+        tested, and the kept views that agreed on an allowed one, consumed)."""
+        views = [DriftView.of(o) for o in obs if o.pl.method not in ("origin", "prior")]
+        pool = views + [v for v in used.pending if v.name not in {w.name for w in views}]
+        held: set[int] = set()
+        largest: tuple[float, list[str]] | None = None
+        consumed: list[str] = []
+        for o in sorted(obs, key=lambda o: o.name):
+            size = _correction(used, o)
+            if size is None:
+                continue
+            agree = _agreeing(DriftView.of(o), pool, used.odo_scale)
+            names = sorted(v.name for v in agree)
+            if largest is None or size > largest[0]:
+                largest = (size, names)
+            if len(_independent(agree)) >= DRIFT_AGREE_MIN:
+                consumed += [v.name for v in agree]
+                continue
+            held.add(o.index)
+            log.info("%s: its image pose moves its drifting prior by %.3f, beyond the prior's "
+                     "sigma, and %d independent views agree (needs %d): held as a prior "
+                     "conflict", o.name, size, len(_independent(agree)), DRIFT_AGREE_MIN)
+        self._held = [DriftView.of(o) for o in obs if o.index in held]
+        self._held_names = {o.name for o in obs if o.index in held}
+        self._rule = (bool(held), [] if largest is None else largest[1], consumed)
+        return held
+
+    def _fit_obs(self, obs: list[_DriftObs], able: set[int], used: Drift
+                 ) -> tuple[Drift | None, dict[int, Placement]]:
+        """``_fit_drift``'s fit over the observations ``obs`` the one-view rule left in."""
         base = _drift_inliers(used, obs)
         best, best_in = None, base
         for o in sorted(obs, key=lambda o: o.name):
@@ -4460,6 +4818,10 @@ class AnchoredMap:
         # robust support (map.md §1): the inliers that can support it, at least min(3, n) of the
         # n that can, at least half of them, never one alone
         n, got_n = len(able), len(best_in & able)
+        # the earlier jobs' held views that agreed on this job's correction support it too (map.md
+        # §1, oms/2.13): a robot sending one frame per job is not refused for being alone
+        kept = len({v.name for v in used.pending} & set(self._rule[2]))
+        n, got_n = n + kept, got_n + kept
         supported = got_n >= max(min(DRIFT_MIN_SUPPORT, n), DRIFT_NEVER_ALONE) \
             and got_n >= DRIFT_SUPPORT_SHARE * n
         if (large or not previous) and not supported:
@@ -4468,6 +4830,7 @@ class AnchoredMap:
             return None, _drift_outliers(used, obs, base)
         fitted.fit_sigma = (sp, sr)
         fitted.support = [o.P[:3, 3].tolist() for o in obs if o.index in best_in]
+        fitted.pending = list(used.pending)
         return fitted, _drift_outliers(fitted, obs, best_in)
 
     def _close_drift(self, frames: list[FrameIn], out: dict[int, Placement], used: Drift
@@ -4491,6 +4854,11 @@ class AnchoredMap:
         obs = [o for o in self._drift_evidence(frames, out) if o.pl.status == "registered"]
         if obs:
             self.drift.ref_T = _refined_drift(self.drift, obs).ref_T
+        # the views the one-view rule held are kept for later jobs, those that agreed on an
+        # allowed correction consumed (map.md §1, oms/2.13)
+        gone = set(self._rule[2]) | {v.name for v in self._held}
+        self.drift.pending = [*(v for v in self.drift.pending if v.name not in gone),
+                              *self._held][-DRIFT_PENDING_MAX:]
 
     def keyframe(self, kid: str) -> Keyframe | None:
         """The keyframe of id ``kid``, or None."""
@@ -4723,8 +5091,13 @@ class AnchoredMap:
                  "sigma_pos_m": kf.prior["sigma_pos_m"], "sigma_rot_deg": kf.prior["sigma_rot_deg"]}
         if kf.prior.get("sigma_tilt_deg") is not None:
             prior["sigma_tilt_deg"] = kf.prior["sigma_tilt_deg"]
+        # its stored depth only tests the fit's inliers (map.md §2, oms/2.13), never confirms it;
+        # a depth the floor check did not judge serves nothing (P30d)
+        grid = self._grid(kf) if kf.lifts() and kf.depth_kind != "none" else None
         f = FrameIn(kf.name, kf.camera_id, rgb, kf.K, prior, None, height_m=kf.height_m,
-                    height_sigma_m=kf.height_sigma_m, features_count=len(kf.feats.kps))
+                    height_sigma_m=kf.height_sigma_m, features_count=len(kf.feats.kps),
+                    own_depth=None if grid is None or kf.K_grid is None
+                    else (grid.depth, kf.K_grid, kf.depth_kind))
         pl = self.place(f, kf.feats, kf.descriptor, (kf.T, kf.sigma_pos_m, kf.sigma_rot_deg))
         # its registration re-run whole, the distance limit included (as ``_rounds``: only
         # image feature inliers count toward ``TOO_CLOSE_INLIERS``)

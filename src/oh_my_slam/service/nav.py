@@ -385,17 +385,24 @@ def locate_summary(fr: LocateFrame, res: dict[str, Any]) -> dict[str, Any]:
     """A locate answer's line in the service log: the frame's name, status and reason, its
     sigmas, and its residual against the prior sent (m, deg; null without a prior or a pose), so
     a client measures the located sigmas' containment against its own truth."""
-    p, T = fr.prior, res["T_map_cam"]
-    dm = dd = None
-    if p is not None and "T_map_cam" in p and T is not None:
-        A, B = np.asarray(T, np.float64), np.asarray(p["T_map_cam"], np.float64)
-        dm = round(float(np.linalg.norm(A[:3, 3] - B[:3, 3])), 4)
-        c = (float(np.trace(A[:3, :3].T @ B[:3, :3])) - 1.0) / 2.0
-        dd = round(math.degrees(math.acos(max(-1.0, min(1.0, c)))), 3)
+    p = fr.prior
+    dm, dd = prior_residual(fr, res["T_map_cam"])
     return {"name": fr.name, "status": res["status"], "reason": res["reason"],
             "sigma_pos_m": res["sigma_pos_m"], "sigma_rot_deg": res["sigma_rot_deg"],
             "prior": None if p is None else p.get("trust"),
             "prior_residual_m": dm, "prior_residual_deg": dd}
+
+
+def prior_residual(fr: LocateFrame, T: Any) -> tuple[float | None, float | None]:
+    """A located pose ``T`` against the frame's prior as sent (m, deg; api.md §6
+    ``prior_residual_*``, oms/2.13); nulls without a prior or a pose."""
+    p = fr.prior
+    if p is None or "T_map_cam" not in p or T is None:
+        return None, None
+    A, B = np.asarray(T, np.float64), np.asarray(p["T_map_cam"], np.float64)
+    c = (float(np.trace(A[:3, :3].T @ B[:3, :3])) - 1.0) / 2.0
+    return (round(float(np.linalg.norm(A[:3, 3] - B[:3, 3])), 4),
+            round(math.degrees(math.acos(max(-1.0, min(1.0, c)))), 3))
 
 
 def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
@@ -410,7 +417,8 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                                "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
                                "inlier_ratio": None, "ambiguity": None, "rivals": [],
                                "consistent_with_prior": None, "height_consistent": None,
-                               "nearest_view": None}
+                               "prior_residual_m": None, "prior_residual_deg": None,
+                               "inlier_floor_share": None, "nearest_view": None}
         reason = checks.reason(measures, None)
         if reason not in ("plain", "blur"):  # locate's few_features is its own keypoint count
             reason = "few_features" if len(q.uv) < relocalize.MIN_INLIERS else None
@@ -428,7 +436,10 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                             q, o.T, o.sigma_pos_m, o.height_sigma_m),
                         "sigma_rot_deg": o.sigma_rot_deg,
                         "inlier_ratio": o.inlier_ratio, "ambiguity": o.ambiguity,
-                        "rivals": o.rivals, "consistent_with_prior": o.consistent_with_prior})
+                        "rivals": o.rivals, "consistent_with_prior": o.consistent_with_prior,
+                        "inlier_floor_share": o.floor_share})
+            res["prior_residual_m"], res["prior_residual_deg"] = prior_residual(
+                fr, res["T_map_cam"])
         elif o.reason is not None:  # prior_conflict
             res["reason"] = o.reason
         else:  # enough keypoints, no pose: no overlap with the map

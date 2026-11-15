@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.12. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.13. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -441,6 +441,31 @@
           ],
           "description": "Residual between the committed pose and the frame's prior as placed (a drifting prior through the drift estimate, map.md section 1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is quality.max_displacement_m / max_displacement_deg, frames without a prior aside (those are measured against their image-only pose)."
         },
+        "prior_residual_sent_m": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "oms/2.13. Residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior as sent, before any drift estimate placed it; null without a prior or a pose."
+        },
+        "prior_residual_sent_deg": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "oms/2.13. Residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior as sent, before any drift estimate placed it; null without a prior or a pose."
+        },
+        "inlier_floor_share": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "oms/2.13. Share of the image pose's inliers that are floor points (within max(0.06 m, 3 x hypot(the floor's sigma, the point's height sigma)) of the map floor as the point's reference depth places it, map.md section 2, Texture-aliasing guards). Null without a points fit (no image pose, a rotation-only fit, the older mapper) or without a map floor."
+        },
         "depth_scale": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -723,6 +748,17 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "The estimate's odometry scale: map metres per odometry metre; 1 without scale evidence."
+        },
+        "held": {
+          "type": "boolean",
+          "description": "oms/2.13. Whether the one-view rule (map.md section 1, No correction from one view) held at least one of the job's frames: its image-only pose moved its drifting prior by more than the prior's own sigma without DRIFT_AGREE_MIN independent views agreeing, so it was treated as a prior conflict. Absent on a report written before oms/2.13."
+        },
+        "agreeing_frames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "oms/2.13. The views (this job's frames and earlier jobs' held ones) that agreed on the largest correction the one-view rule tested, that frame included, sorted by name; empty when no frame's correction exceeded its prior's sigma."
         }
       }
     },
@@ -2434,7 +2470,7 @@
               "type": "null"
             }
           ],
-          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior, position and rotation tested separately (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg)."
+          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior, position and rotation tested separately (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg). With a map floor (oms/2.13), a fit whose off-floor inliers are fewer than that minimum is no pose: no_overlap when no other hypothesis has enough."
         },
         "T_map_cam": {
           "oneOf": [
@@ -2531,6 +2567,31 @@
             "null"
           ],
           "description": "When the map's scale_source is camera_height: false when |z_located - z_expected| > 3 x sqrt(height_sigma^2 + sigma_z^2), sigma_z = sigma_rel / sqrt(3); z_expected is the floor height plus the locate frame's height_above_floor_m, else the camera's registered height; height_sigma is, in order: the locate frame's height_sigma_m; else the median height_sigma_m the answer's reference keyframes carried when sent; else the median sigma_pos_m / sqrt(3) of the registered (image-confirmed) reference keyframes, kept references skipped; else the README default. The reported position sigma is hypot(sigma_rel, |z_located - z_expected|). Such a hypothesis ranks below any height-consistent rival. Null without any height (sigma = sigma_rel) or another scale source."
+        },
+        "prior_residual_m": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "oms/2.13. The located pose against the frame's prior as sent; null without a prior or a pose."
+        },
+        "prior_residual_deg": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "oms/2.13. The located pose against the frame's prior as sent; null without a prior or a pose."
+        },
+        "inlier_floor_share": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "oms/2.13. Share of the located pose's inliers that are floor points (api.md section 6, Floor points); null for a turn fit, without a pose or without a map floor."
         },
         "nearest_view": {
           "oneOf": [

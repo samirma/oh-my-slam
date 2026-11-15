@@ -38,6 +38,11 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
   (``sigmas.conflicts``); none there is ``prior_conflict``. Without a prior, the
   best-supported, preferring those at the camera's expected height. Its sigmas are its own fit's
   only, never the spread of its rivals.
+* **Floor points** (api.md §6, oms/2.13; ``floor_points``). With a map floor (``Index.floor``),
+  a correspondence whose map point lies within the floor band of it is a floor point: the
+  hypotheses also hold a fit on the off-floor correspondences alone, and only one with
+  ``MIN_INLIERS`` off-floor inliers (``standing``) can be reported; a floor-dominated one stays
+  a rival. None standing is no pose (``no_overlap``).
 * **Rivals.** Every other supported hypothesis farther than ``RIVAL_POS_M`` or ``RIVAL_ROT_DEG``
   from the reported pose, whatever else its inliers explain, strongest first (``rivals_of``);
   ``ambiguity`` is the first (api.md §6)."""
@@ -53,7 +58,12 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from oh_my_slam.core.constants import REGISTRATION_MIN
+from oh_my_slam.core.constants import (
+    DEPTH_POINT_SIGMA_REL,
+    FLOOR_BAND_MIN_M,
+    FLOOR_BAND_SIGMAS,
+    REGISTRATION_MIN,
+)
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import DEFAULT_SIGMA_POS_M, DEFAULT_SIGMA_ROT_DEG
 from oh_my_slam.mapping.locate import kabsch, turn_ransac
@@ -204,6 +214,12 @@ class Keyframe:
 @dataclass
 class Index:
     keyframes: list[Keyframe]
+    # the version's map floor (its height and sigma; api.md §6 "Floor points", oms/2.13): its
+    # floor points never place a frame alone; None without a map floor
+    floor: tuple[float, float] | None = None
+    # the relative sigma of the version's measured depth scale that widens a floor point's band
+    # (0 for a monocular version, whose scale places no floor)
+    floor_scale: float = 0.0
     _flann: Any = None
     _owner: NDArray[np.int64] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -398,6 +414,9 @@ class Outcome:
     nearest: int | None = None  # keyframe index most similar by votes (for no_overlap)
     votes: NDArray[np.int64] = field(default_factory=lambda: np.zeros(0, np.int64))
     height_sigma_m: float | None = None  # the height_sigma its height test used (``z_sigma``)
+    # the share of its inliers that are floor points (api.md §6, oms/2.13); None without a
+    # points fit or a map floor
+    floor_share: float | None = None
 
     @property
     def located(self) -> bool:
@@ -757,7 +776,7 @@ def locate(q: Query, index: Index) -> Outcome:
         out.nearest = int(np.argmin([float(np.linalg.norm(k.centre - c))
                                      for k in index.keyframes]))
     px = PX_THRESHOLD * max(q.width, q.height) / 640.0
-    iq_l, xyz_l, kf_l, s_l, ray_q, ray_k, ray_kf = [], [], [], [], [], [], []
+    iq_l, xyz_l, kf_l, s_l, ray_q, ray_k, ray_kf, h_l = [], [], [], [], [], [], [], []
     per_kf: list[tuple[int, int]] = []
     for i in chosen:
         kf = index.keyframes[i]
@@ -774,6 +793,13 @@ def locate(q: Query, index: Index) -> Outcome:
         kf_l.append(np.full(int(ok.sum()), i))
         # the scale sigma of the depth each point came from (0: triangulated)
         s_l.append(np.where(kf.lifted_mask()[m[ok, 1]], kf.scale_sigma_rel, 0.0))
+        # a floor point's height sigma (oms/2.13): its depth's relative sigma times the
+        # keyframe camera's height above the floor
+        if index.floor is not None:
+            h = abs(float(kf.centre[2]) - index.floor[0])
+            rel = math.hypot(index.floor_scale, DEPTH_SIGMA_REL if kf.depth
+                             else DEPTH_POINT_SIGMA_REL)
+            h_l.append(np.full(int(ok.sum()), rel * h))
         per_kf.append((int(ok.sum()), i))
     # every correspondence (a query keypoint may match points of several keyframes: a symmetric
     # room's twin views give each its own hypothesis); a pose's support counts query keypoints
@@ -787,6 +813,12 @@ def locate(q: Query, index: Index) -> Outcome:
         mask = inliers_of(T, q.K, uv, xyz, px)
         return Hypothesis(T, int(np.unique(iq[mask]).size), mask)
 
+    # floor points (api.md §6 "Floor points", oms/2.13): a pose needs MIN_INLIERS off them
+    on_floor = floor_points(xyz, index.floor, np.concatenate(h_l) if h_l else 0.0)
+
+    def standing(h: Hypothesis) -> bool:
+        return index.floor is None or int(np.unique(iq[h.mask & ~on_floor]).size) >= MIN_INLIERS
+
     pooled = pnp(uv, xyz, q.K, px)
     if pooled is not None and hypothesis(pooled[0]).inliers >= MIN_INLIERS:
         hyps = [hypothesis(pooled[0])]
@@ -798,30 +830,36 @@ def locate(q: Query, index: Index) -> Outcome:
         near = near_prior(q, index)
         if near:
             subsets.append(np.isin(kfs, near))
+        if on_floor.any():  # the fit on the off-floor correspondences alone (oms/2.13)
+            subsets.append(~on_floor)
         for seed, sel in enumerate(subsets, 1):
             got = pnp(uv[sel], xyz[sel], q.K, px, seed=seed) if sel.any() else None
             if got is not None:
                 hyps.append(hypothesis(got[0]))
         # a degenerate solve is no hypothesis (a wrong pose is worse than none)
         hyps = [h for h in hyps if plausible(h, kfs, index)]
-        if not hyps:
+        # only a hypothesis standing off the floor can be reported (oms/2.13); a floor-dominated
+        # one stays a rival
+        cands = [h for h in hyps if standing(h)]
+        if not cands:
             return out
         # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
         sig = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
-                       _on_depth(h, kfs, index), srel) for h in hyps]
-        zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in hyps]
-        k = choose(q, [h.T for h in hyps], [h.inliers for h in hyps], sig, zs)
+                       _on_depth(h, kfs, index), srel) for h in cands]
+        zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in cands]
+        k = choose(q, [h.T for h in cands], [h.inliers for h in cands], sig, zs)
         if k is None:
             out.reason = "prior_conflict"
             return out
         origin = np.array([index.keyframes[int(i)].centre for i in kfs]).reshape(-1, 3)
-        main, cov = _refined(hypothesis(_refine(hyps[k], q.K, uv, xyz, iq)), hypothesis, q, uv,
+        main, cov = _refined(hypothesis(_refine(cands[k], q.K, uv, xyz, iq)), hypothesis, q, uv,
                              xyz, origin, px)
         sp, sr = _sigmas(main, q, uv, xyz, iq, cov, _keyframe_sigmas(main, kfs, index),
                          _on_depth(main, kfs, index), srel)
-        if not within_prior(q, main.T, (sp, sr)):  # the refinement left the prior: as it was
-            main, (sp, sr) = hyps[k], sig[k]
-        others = [h for j, h in enumerate(hyps) if j != k]
+        # the refinement left the prior, or the off-floor points: as it was
+        if not within_prior(q, main.T, (sp, sr)) or not standing(main):
+            main, (sp, sr) = cands[k], sig[k]
+        others = [h for h in hyps if h is not cands[k]]
         best = max([main.inliers, *(h.inliers for h in others)])
         out.rivals = rivals_of(main.T, [h.T for h in others], [h.inliers for h in others], best)
         out.inliers = main.inliers
@@ -831,6 +869,8 @@ def locate(q: Query, index: Index) -> Outcome:
             sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
         out.height_sigma_m = _ref_z_sigma(q, kfs[main.mask], index)
+        out.floor_share = None if index.floor is None \
+            else round(float(on_floor[main.mask].mean()), 4)
         return _finish(q, out)
     if ray_q:
         turned = _turn(q, index, np.concatenate(ray_q), np.concatenate(ray_k),
@@ -838,6 +878,18 @@ def locate(q: Query, index: Index) -> Outcome:
         if turned is not None:
             return _with_votes(turned, out)
     return out
+
+
+def floor_points(xyz: Array, floor: tuple[float, float] | None, point_sigma: Any = 0.0
+                 ) -> NDArray[np.bool_]:
+    """Which correspondences' map points are floor points (api.md §6 "Floor points", oms/2.13):
+    within the floor band of the map floor ``floor`` (height, sigma), max(``FLOOR_BAND_MIN_M``,
+    ``FLOOR_BAND_SIGMAS`` × hypot(the floor's sigma, the point's height sigma ``point_sigma``));
+    none without a floor."""
+    if floor is None:
+        return np.zeros(len(xyz), bool)
+    band = np.maximum(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS * np.hypot(floor[1], point_sigma))
+    return np.asarray(np.abs(xyz[:, 2] - floor[0]) <= band, bool)
 
 
 def _finish(q: Query, o: Outcome) -> Outcome:

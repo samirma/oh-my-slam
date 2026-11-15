@@ -37,6 +37,10 @@ REGISTRATION_MIN = 15
 FLOOR_BAND_MIN_M = 0.06
 FLOOR_BAND_SIGMAS = 3.0
 FLOOR_SIGMA_DEFAULT_M = 0.02
+# map.md §2 "Texture-aliasing guards", api.md §6 "Floor points" (oms/2.13): the per-point floor of
+# a lifted point's relative depth sigma (monocular depth), in the depth-consistency guard and in
+# a floor point's height sigma
+DEPTH_POINT_SIGMA_REL = 0.10
 # map.md §2 "Ignored pixels": a detection with more than this share of its mask (its box when it
 # has no mask) inside the ignored pixels (the camera's and the frame's ignore masks) is dropped
 IGNORED_DETECTION_MAX_SHARE = 0.5

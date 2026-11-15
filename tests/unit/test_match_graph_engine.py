@@ -129,10 +129,12 @@ def test_a_drift_change_needs_three_frames_and_half_the_job(tmp_path: Path) -> N
     assert [(p.status, p.reason) for p in pls] == [("registered", None)] * 3 + [
         ("rejected", "prior_conflict")] * 2
     m2 = _drift_map(tmp_path / "two")
+    # three independent views (oms/2.13: turned at least DRIFT_INDEPENDENT_DEG apart)
+    three = [base_pose(y) for y in (65, 80, 100)]
     pls = m2.update([frame(f"s{k}", T, p=prior(_rot_z(T, 25.0), "drifting", sr=5.0))
-                     for k, T in enumerate(truth[2:])])
+                     for k, T in enumerate(three)])
     assert [p.status for p in pls] == ["registered"] * 3
-    for p, T in zip(pls, truth[2:], strict=True):
+    for p, T in zip(pls, three, strict=True):
         assert err(p.T, T)[1] < 1.0  # type: ignore[arg-type]
 
 

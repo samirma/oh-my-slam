@@ -136,6 +136,8 @@ error code `invalid_request` (§9).
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
   | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's. Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
+  | `prior_residual_sent_m`, `prior_residual_sent_deg` | Optional (oms/2.13). The residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior **as sent**, before any drift estimate placed it; null without a prior or a pose. With `prior_residual_*` (against the prior as placed) and `quality.drift_correction`, a client separates what the drift estimate moved from what the images moved. |
+  | `inlier_floor_share` | Optional (oms/2.13). The share of the frame's image pose's inliers that are floor points (map.md §2, Texture-aliasing guards): near 1 when the pose rests on the floor's texture. Null when the frame has no points fit (no image pose, a rotation-only fit, the older mapper) or the map has no floor. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
   | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2); the keyframe stays a registration reference for image matching and pose, its features used without its depth, which lifts no later frame, in registration or in locate (map.md §2, §6 below))). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
@@ -288,7 +290,11 @@ error code `invalid_request` (§9).
   to the job's `drifting` priors: `{translation_m, rotation_deg, odo_scale}`, defined in map.md §4.
   A job's inputs' `prior_residual_*` are measured from the prior as placed, so with it a client
   sees how much of a frame's distance from the prior it sent is the estimate and how much the
-  images. Null when the job has no `drifting` prior.
+  images; `prior_residual_sent_*` (oms/2.13) gives that distance directly. Null when the job has
+  no `drifting` prior. It carries (oms/2.13) `held`, whether the one-view rule (map.md §1, No
+  correction from one view) held a frame of the job, and `agreeing_frames`, the views that agreed
+  on the largest correction it tested; it is in every update response that carries a quality
+  report: the job's, and the dry run's predicted one.
 
   **Scale check** (oms/2.8). `quality.scale_check` compares the camera heights the client sent
   with what the frames' own depth measures: `{median_ratio, spread, frames}`, over the job's
@@ -373,6 +379,8 @@ The versions read, revert and `--keep-versions` are O2.
   | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
   | `height_consistent` | With a camera-height scale (see below): whether the located camera height agrees with the expected one within 3 sigma; null otherwise. |
+  | `prior_residual_m`, `prior_residual_deg` | Optional (oms/2.13). The located pose against the frame's prior as sent; null without a prior or a pose. |
+  | `inlier_floor_share` | Optional (oms/2.13). The share of the located pose's inliers that are floor points (Floor points, below); null for a turn fit, without a pose or without a map floor. |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
   support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
@@ -425,6 +433,25 @@ The versions read, revert and `--keep-versions` are O2.
     | without depth | 0.15 m / 2.1° | 0.15 m / 2.1° | 0.15 m / 2.1° |
 
     Locate uses the `none` column.
+* **Floor points** (oms/2.13). A locate frame has no depth of its own, so the depth-consistency
+  guard of registration (map.md §2, Texture-aliasing guards) does not apply; the floor guard
+  does. With a map floor (the version's `floor_z_m`, when its record holds one), a map point
+  within max(0.06 m, 3 × hypot(`floor_sigma_m`, its height sigma)) of it is a floor point (its
+  height sigma: its depth's relative sigma, the version's `scale_sigma_rel` unless that is
+  `monocular` and a per-point noise, `README.md`, times its keyframe camera's height above the
+  floor), and
+  repeated floor texture (planks, tiles, carpet) must not place a frame alone:
+  * the hypotheses also include a fit on the off-floor correspondences alone;
+  * only a hypothesis with at least the registration minimum of off-floor inliers can be the
+    reported pose; support and the conflict bound are as below, the support counted against the
+    best such hypothesis;
+  * every other supported hypothesis, a fit dominated by floor points included, can be a rival:
+    one that disagrees with the reported pose by more than the rival distances makes it
+    `ambiguity`;
+  * when no hypothesis has enough off-floor inliers, a floor-only fit is no pose: the frame is
+    `rejected` `no_overlap` (with `nearest_view`).
+
+  Without a map floor there are no floor points and this rule does not apply.
 * **Ambiguity.** `ambiguity` is non-null whenever a supported rival hypothesis exists.
   * A rival is a pose hypothesis, other than the reported one, farther than 0.10 m or 5° from
     it. Hypotheses come from separate groups of reference keyframes (oms/2.12), each

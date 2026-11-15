@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.12) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.13) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.12; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.13; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -1370,6 +1370,53 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   was), else monocular (0.65, `MONOCULAR_SIGMA_REL`). On a new
   anchored map `prior_gravity_deg` is the engine's (the origin's gravity), null for a camera-only
   map.
+
+### Texture-aliasing guards (oms/2.13)
+
+Repeated texture (floor planks, tiles, carpet, a wood-grain panel) matches a frame to the wrong
+place with hundreds of inliers. map.md §1-§2 and api.md §6 define three guards; their constants:
+
+* **Depth consistency** (map.md §2, `anchored.depth_consistency`, `AnchoredMap._depth_guard`).
+  Each inlier of a points fit: r = ln(own depth / depth the fitted pose predicts for its map
+  point), bound 3 × sqrt(σ_own² + σ_ref² + σ_point²). σ_own, σ_ref: a depth image's
+  `SENSOR_SCALE_SIGMA_REL` = 0.03; a monocular depth's: the map's `scale_sigma_rel` (at least
+  0.03) once a source other than `monocular` measured it, else
+  `MONOCULAR_REGISTRATION_SIGMA_REL` = 0.30. σ_point = `DEPTH_POINT_SIGMA_REL` = **0.10**
+  (`core.constants`). With a depth image, |median r| beyond the median bound (over at least the
+  registration minimum, 15) is no pose. A monocular frame's own scale is free (the floor check
+  judges it; a `floor_not_judged` frame keeps its pose, oms/2.5), so its r is taken about the
+  median: its depth's shape is tested, not its scale. Applies to new frames, their retries,
+  candidate poses near the prior and re-registration (the stored depth, which never confirms);
+  not to rotation-only fits, MapAnything or the older mapper.
+* **Floor points** (map.md §2, `anchored.floor_points`, `AnchoredMap._on_floor`;
+  `relocalize.floor_points`). Band max(`FLOOR_BAND_MIN_M` 0.06 m, `FLOOR_BAND_SIGMAS` 3 ×
+  hypot(floor sigma, the point's height sigma)), the point's height sigma being its depth's
+  relative sigma (the measured scale sigma, none for a `monocular` scale, and per-point noise:
+  `DEPTH_POINT_SIGMA_REL` for monocular depth,
+  `DEPTH_NOISE_REL` = 0.02 for a depth image in registration, `relocalize.DEPTH_SIGMA_REL` = 0.05
+  in locate) times its reference camera's height above the floor. A monocular reference lifted
+  at the map's k while the floor check gave it its own scale (`floor_factor`) has its floor at
+  c_z + (floor − c_z) × (k / k_used) / floor_factor (`AnchoredMap._floor_ratio`). A fit with fewer
+  than 15 off-floor inliers is fitted again on the off-floor correspondences; locate adds that
+  fit as a hypothesis and reports only hypotheses with 15 off-floor inliers. No map floor (a
+  first update, a version record without `floor_z_m`): no floor points.
+* **One view never moves the drift** (map.md §1, `AnchoredMap._one_view_rule`): a frame's move
+  (its image-only residual against the prior as placed times σ_placed² / (σ_placed² + σ_image²))
+  beyond its prior's sigma as sent needs `DRIFT_AGREE_MIN` = **3** independent agreeing views:
+  priors `DRIFT_INDEPENDENT_M` = **0.5 m** apart or optical axes `DRIFT_INDEPENDENT_DEG` =
+  **10°** apart. Agreement: 3 × hypot(both image sigmas, `DRIFT_POS_REL` 0.10 × distance) in
+  position, 3 × hypot(both, `DRIFT_ROT_DEG_PER_M` 2°/m × distance) in rotation. Held views are
+  kept in `state.json` (`drift.pending`), the newest `DRIFT_PENDING_MAX` = **20**.
+
+Evidence (map `dev_ainex_j3`, replayed offline through `AnchoredMap.place` with the mapper's own
+lifting, kdepth × k / k_used; fixtures `tests/data/aliasing`): k000011 against k000002 had 286
+inliers, all within 0.19 m below to 0.03 m above the floor (monocular floor points); with the guard
+6 are off the floor, the refit on the off-floor matches gives a loose pose and the frame is kept
+at its prior. k000013 against k000007 (187 inliers): k000007 was fused at k 0.48 and is lifted at
+k 1.01 (× 2.09), so its floor lies at z −0.37…−0.43; the frame's own depth agrees with that
+lifting (median ratio 0.97), so depth consistency does not reject it, the floor guard does (all
+inliers are floor points of that reference). The 1.8-2.8 depth ratio reported for it came from
+lifting kdepth × k_used, which is not the mapper's lifting.
 
 ### Objects, surfaces and relations (O8)
 

@@ -230,6 +230,18 @@ constant measured against truth, as one sigma of the scale's logarithm (map.md �
 pose's position sigma includes the reference depth's scale error, and locate forms hypotheses
 from separate groups of reference keyframes, so a biased solution meets a rival (api.md §6).
 
+**oms/2.13** guards registration, locate and the drift estimate against repeated texture, and is
+additive in shape. A points fit's inliers must agree with the frame's own depth, a fit whose
+off-floor inliers are fewer than the registration minimum is no pose by itself (it is fitted
+again without the floor points), and a frame that fails either takes its usual fallback (map.md
+§2, Texture-aliasing guards); locate applies the floor rule, a floor-dominated fit becoming a
+rival (api.md §6). A drifting prior is moved by more than its own sigma only when three
+independent views agree on that correction, otherwise the frame is held as a prior conflict
+(map.md §1, No correction from one view). New optional fields: the input status's
+`prior_residual_sent_m` / `prior_residual_sent_deg` (against the prior as sent) and
+`inlier_floor_share`, the locate result's `prior_residual_m` / `prior_residual_deg` and
+`inlier_floor_share`, and `quality.drift_correction`'s `held` and `agreeing_frames`.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

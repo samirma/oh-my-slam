@@ -467,7 +467,17 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     detail = "floor_not_judged" if k is not None and k.floor_unjudged else pl.detail
     return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
                      pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, detail,
-                     _depth_scale(am, pl))
+                     _depth_scale(am, pl), sent_residual(pl.T, fr.work.prior, fr.work.trust),
+                     pl.inlier_floor_share)
+
+
+def sent_residual(T: Any, prior: dict[str, Any] | None, trust: str | None
+                  ) -> tuple[float, float] | None:
+    """A frame's pose ``T`` against its prior as sent (api.md §4 ``prior_residual_sent_*``,
+    oms/2.13), before any drift estimate placed it; None without a pose or a prior."""
+    if T is None or prior is None or trust not in ("metric", "drifting"):
+        return None
+    return pose_residual(np.asarray(T, np.float64), np.asarray(prior["T_map_cam"], np.float64))
 
 
 def _depth_scale(am: AnchoredMap | None, pl: Placement) -> float | None:
@@ -489,7 +499,8 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
               sigma_pos_m: float | None, sigma_rot_deg: float | None,
               residual: tuple[float, float] | None, scene_m: float | None,
               duplicate_of: str | None = None, detail: str | None = None,
-              depth_scale: float | None = None) -> dict[str, Any]:
+              depth_scale: float | None = None, sent: tuple[float, float] | None = None,
+              floor_share: float | None = None) -> dict[str, Any]:
     """An ``InputStatus`` (api.md §4): pose and sigmas null when rejected, the prior residuals
     null without a prior, with reason ``too_close`` the distance limit and the frame's median
     scene depth, with reason ``duplicate`` the frame it duplicates, and ``detail``: why the
@@ -503,6 +514,10 @@ def input_row(name: str, status: str, reason: str | None, inliers: int, T: Any,
            "sigma_rot_deg": sigma_rot_deg if kept else None,
            "prior_residual_m": None if residual is None else round(residual[0], 4),
            "prior_residual_deg": None if residual is None else round(residual[1], 3),
+           # oms/2.13: against the prior as sent, and the image pose's floor share
+           "prior_residual_sent_m": None if sent is None or not kept else round(sent[0], 4),
+           "prior_residual_sent_deg": None if sent is None or not kept else round(sent[1], 3),
+           "inlier_floor_share": floor_share if kept else None,
            "detail": detail if (status == "kept_at_prior") != (detail == "floor_not_judged")
            and status != "rejected" else None}
     if reason == "too_close":
@@ -524,7 +539,7 @@ def job_drift_correction(am: AnchoredMap | None, frames: list[_Frame]) -> dict[s
     if not priors:
         return None
     moved, odo = am.drift_moves(priors) if am is not None else ([(0.0, 0.0)] * len(priors), 1.0)
-    return drift_correction(moved, odo)
+    return drift_correction(moved, odo, None if am is None else am.drift_rule())
 
 
 def prior_frames_rejected(frames: list[_Frame], status: dict[int, str]) -> bool:

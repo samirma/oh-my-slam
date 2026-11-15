@@ -635,7 +635,7 @@ def test_floor_not_judged_on_a_registered_or_provisional_frame(tmp_path: Any) ->
     assert kf is not None
     kf.floor_unjudged = True
     fr = type("F", (), {})()
-    fr.work = type("W", (), {"name": "a", "trust": "metric"})()
+    fr.work = type("W", (), {"name": "a", "trust": "metric", "prior": None})()
     fr.scene_m = fr.duplicate_of = None
     for status, want in (("registered", "floor_not_judged"), ("provisional", "floor_not_judged"),
                          ("kept_at_prior", None)):

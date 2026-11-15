@@ -115,7 +115,9 @@ def job_summary(job: Job) -> dict[str, Any] | None:
                      "prior_sigma_pos_m": sp, "prior_sigma_rot_deg": sr,
                      "prior_sigma_tilt_deg": None if p is None else p.get("sigma_tilt_deg"),
                      "prior_residual_m": r["prior_residual_m"],
-                     "prior_residual_deg": r["prior_residual_deg"]})
+                     "prior_residual_deg": r["prior_residual_deg"],
+                     "prior_residual_sent_m": r.get("prior_residual_sent_m"),
+                     "prior_residual_sent_deg": r.get("prior_residual_sent_deg")})
     q = job.quality or {}
     return {"job_id": job.id, "map": job.map, "state": job.state,
             "base_version": job.base_version, "result_version": job.result_version,

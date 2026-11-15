@@ -71,17 +71,20 @@ def displacement_quality(moved: list[tuple[float | None, float]]) -> dict[str, f
             "max_displacement_deg": round(max(r for _, r in moved), 3) if moved else None}
 
 
-def drift_correction(moved: list[tuple[float, float]], odo_scale: float
-                     ) -> dict[str, float] | None:
+def drift_correction(moved: list[tuple[float, float]], odo_scale: float,
+                     rule: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """``quality.drift_correction`` (map.md §4, oms/2.5): the largest translation and rotation
     over the job's frames with a drifting prior between the prior as sent and as placed (one
-    (m, deg) pair per frame: ``moved``) and the estimate's odometry scale; None without such a
-    frame."""
+    (m, deg) pair per frame: ``moved``) and the estimate's odometry scale; the one-view rule's
+    ``held`` and ``agreeing_frames`` (oms/2.13, ``rule``; none held without it: the older
+    mapper); None without such a frame."""
     if not moved:
         return None
+    rule = rule or {}
     return {"translation_m": round(max(m for m, _ in moved), 4),
             "rotation_deg": round(max(d for _, d in moved), 3),
-            "odo_scale": round(odo_scale, 5)}
+            "odo_scale": round(odo_scale, 5), "held": bool(rule.get("held", False)),
+            "agreeing_frames": list(rule.get("agreeing_frames", []))}
 
 
 def reregistered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:

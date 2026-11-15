@@ -698,6 +698,9 @@ class Derived:
                 float(f.get(OWN_SCALE_SIGMA, scale)),
                 # a locate index written before oms/2.12 does not say: every point lifted
                 z[f"l{i}"] if f"l{i}" in z.files else None))
-        idx = relocalize.Index(kfs)
+        # its map floor (api.md §6 "Floor points", oms/2.13): only a version whose record holds one
+        idx = relocalize.Index(kfs, None if dv.record.get("floor_z_m") is None
+                               else (dv.floor_z, dv.floor_sigma),
+                               0.0 if dv.record["scale_source"] == "monocular" else scale)
         idx.prepare()  # its nearest-neighbour index too: the first locate does not build it
         return idx
