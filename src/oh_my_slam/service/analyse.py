@@ -26,6 +26,15 @@
 * **The floor** of the outputs: the version's in the map frame; elsewhere the frame's own floor
   plane (``mapping.analysis.own_floor_z``), else the camera's height below it, else unknown
   (no object is grounded, and the range scan takes ``DEFAULT_CAMERA_HEIGHT_M`` below the camera).
+* **The horizontal** (oms/2.10, ``mapping.analysis.horizontal``): with ``T_map_cam`` its up
+  axis is the horizontal's. A monocular depth whose floor plane (the floor check's choice, in
+  the raw depth) tilts from it beyond 3 x ``sigma_tilt_deg`` is lifted with its floor turned
+  onto it about the camera centre: the pose's rotation is replaced by that one for everything
+  the depth gives (scale on the floor's height, floor, objects, points, range scan, the
+  objects' ``centre_cam_m``), never for what the image alone gives (the map cloud's pixels of
+  ``map_factor``, a rotation keeping every range). ``scale_check.floor_tilt_deg`` is that
+  plane's tilt from the up axis used (the pose's, or the estimated gravity, which nothing
+  turns).
 * **Prompts**: the default vocabulary, the map's (``map`` given) and the request's ``labels``;
   ``labels`` alone with ``labels_only``. A detection's label takes the client's form
   (``client_form``) and ``matches`` names the best object of each client label.
@@ -117,6 +126,7 @@ class Work:
     step_deg: float
     voxel_m: float
     min_score: float
+    sigma_tilt_deg: float = analysis.SIGMA_TILT_DEFAULT_DEG  # the pose's tilt sigma (oms/2.10)
 
     @property
     def wants_objects(self) -> bool:
@@ -185,7 +195,8 @@ def work(store: Store, req: dict[str, Any], parts: dict[str, bytes]) -> Work:
     step = float(req.get("bearing_step_deg", DEFAULT_BEARING_STEP_DEG))  # >= 0.1: the schema
     return Work(cam, image, rgb, depth, mask, T, frozenset(req["outputs"]), labels, only,
                 (lo, hi), step, float(req.get("voxel_m", DEFAULT_VOXEL_M)),
-                float(req.get("min_score", DEFAULT_MIN_SCORE)))
+                float(req.get("min_score", DEFAULT_MIN_SCORE)),
+                float(req.get("sigma_tilt_deg", analysis.SIGMA_TILT_DEFAULT_DEG)))  # > 0: schema
 
 
 def client_form(label: str, client: list[str]) -> str:
@@ -260,8 +271,22 @@ class Analyser:
             T, frame = analysis.gravity_pose(mono.up_cam), "gravity_camera"
         else:
             T, frame = w.T, "map" if dv is not None else "client"
+        posed = T  # the pose as sent (or the gravity's), before the depth's floor is turned
         # the camera's height above the floor, when it gives one that is a height
         height = cam.height_above_floor_m if (cam.height_above_floor_m or 0.0) > 0 else None
+        # the horizontal (api.md §7, oms/2.10): the raw depth's floor plane, the floor check's
+        # choice; a monocular depth with a pose whose floor tilts beyond 3 sigma from the pose's
+        # up axis is lifted with it turned onto that axis (T's rotation, from here on)
+        rotate = sensor is None and frame != "gravity_camera"
+        checked = frame != "map" and height is not None
+        hz = None
+        if rotate or checked:
+            hz = analysis.horizontal(depth, K_grid, T[:3, :3], height,
+                                     "mono" if sensor is None else "sensor", cam.height_sigma_m,
+                                     w.sigma_tilt_deg, rotate)
+            if hz.rotated:
+                T = T.copy()
+                T[:3, :3] = hz.R
         factor, floor_sigma = 1.0, FLOOR_SIGMA_DEFAULT_M
         floor: float | None
         scale_check: dict[str, Any] | None = None  # outside the map frame, with a sent height
@@ -272,25 +297,28 @@ class Analyser:
             if sensor is None:
                 # on a map whose scale is its camera heights', the frame's own: the scale an
                 # update gives the same frame's content (map.md §2 "Floor check")
-                sent = analysis.height_factor(depth, K_grid, T[:3, :3], height,
-                                              cam.height_sigma_m) \
+                by_height = analysis.height_factor(depth, K_grid, T[:3, :3], height,
+                                                   cam.height_sigma_m) \
                     if source == "camera_height" else None
                 # within the monocular scale bound of the map's monocular depth scale k only
                 # (api.md §7): beyond it, or on a version that records no k, the map's cloud
                 k = dv.record.get("mono_depth_scale")
-                if sent is not None and not (
-                        k and abs(sent / float(k) - 1.0) <= MONO_FLOOR_BOUND_REL):
-                    sent = None
-                factor = (sent or analysis.map_factor(depth, K_grid, T, dv.cloud()["xyz"])
+                if by_height is not None and not (
+                        k and abs(by_height / float(k) - 1.0) <= MONO_FLOOR_BOUND_REL):
+                    by_height = None
+                # the map's cloud at the pixels where the image sees it: the pose as sent (the
+                # floor's turn about the camera keeps every range)
+                factor = (by_height
+                          or analysis.map_factor(depth, K_grid, posed, dv.cloud()["xyz"])
                           or analysis.height_factor(depth, K_grid, T[:3, :3],
                                                     float(T[2, 3]) - floor) or 1.0)
             depth = (depth * factor).astype(np.float32)
         else:
             source, sigma = "depth", DEPTH_SIGMA_REL
-            if height is not None:  # the raw depth, before the sent height rescales it
-                scale_check = analysis.scale_check(depth, K_grid, T[:3, :3], height,
-                                                   "monocular" if sensor is None else "sensor",
-                                                   cam.height_sigma_m)
+            if checked:  # the raw depth, before the sent height rescales it
+                assert hz is not None and height is not None
+                scale_check = analysis.checked(hz.plane, depth, K_grid, posed[:3, :3], height,
+                                               "monocular" if sensor is None else "sensor")
             if sensor is None:
                 f = analysis.height_factor(depth, K_grid, T[:3, :3], height,
                                            cam.height_sigma_m)
@@ -344,15 +372,18 @@ class Analyser:
             if "range_scan" in w.outputs:
                 level = floor if floor is not None else float(T[2, 3]) - DEFAULT_CAMERA_HEIGHT_M
                 out["range_scan"] = analysis.range_scan(
-                    pts.xyz, T[:3, 3], level, floor_band_m(floor_sigma), w.z_band, w.step_deg)
+                    pts.xyz, T[:3, 3], level, floor_band_m(floor_sigma), w.z_band, w.step_deg,
+                    pts.supported)
         if "depth" in w.outputs:
             metres = np.nan_to_num(self._on_image(w, depth), nan=0.0, posinf=0.0, neginf=0.0)
             units = np.rint(metres / DEPTH_OUTPUT_UNIT_M)
             out["depth"] = binary(np.clip(units, 0, MAX_DEPTH_UNITS).astype(np.uint16))
         if w.labels is not None:
             out["matches"] = matches(w.labels, out["objects"])
-        log.info("analysed a frame: frame %s, scale %s x%.3f, %d objects", frame, source, factor,
-                 len(seen))
+        log.info("analysed a frame: frame %s, scale %s x%.3f, floor tilt %s%s, %d objects", frame,
+                 source, factor, "-" if hz is None or hz.tilt_deg is None
+                 else f"{hz.tilt_deg:.1f} deg", " (turned)" if hz is not None and hz.rotated
+                 else "", len(seen))
         return out
 
     def _infer(self, w: Work, dv: DerivedVersion | None, K: Any, geometry: bool

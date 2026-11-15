@@ -1,6 +1,6 @@
 ---
 name: oh-my-slam
-description: "Short reference of the oh-my-slam HTTP API (schema oms/2.9) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
+description: "Short reference of the oh-my-slam HTTP API (schema oms/2.10) for the robot-guide skill's client: update jobs (and dry runs) that build an anchored map from camera frames with pose priors, per-frame status and the quality gate; the map summary, keyframes, objects and support surfaces, navigation grid, points near a place and bird's-eye image of any kept version; locating frames with uncertainty and ambiguity, the recorded pose; analysing one frame without changing a map (objects, the best match per label, image masks, points, a range scan); health and timings."
 ---
 
 # oh-my-slam API
@@ -8,7 +8,7 @@ description: "Short reference of the oh-my-slam HTTP API (schema oms/2.9) for th
 Generated from the API definitions (`python -m oh_my_slam.service.skill`); never edit it by hand. The full contract is `GET /api/openapi.json` (OpenAPI 3.1, its schemas those of `specs/api.schema.json`) and `specs/api.md`.
 
 * Service: `server.sh` on port 9091, every route under `/api/`, reachable from the LAN.
-* Every JSON body carries `schema` (`oms/2.9`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
+* Every JSON body carries `schema` (`oms/2.10`); units are metres, degrees and seconds; `T_a_b` is the 4x4 row-major pose of b in a; the map frame has z up.
 * Implemented groups (`GET /api/health` → `capabilities`): O1, O2, O3-jobs, O4, O5, O6, O7, O8, O9, O10. Refuse what is missing instead of calling it.
 * Errors answer `{schema, error: {code, message, retryable, details}}`; a frame that cannot be used is an input status, never an error.
 
@@ -43,7 +43,7 @@ curl -s http://HOST:9091/api/maps/home/updates \
 curl -s 'http://HOST:9091/api/jobs/JOB_ID?wait_s=30'
 ```
 
-`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses `objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and `matches` then names the best object of each (`object_id` null when none). Outputs are in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`. Outside the map frame, a camera with `height_above_floor_m` gets `scale_check`: that height against the camera's height above the frame's own floor plane in its raw depth.
+`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses `objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and `matches` then names the best object of each (`object_id` null when none). Outputs are in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`. Outside the map frame, a camera with `height_above_floor_m` gets `scale_check`: that height against the camera's height above the frame's own floor plane in its raw depth (`floor_tilt_deg`: that floor's tilt from the up axis). With `T_map_cam` the pose's up axis is the horizontal: a monocular floor tilted beyond 3 x `sigma_tilt_deg` (default 2) is turned onto it. Each range-scan beam has `support`, its pixels; one that no supported pixel holds is `unseen`.
 
 ```sh
 curl -s http://HOST:9091/api/frames/analyse \

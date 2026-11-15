@@ -87,7 +87,11 @@ def render() -> str:
         "carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a "
         "gravity-aligned camera frame (`gravity_camera`); every object also has `centre_cam_m`. "
         "Outside the map frame, a camera with `height_above_floor_m` gets `scale_check`: that "
-        "height against the camera's height above the frame's own floor plane in its raw depth.",
+        "height against the camera's height above the frame's own floor plane in its raw depth "
+        "(`floor_tilt_deg`: that floor's tilt from the up axis). With `T_map_cam` the pose's up "
+        "axis is the horizontal: a monocular floor tilted beyond 3 x `sigma_tilt_deg` (default "
+        "2) is turned onto it. Each range-scan beam has `support`, its pixels; one that no "
+        "supported pixel holds is `unseen`.",
         "",
         "```sh",
         "curl -s http://HOST:9091/api/frames/analyse \\",
