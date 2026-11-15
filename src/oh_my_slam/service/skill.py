@@ -81,7 +81,8 @@ def render() -> str:
         "```",
         "",
         "`POST /api/frames/analyse` analyses one frame and changes nothing: `outputs` chooses "
-        "`objects`, `masks`, `points`, `range_scan` and `depth`; `labels` are text prompts, and "
+        "`objects`, `masks`, `points`, `range_scan`, `depth` and `depth_sigma`; `labels` are "
+        "text prompts, and "
         "`matches` then names the best object of each (`object_id` null when none). Outputs are "
         "in the map frame with `map` and `T_map_cam` (`frame: map`, detections of map objects "
         "carry their ids), in the pose's own frame with `T_map_cam` alone (`client`), else in a "
@@ -91,7 +92,14 @@ def render() -> str:
         "(`floor_tilt_deg`: that floor's tilt from the up axis). With `T_map_cam` the pose's up "
         "axis is the horizontal: a monocular floor tilted beyond 3 x `sigma_tilt_deg` (default "
         "2) is turned onto it. Each range-scan beam has `support`, its pixels; one that no "
-        "supported pixel holds is `unseen`.",
+        "supported pixel holds is `unseen`. `frames` (at most 4: other images of the same "
+        "camera, each with `T_ref_frame`, its pose in the reference's optical frame, and "
+        "`sigma_pos_m`, `sigma_rot_deg`) adds motion stereo: the poses are refined on the "
+        "images (never their length |t|), every output uses the depth fitted to the "
+        "triangulated points, `motion.frames[]` gives each frame's `status`, and a frame whose "
+        "|t| is known to 10 % gives `scale_source: baseline`; with a camera height, "
+        "`baseline_check` compares the two scales and falls back to the height's. "
+        "`depth_sigma` is sigma(ln z) per pixel (x 0.001).",
         "",
         "```sh",
         "curl -s http://HOST:9091/api/frames/analyse \\",

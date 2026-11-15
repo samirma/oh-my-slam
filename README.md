@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.10; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.11; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -2018,7 +2018,8 @@ It is an update's own code on one frame, kept nowhere.
   `camera_height` when the camera gives `height_above_floor_m` and the frame shows a measurable
   floor plane (the same factor; σ = `height_sigma_m`, default 0.02 m, over the height); else
   `monocular` (σ 0.10). A camera height with no floor plane in view cannot scale the frame: it
-  is `monocular`.
+  is `monocular`. With `frames` (oms/2.11) a monocular depth may take `baseline` instead
+  (*Motion stereo* below).
 * **Floor.** The version's `floor_z_m` and `floor_sigma_m` in the map frame. Elsewhere the
   frame's own floor: the plane the floor check takes (`anchored.own_floor`, *Which plane*
   above: with real support, the one near the camera's height within the same `floor_band` as
@@ -2145,6 +2146,101 @@ It is an update's own code on one frame, kept nowhere.
   in millimetres (metres = value × 0.001, fixed, whatever the camera's `depth_scale_m`, with
   which the input is read; a non-finite value is 0, beyond 65.535 m it saturates), at the outputs' scale, on the pixels of the image
   as sent (nearest); a monocular depth is resampled from its grid.
+* **Motion stereo** (oms/2.11, api.md §7; `mapping.motion`, `reconstruction.stereo`). The
+  method is the one the evaluation chose (`reports/motion_stereo_eval.md`, method `b2`, §9),
+  without its optional plane sweep. `frames[]` are other images of the request's camera, each
+  with `T_ref_frame` (its optical frame's pose in the reference's, metres) and its sigmas; at
+  most `MAX_MOTION_FRAMES` = 4 (the schema's `maxItems`), each the camera's size (else
+  `invalid_request`, `details.field` `frames[i].image`; a missing part too; a `T_ref_frame`
+  that is no rigid transform is `frames[i].T_ref_frame`). Each is rectified to the canonical
+  pinhole as the reference is and loses the **camera's** ignored pixels (its inline or stored
+  `ignore_mask`, and what the canonical pinhole does not reach); a frame of `frames` carries no
+  mask of its own in the schema, so the request's own `ignore_mask` is the reference's alone.
+  No model runs on the other frames: MoGe-2 runs once, on the reference, as before.
+  1. **Matches.** Registration's SIFT (`anchored.features`: RootSIFT, 4000 features, contrast
+     0.01, none on ignored pixels) and ratio-test matches (`anchored.match`, ratio 0.8, one per
+     reference keypoint); fewer than `motion.MIN_MATCHES` = 12 is `no_overlap`.
+  2. **Pose.** The relative pose minimising the matches' Sampson distances (pixels over
+     `MATCH_SIGMA_PX` = 0.7; Cauchy at 3, then Huber at 1.5 on the inliers within `INLIER_PX` =
+     3 px), with the sent pose as a Gaussian prior (`sigma_rot_deg` on the rotation,
+     `sigma_pos_m` on the translation). It starts from the sent pose and from the matches' own
+     essential matrix (RANSAC, `cv2.recoverPose`), the start with more inliers winning: a
+     rotation sent 10° off is found 10° off (the evaluation's prototype started from the sent
+     pose only, which a 10° error pulls into a wrong minimum). |t| is not observable: the
+     refined translation keeps the sent length, its direction refined. `sigma_rot_deg_post` is
+     the largest rotation sigma of the Gauss–Newton posterior (prior included);
+     `rotation_change_deg` the angle between the refined and the sent rotation. A sent
+     translation under 0.1 mm (`MIN_BASELINE_M`) has no epipolar geometry: `baseline_short`,
+     nothing refined (null fields).
+  3. **Status**, in this order: `no_overlap` (fewer than 12 matches or inliers);
+     `pose_inconsistent` (`rotation_change_deg` > `POSE_K_SIGMA` = 3 × `sigma_rot_deg`: its
+     points are not used); `baseline_short` (`sigma_pos_m` / |t| > `BASELINE_SIGMA_REL_MAX` =
+     0.10, the client's `sigma_pos_m` being its sigma along every axis); `too_few_points`
+     (fewer than `BASELINE_MIN_POINTS` = 30 triangulated inliers with σ(ln z) below
+     `BASELINE_POINT_SIGMA_MAX` = 0.25); else `used`. `points` counts those triangulated
+     points for every status that triangulated (0 otherwise).
+  4. **Triangulation** (`stereo.triangulate`): the midpoint of the two rays; σ(ln z) =
+     hypot(0.7 px, σ_rot · f) over the pixels the point moves in the other image per unit ln z.
+  5. **Depth.** The points of every `used` pair, pooled into one fit (the evaluation measured
+     pairs only; pooling is its inferred recommendation), fit the model's depth in ln z: a scale
+     and a slope (`fit_scale`, inverse-variance σ² + spread² weights, Huber 1.5, |slope| ≤ 0.6),
+     then the bilateral sparse-to-dense correction (`sparse_dense`: per pixel the weighted
+     residual of the 16 nearest points within 75 px, Gaussian `S2D_RADIUS_PX` = 25 px in the
+     image and `S2D_LNZ` = 0.15 in ln z, shrunk to 0 with weight 1 / `S2D_PRIOR`² = 1 / 0.10²).
+     That depth replaces the model's for every output (`depth`, `points`, `objects`,
+     `range_scan`) and for the horizontal (oms/2.10: its floor plane is found and turned in the
+     stereo depth, whose floor the correction has already straightened; the scale check stays
+     on the model's own metres, as api.md §7 defines it).
+  6. **Scale.** With a `used` pair: `baseline`, `scale_sigma_rel` = hypot(σ_t/|t|, the fit's
+     standard error, the robust spread of the points about the fitted depth); with several used
+     pairs σ_t/|t| is theirs combined by their share of the points (sqrt Σ (n_i/N)² s_i²).
+     Without one, `baseline_short` pairs holding 30 good points give the shape alone, which then
+     takes the camera height's scale (`camera_height`); without a sent height, or without a
+     floor plane in that shape to take it on, the frame is analysed exactly as one frame
+     (`monocular` or `camera_height` on the model's depth).
+  7. **Baseline check** (outside the map frame, with `frames` and `height_above_floor_m`):
+     `baseline_scale_ratio` is `height_factor` of the baseline depth (the sent height over the
+     camera's height above its floor plane: the camera-height scale over the baseline one) and
+     `sigma` = hypot(`scale_sigma_rel`, `height_sigma_m` / height) — both the sigma of ln of
+     the ratio; when |ln ratio| > `BASELINE_CHECK_K_SIGMA` = 3 × sigma the outputs take the
+     ratio (`camera_height`, σ the height's, `used: camera_height`). Without a floor plane (or a
+     ratio outside 0.2–5) the ratio and sigma are null and the baseline stays. Without a used
+     pair the check is `{null, null, camera_height}` (*spec doubt*: also when no floor lets the
+     height scale the frame and `scale_source` is `monocular`; `used` has no third value).
+  * **Beside a depth image** the depth is the sensor's: the frames are matched, refined and
+    reported, the depth is not changed, `scale_source` stays `depth` and there is no
+    `baseline_check` (*spec doubt*: api.md does not say). **In the map frame** the stereo
+    depth (or shape) is brought onto the map as a monocular depth is (by the map's own rules
+    above; its camera-height factor is then compared with the map's monocular scale k, which
+    a near-metric stereo depth may fall outside of, leaving the cloud's factor): the scale
+    stays the map's and there is no `baseline_check` (*spec doubt*).
+  * *Evaluation* (synthetic AiNex scenes with exact truth, `reports/motion_stereo_eval.md`
+    §4–§8): obstacles 1.0 / 3.0 / 4.9 % median error at 0.2–0.5 / 0.5–1.0 / 1.0–1.5 m on side
+    steps with an exact pose, 2.6 / 9.0 / 16.3 % on head pans of the 5.7 cm neck, against 5.2 /
+    10.0 / 23.3 % for MoGe-2 at the true camera height; rotation after refinement 0.02–0.05°;
+    the scale as good as |t| (`scale_sigma_rel` rule covering 79–82 % within 1σ); missed near
+    obstacles in the range scan 35 → 5 % with the sent floor; 0.26 s of CPU after MoGe per
+    frame (median), each further frame about +0.25 s. *Tests* (`tests/unit/test_motion_stereo.py`,
+    the same kind of scene rendered analytically, a fake model depth 0.8 × z^0.9 bent ±6 %):
+    obstacles 0.2 / 0.4 / 1.4 % on the 10 cm side step with its exact pose (the model alone
+    12.8 / 19.6 / 19.0 % in its metres, 5.9 / 2.5 / 2.3 % at the true scale), 1.7 / 6.3 /
+    7.5 % on the 30° pan sent 1° off (rotation refined to within 0.1°, 0.03° measured);
+    `pose_inconsistent` at 10° off with σ 1°, refined to the truth and used with σ 5°; the step
+    sent 1.4 × too long: `baseline_check` ratio 0.71, beyond 3 σ, outputs on the camera height
+    within 4 %.
+  * *Measured* (2026-11-15, M3 Pro, heavy lock held): motion stereo's CPU work after the model
+    (`motion_stereo`, warm, the test scene) 0.35 s for one frame and 0.49 s for four (the
+    evaluation's prototype: 0.26 s); through a scratch service on the resident inference server
+    (MoGe-2), the test scene's step pair: 0.95 s for the frame alone, 1.15–1.44 s with the
+    other frame (analysis stage), obstacles 12.1 / 5.9 / 9.7 % alone with the camera height
+    and 0.5 / 0.6 / 2.0 % with the step (`baseline`, `baseline_check` ratio 1.01, σ 0.09).
+* **Depth sigma** (oms/2.11, output `depth_sigma`). σ(ln z) per pixel of `depth`, `uint16`,
+  value × 0.001 (`SIGMA_OUTPUT_UNIT`), 0 where `depth` is 0, on the image as sent. With motion
+  stereo: hypot(`scale_sigma_rel`, the correction's local sigma), the local sigma being
+  sqrt(1 / (Σ the correction's weights + 1 / spread²)): the fit's spread far from every point,
+  less near them (the evaluation's rule: the interpolation's variance at corrected pixels,
+  hypot(scale sigma, spread) elsewhere). Otherwise, also for one frame: hypot(`scale_sigma_rel`,
+  the depth's own relative noise: `MONO_DEPTH_REL` = 0.05, `SENSOR_DEPTH_REL` = 0.01).
 * **Concurrency.** The request runs in the service's thread pool beside the job worker; its
   inference requests are interactive ones, served before a job's waiting fusion requests
   (inference.md, single worker). A depth image with a pose needs no model for `points`,

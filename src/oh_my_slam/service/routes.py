@@ -127,9 +127,9 @@ ENDPOINTS: tuple[Endpoint, ...] = (
              {204: None}, ("map_not_found", "map_busy", "invalid_request"), params=(MAP,)),
     Endpoint("POST", "/api/frames/analyse", "post_analyse",
              "Analyse one frame, no map change (O7): objects (with labels, the best match per "
-             "client label), image masks, points, a range scan and depth, in the map frame "
-             "(map and T_map_cam), the pose's own frame (T_map_cam alone) or a gravity-aligned "
-             "camera frame", {200: "Analysis"},
+             "client label), image masks, points, a range scan, depth and its sigma, in the map "
+             "frame (map and T_map_cam), the pose's own frame (T_map_cam alone) or a "
+             "gravity-aligned camera frame; frames[] adds motion stereo (baseline scale)", {200: "Analysis"},
              ("invalid_request", "map_not_found", "inference_unavailable", "out_of_memory",
               "payload_too_large"), request="AnalyseRequest", multipart=True),
 )

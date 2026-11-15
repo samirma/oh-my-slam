@@ -35,6 +35,15 @@
   ``map_factor``, a rotation keeping every range). ``scale_check.floor_tilt_deg`` is that
   plane's tilt from the up axis used (the pose's, or the estimated gravity, which nothing
   turns).
+* **Motion stereo** (oms/2.11, ``mapping.motion``): ``frames`` (the camera's other images, its
+  own mask only) are matched to the frame and their relative poses refined; a monocular depth
+  is replaced by the one fitted to their triangulated points for every output. Outside the map
+  frame a ``used`` pair's scale is ``baseline``; with a sent height ``baseline_check`` compares
+  it with the height's and takes that one beyond ``BASELINE_CHECK_K_SIGMA`` sigmas; without a
+  used pair the shape alone takes the height's scale, else the frame is one frame. A depth
+  image is kept as it is (the frames reported only); the map frame keeps the map's scale.
+* **Depth sigma** (``depth_sigma``): hypot(the scale's sigma, the depth's own per pixel: the
+  stereo correction's local sigma, else ``MONO_DEPTH_REL`` / ``SENSOR_DEPTH_REL``).
 * **Prompts**: the default vocabulary, the map's (``map`` given) and the request's ``labels``;
   ``labels`` alone with ``labels_only``. A detection's label takes the client's form
   (``client_form``) and ``matches`` names the best object of each client label.
@@ -44,11 +53,12 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -59,7 +69,7 @@ from oh_my_slam.core import rle
 from oh_my_slam.core.constants import FLOOR_SIGMA_DEFAULT_M, floor_band_m
 from oh_my_slam.core.images import on_grid, save_jpeg
 from oh_my_slam.core.log import get_logger
-from oh_my_slam.mapping import analysis
+from oh_my_slam.mapping import analysis, motion
 from oh_my_slam.mapping.anchored import (
     DEFAULT_HEIGHT_SIGMA_M,
     DEPTH_SIGMA_REL,
@@ -105,8 +115,21 @@ DEFAULT_MIN_SCORE = 0.5
 DEFAULT_CAMERA_HEIGHT_M = 1.0  # the range scan's floor below a camera that sees and gives none
 MAX_DEPTH_UNITS = 65535
 DEPTH_OUTPUT_UNIT_M = 0.001  # the depth output's unit, whatever the camera's depth_scale_m
+SIGMA_OUTPUT_UNIT = 0.001  # depth_sigma's unit: sigma(ln z) = value x this (oms/2.11)
+BASELINE_CHECK_K_SIGMA = 3.0  # api.md §7 "Baseline check": the scales disagree beyond this
 
 Array = NDArray[np.float64]
+
+
+@dataclass
+class MotionFrame:
+    """An entry of a request's ``frames`` (oms/2.11): its image as sent, its pose in the
+    reference's optical frame and that pose's sigmas."""
+
+    rgb: NDArray[np.uint8]
+    T_ref_frame: Array
+    sigma_pos_m: float
+    sigma_rot_deg: float
 
 
 @dataclass
@@ -127,6 +150,8 @@ class Work:
     voxel_m: float
     min_score: float
     sigma_tilt_deg: float = analysis.SIGMA_TILT_DEFAULT_DEG  # the pose's tilt sigma (oms/2.10)
+    frames: list[MotionFrame] = field(default_factory=list)  # motion stereo (oms/2.11)
+    camera_mask: NDArray[np.bool_] | None = None  # the camera's ignored pixels alone
 
     @property
     def wants_objects(self) -> bool:
@@ -167,6 +192,7 @@ def work(store: Store, req: dict[str, Any], parts: dict[str, bytes]) -> Work:
     cam = Camera.from_json(body)
     if mask is not None:
         sized("camera.ignore_mask", mask, cam)
+    camera_mask = mask
     image = part("image", req["image"])
     rgb = decode_rgb(image, "image")
     sized("image", rgb, cam)
@@ -193,10 +219,21 @@ def work(store: Store, req: dict[str, Any], parts: dict[str, bytes]) -> Work:
     if not hi > lo:
         raise invalid("z_band_m", f"z_band_m [{lo}, {hi}]: its top must be above its bottom")
     step = float(req.get("bearing_step_deg", DEFAULT_BEARING_STEP_DEG))  # >= 0.1: the schema
+    others = []
+    for i, f in enumerate(req.get("frames", [])):  # at most MAX_MOTION_FRAMES: the schema
+        at = f"frames[{i}]"
+        other = decode_rgb(part(f"{at}.image", f["image"]), f"{at}.image")
+        sized(f"{at}.image", other, cam)
+        if not _rotation_ok(f["T_ref_frame"]):
+            raise invalid(f"{at}.T_ref_frame", f"{at}.T_ref_frame is not a rigid transform "
+                          "(orthonormal rotation, last row 0 0 0 1)")
+        others.append(MotionFrame(other, np.asarray(f["T_ref_frame"], np.float64),
+                                  float(f["sigma_pos_m"]), float(f["sigma_rot_deg"])))
     return Work(cam, image, rgb, depth, mask, T, frozenset(req["outputs"]), labels, only,
                 (lo, hi), step, float(req.get("voxel_m", DEFAULT_VOXEL_M)),
                 float(req.get("min_score", DEFAULT_MIN_SCORE)),
-                float(req.get("sigma_tilt_deg", analysis.SIGMA_TILT_DEFAULT_DEG)))  # > 0: schema
+                float(req.get("sigma_tilt_deg", analysis.SIGMA_TILT_DEFAULT_DEG)),  # > 0: schema
+                others, camera_mask)
 
 
 def client_form(label: str, client: list[str]) -> str:
@@ -274,6 +311,21 @@ class Analyser:
         posed = T  # the pose as sent (or the gravity's), before the depth's floor is turned
         # the camera's height above the floor, when it gives one that is a height
         height = cam.height_above_floor_m if (cam.height_above_floor_m or 0.0) > 0 else None
+        # motion stereo (api.md §7, oms/2.11): the other frames' report, and the depth brought
+        # onto their triangulated points (a monocular depth only)
+        ms = self._motion(w, rgb, ignore, K, None if sensor is not None else depth, K_grid)
+        stereo = None if ms is None else ms.stereo
+        qualified = ms is not None and ms.qualified  # a used pair gave the depth its scale
+        if stereo is not None and not qualified and frame != "map" and (
+                height is None or analysis.height_factor(stereo.depth, K_grid, T[:3, :3],
+                                                         height, cam.height_sigma_m) is None):
+            # the shape alone takes the camera height's scale; without one, or without a floor
+            # to take it on, the frame is analysed as one frame
+            stereo = None
+        raw = depth  # the model's own metres (the scale check's)
+        local: NDArray[np.float32] | None = None  # the stereo depth's own sigma(ln z) per pixel
+        if stereo is not None:
+            depth, local = stereo.depth, stereo.local_sigma
         # the horizontal (api.md §7, oms/2.10): the raw depth's floor plane, the floor check's
         # choice; a monocular depth with a pose whose floor tilts beyond 3 sigma from the pose's
         # up axis is lifted with it turned onto that axis (T's rotation, from here on)
@@ -290,6 +342,7 @@ class Analyser:
         factor, floor_sigma = 1.0, FLOOR_SIGMA_DEFAULT_M
         floor: float | None
         scale_check: dict[str, Any] | None = None  # outside the map frame, with a sent height
+        baseline_check: dict[str, Any] | None = None  # ... with frames too (oms/2.11)
         if frame == "map":
             assert dv is not None
             source, sigma = str(dv.record["scale_source"]), float(dv.record["scale_sigma_rel"])
@@ -317,18 +370,39 @@ class Analyser:
             source, sigma = "depth", DEPTH_SIGMA_REL
             if checked:  # the raw depth, before the sent height rescales it
                 assert hz is not None and height is not None
-                scale_check = analysis.checked(hz.plane, depth, K_grid, posed[:3, :3], height,
-                                               "monocular" if sensor is None else "sensor")
+                scale_check = (analysis.checked(hz.plane, depth, K_grid, posed[:3, :3], height,
+                                                "monocular" if sensor is None else "sensor")
+                               if stereo is None else
+                               analysis.scale_check(raw, K_grid, posed[:3, :3], height,
+                                                    "monocular", cam.height_sigma_m))
             if sensor is None:
                 f = analysis.height_factor(depth, K_grid, T[:3, :3], height,
                                            cam.height_sigma_m)
-                if f is None:
+                by_height = None if height is None else max(
+                    (cam.height_sigma_m or DEFAULT_HEIGHT_SIGMA_M) / height, MIN_SCALE_SIGMA_REL)
+                if qualified:
+                    assert ms is not None and ms.scale_sigma_rel is not None
+                    source, sigma = "baseline", ms.scale_sigma_rel
+                    if by_height is not None:
+                        # api.md §7 "Baseline check": the camera height's scale over the
+                        # baseline's, against both sigmas
+                        both = math.hypot(sigma, by_height)
+                        baseline_check = {"baseline_scale_ratio": None, "sigma": None,
+                                          "used": "baseline"}
+                        if f is not None:
+                            baseline_check.update(baseline_scale_ratio=round(f, 4),
+                                                  sigma=round(both, 5))
+                            if abs(math.log(f)) > BASELINE_CHECK_K_SIGMA * both:
+                                factor, source, sigma = f, "camera_height", by_height
+                                baseline_check["used"] = "camera_height"
+                elif f is None:
                     source, sigma = "monocular", MONOCULAR_SIGMA_REL
                 else:
-                    assert height is not None
-                    factor, source = f, "camera_height"
-                    sigma = max((cam.height_sigma_m or DEFAULT_HEIGHT_SIGMA_M) / height,
-                                MIN_SCALE_SIGMA_REL)
+                    assert by_height is not None
+                    factor, source, sigma = f, "camera_height", by_height
+                if ms is not None and by_height is not None and not qualified:
+                    baseline_check = {"baseline_scale_ratio": None, "sigma": None,
+                                      "used": "camera_height"}
             depth = (depth * factor).astype(np.float32)
             # the plane the scale was taken on (``height_factor``, ``scale_check``): one band
             floor = analysis.own_floor_z(depth, K_grid, T, height,
@@ -358,6 +432,10 @@ class Analyser:
                                "scale_sigma_rel": round(sigma, 5)}
         if scale_check is not None:
             out["scale_check"] = scale_check
+        if ms is not None:
+            out["motion"] = ms.body()
+        if baseline_check is not None:
+            out["baseline_check"] = baseline_check
         if w.wants_objects:
             out["objects"] = self._objects(w, seen, T)
             returned = {o["id"] for o in out["objects"]}
@@ -374,17 +452,44 @@ class Analyser:
                 out["range_scan"] = analysis.range_scan(
                     pts.xyz, T[:3, 3], level, floor_band_m(floor_sigma), w.z_band, w.step_deg,
                     pts.supported)
-        if "depth" in w.outputs:
+        if w.outputs & {"depth", "depth_sigma"}:
             metres = np.nan_to_num(self._on_image(w, depth), nan=0.0, posinf=0.0, neginf=0.0)
-            units = np.rint(metres / DEPTH_OUTPUT_UNIT_M)
-            out["depth"] = binary(np.clip(units, 0, MAX_DEPTH_UNITS).astype(np.uint16))
+            units = np.clip(np.rint(metres / DEPTH_OUTPUT_UNIT_M), 0, MAX_DEPTH_UNITS)
+            if "depth" in w.outputs:
+                out["depth"] = binary(units.astype(np.uint16))
+            if "depth_sigma" in w.outputs:
+                # api.md §7 "Depth sigma": the scale's sigma with the depth's own per pixel
+                own = np.hypot(sigma, rel if local is None else local.astype(np.float64))
+                per = self._on_image(w, np.broadcast_to(own, depth.shape).astype(np.float32))
+                s = np.clip(np.rint(per / SIGMA_OUTPUT_UNIT), 0, MAX_DEPTH_UNITS)
+                out["depth_sigma"] = binary(np.where(units > 0, s, 0).astype(np.uint16))
         if w.labels is not None:
             out["matches"] = matches(w.labels, out["objects"])
-        log.info("analysed a frame: frame %s, scale %s x%.3f, floor tilt %s%s, %d objects", frame,
-                 source, factor, "-" if hz is None or hz.tilt_deg is None
+        log.info("analysed a frame: frame %s, scale %s x%.3f, floor tilt %s%s, %d objects%s",
+                 frame, source, factor, "-" if hz is None or hz.tilt_deg is None
                  else f"{hz.tilt_deg:.1f} deg", " (turned)" if hz is not None and hz.rotated
-                 else "", len(seen))
+                 else "", len(seen), "" if ms is None else ", motion " + " ".join(
+                     f"{p.status}:{p.points}" for p in ms.frames))
         return out
+
+    @staticmethod
+    def _motion(w: Work, rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None, K: Any,
+                depth: NDArray[np.float32] | None, K_grid: Any) -> motion.Motion | None:
+        """The motion stereo of a request with ``frames`` (``mapping.motion``; None without):
+        the reference's image ``rgb`` on the canonical pinhole ``K`` with its ignored pixels,
+        each other frame's taken there as the reference's is, its ignored pixels the camera's
+        alone (a frame of ``frames`` carries no mask of its own), and the reference's
+        monocular ``depth`` on its grid (None beside a depth image)."""
+        if not w.frames:
+            return None
+        cam = w.camera
+        ignore_other = cam.beyond()
+        if w.camera_mask is not None and w.camera_mask.any():
+            own = cam.rectify(w.camera_mask.astype(np.uint8), nearest=True) > 0
+            ignore_other = own if ignore_other is None else (ignore_other | own)
+        others = [motion.Other(mapper_image(f.rgb, cam, w.camera_mask), ignore_other,
+                               f.T_ref_frame, f.sigma_pos_m, f.sigma_rot_deg) for f in w.frames]
+        return motion.motion_stereo(rgb, ignore, K, others, depth, K_grid)
 
     def _infer(self, w: Work, dv: DerivedVersion | None, K: Any, geometry: bool
                ) -> tuple[Any, list[Any], NDArray[np.uint8]]:
