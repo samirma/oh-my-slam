@@ -14,6 +14,7 @@ class Param:
     required: bool = False
     minimum: float | None = None
     maximum: float | None = None
+    enum: tuple[str, ...] | None = None  # the words a string parameter takes
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,11 @@ ENDPOINTS: tuple[Endpoint, ...] = (
                      Param("footprint_radius_m", "query", "number", "The robot's radius: its "
                            "footprint is free where cameras stood, and a passage narrower than "
                            "twice it has narrow: true (null without it).", minimum=0),
+                     Param("blind_disc", "query", "string", "The near blind disc that is free "
+                           "by rule around each camera stand (oms/2.9): full (default), "
+                           "footprint (limited to footprint_radius_m, which it then needs) or "
+                           "none (the stand's own cell only); never over or past a drop cell; "
+                           "echoed in the header.", enum=("full", "footprint", "none")),
                      Param("height_cap_m", "query", "number", "Ceiling of the height_m layer, "
                            "metres above the floor estimate: surfaces above it are left out "
                            "(default: z_max when given, else 2.0); echoed in the header."))),

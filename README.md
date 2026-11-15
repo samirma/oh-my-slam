@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.8) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.9) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -1693,7 +1693,7 @@ server.
 
 ### Navigation grid and points (O6)
 
-`GET /api/maps/{name}/grid?cell_m=&z_min=&z_max=&footprint_radius_m=&height_cap_m=&version=`
+`GET /api/maps/{name}/grid?cell_m=&z_min=&z_max=&footprint_radius_m=&blind_disc=&height_cap_m=&version=`
 (defaults 0.05 m, 0.05 m, 1.8 m; `height_cap_m` `z_max` when given, else 2.0 m, > 0; `cell_m` 0.01–1 m) and `GET /api/maps/{name}/points?min=x,y,z&max=x,y,z&voxel_m=
 &max_points=` (defaults 0.01 m, 200 000; at most 2 000 000), from the version's derived data
 (`mapping.navgrid`, `service.nav`).
@@ -1733,7 +1733,71 @@ server.
   cap, relative to the floor: the request's `height_cap_m`, else its `z_max` when it gives one,
   else 2.0 m (`navgrid.HEIGHT_CAP_M`), echoed as `height_cap_m`; a ceiling above it is left out.
   `floor_observed` 1 for a floor-like voxel in the column, 2 for a cell free by rule (below) whose
-  floor was not seen, else 0.
+  floor was not seen, 3 for a drop (next), else 0.
+* **Drops** (oms/2.9, map.md §6; `navgrid.layers`, `navgrid._drops`). A column is a drop
+  candidate when it holds no floor-like voxel and a surface voxel — the evidence of an occupied
+  cell, `hit ≥ 0.2 (hit + free)` — whose surface height (its hits' mean, as the floor band
+  classifies) lies below `floor_z_m − max(0.06 m, 3 × floor_sigma_m)`. A drop is `occupied`
+  whatever the band, `floor_observed` 3, and `height_m` is the centre of its highest voxel below
+  the band, relative to the floor (negative; of several surfaces below the band the highest, as
+  the layer's rule is). A candidate where an obstacle of the requested band stands above the
+  floor is no drop: it reads as that obstacle, as before oms/2.9 (occupied, `floor_observed`
+  0, `height_m` the obstacle's) — a wall that rises from the lower floor, and a wall's foot
+  under a floor estimated too high (`dev_rosmaster` v1 and v2 on 2026-11-14: 22 and 41 such
+  cells pass the two tests below, every one occupied in the band before, `height_m` 1.42 m
+  and 1.63 m, which as drops would have lost that height and their part in walls and jambs).
+  Two tests
+  keep the floor's own noise out, the constants this README owes the spec ("the evidence an
+  occupied cell needs" alone does not: nothing sees through a voxel below the floor, so one hit
+  is a surface there):
+  * **A step.** A candidate is no drop when its surface continues the seen floor without a
+    step: it is reached from a floor-like surface through neighbouring columns (8-connected)
+    whose heights differ by at most `navgrid.drop_step_m` = max(0.06 m, half the floor band)
+    (`DROP_STEP_MIN_M`, `DROP_STEP_BANDS`), along the surfaces below the band alone (per column
+    the highest; those lying under a seen floor carry it on), never down a column (the room
+    floor seen under the top's last cell continues nothing). That is the floor's own sheet,
+    below the band where far monocular depth or a tilted pose put it, or a ramp; a drop has a
+    step (a top's edge, a stair, a hole) or lies beyond the strip its edge hides.
+  * **A size.** Drop cells in a connected piece (8-connected) smaller than `DROP_MIN_M2` =
+    0.05 m² (20 cells) are no drop: flying pixels.
+  Measured on the maps the service held on 2026-11-14 (83 stored versions of 11 maps, by
+  `navgrid.layers` on their stored volumes; cameras 0.33–0.70 m up, `floor_sigma_m`
+  0.012–0.080 m): 34 versions have candidates, from 8 cells to 3646, the largest sets on
+  plain room floors (the keyframes of `dev_ainex_1`, `dev_ainex_loop1` and `dev_ainex_loop4`
+  show a simulated room's wooden floor, nothing below it) — 871–2653 cells a version in
+  `dev_ainex_loop1`, down to 0.68 m below the floor, 2667–3646 in `dev_ainex_loop4`, down to
+  1.19 m (5.6 floor bands), a band 0.7–2.5 m wide along a wall — the floor's own far sheets
+  as monocular depth and a walking robot's poses place them. As drops they
+  would be occupied cells on open floor, what `grid.floor_false_obstacles` counts; no depth
+  below the floor tells them from a real drop (a rule "more than 3 bands down is a drop",
+  tried for a drop joined to the floor by a wall, made 2100–3070 of them in
+  `dev_ainex_loop4`). With the step, 0–11 cells a version are left, in pieces of at most 7 (a
+  fixed step of 0.075 m left pieces of 60 cells); with both tests, none on any of the 83
+  versions, whose grids (layers, camera stands, a 0.2 m resampling, features) are the same as
+  before oms/2.9, while the test scenes' visible lower floor (99.9 % of its cells), stairs and
+  kerb are drops. No stored map holds a real drop whose lower floor was reconstructed
+  (`dev_edge_probe` and `dev_rosmaster` stand on a worktop: no candidate, and 8–10 that
+  continue the floor), so what the tests cost on one is not measured: the step is by
+  connection, and a lower floor that a slope or a leaning face joins to the floor's height
+  reads as its continuation. A candidate
+  that is no drop reads as before oms/2.9: free where seen through in the band, else unknown,
+  `floor_observed` 0.
+  **What is no drop: the strip an edge hides.** A drop needs a surface below the band (map.md
+  §6). From a camera `h` above a top whose edge is `d` away, the floor `D` below is seen only
+  from `d · D / h` past the edge (0.5 m up, 1.1 m down: 2.2 `d`); the cells between hold no
+  surface, so they stay free (seen through in the band) with `floor_observed` 0 and `height_m`
+  NaN, as before. `dev_edge_probe` v1 (one level frame 0.5 m above a top) has no candidate and
+  no drop cell: of its 2869 free cells with unseen floor, 1955 are crossed by rays below the
+  floor band and hold no surface, up to a vertical surface 2.5 m away, nearly all that its
+  volume holds below the top (the image shows the lower floor from the top's edge to the
+  horizon: the depth did not make a floor of it). A planner must not take a free cell with
+  `floor_observed` 0 for floor.
+  **Not a wall.** `inflate_walls` neither grows a drop nor grows a wall into one; in the
+  features a drop bounds regions as an obstacle does and makes no frontier (it is not unknown),
+  but it is never a jamb or a leaf: a chord "walled" by drops at both ends cut a free top
+  1.1 m wide in two regions with a passage between. **Resampling.** A coarser cell that covers
+  a drop cell is a drop (its worst state is occupied; `floor_observed` 3 over 1 over 2 over 0),
+  `height_m` the highest of its drop cells' surfaces.
 * **The floor: one estimate per version** (map.md §5). `floor_z_m` and `floor_sigma_m` are the
   version record's, estimated once at commit, before the objects are fused, which use the same
   two (`AnchoredMap.floor`): the surface the robot stands on, among the large horizontal planes
@@ -1787,6 +1851,22 @@ server.
   1248 within 1 m by rule — and the cells already free never got `floor_observed` 2; both are
   gone.)
   This is done at 5 cm for the features and again on the cells asked.
+  **`blind_disc`** (oms/2.9; `nav.blind_disc`, `navgrid.mark_stands`): `full` (default) as
+  above; `footprint` frees the footprint's disc alone (the blind disc limited to
+  `footprint_radius_m` is that disc; without the radius 400 `invalid_request` with
+  `details.field` `footprint_radius_m`; a radius of 0 is the camera's own cell); `none` frees
+  the camera's own cell alone, not the footprint either, which still decides `narrow`. Another
+  word is `invalid_request` (`details.field` `blind_disc`). It is echoed in the header, is part
+  of the answer's cache key, and the features are computed on the cells it frees.
+  **Never over or past a drop** (`navgrid._past_drop`): from the camera, rays half a cell apart
+  at the farthest cell and stepped by half a cell (`DROP_SIGHT_STEP`) give each direction's
+  distance to its first drop cell; a cell whose centre is at least that far along its direction
+  is not freed (a cell is judged along a line a quarter cell beside its centre at most). This
+  holds for the camera's own cell and its footprint too: a camera over a drop cell (an arm's,
+  past the worktop's edge) frees no cell. Unlike the straight-sight test removed above, it is
+  against drop cells only. A disc cell before the first drop cell is still free by rule: with
+  `full`, the strip an edge hides (Drops) inside a blind disc is free by rule, which
+  `footprint` and `none` avoid.
 * **Resolution.** Passages, regions and frontiers are computed at the volume's 5 cm whatever
   `cell_m` is asked (the layers are then resampled), so they do not change with the cell size.
 * **Passages.** Through every free cell on the medial axis of the free space with a clearance
@@ -1849,7 +1929,7 @@ server.
   `max_points`, the budget grid of `core.geometry.budget_voxel_indices` (`truncated: true`).
 
 **Encodings.** Every `Binary` is little-endian, row-major, base64: `state` uint8 (0 unknown,
-1 free, 2 occupied), `observations` uint16, `height_m` float32 (NaN: none), `floor_observed` uint8 (0 not seen, 1 seen, 2 free by rule),
+1 free, 2 occupied), `observations` uint16, `height_m` float32 (NaN: none), `floor_observed` uint8 (0 not seen, 1 seen, 2 free by rule, 3 a drop: occupied, `height_m` negative),
 shape `[rows (y), cols (x)]`; cell `[r, c]` covers x `origin_m[0] + c·cell_m` to `+cell_m`, y
 likewise with `r`. Points: `xyz` float32 `[n, 3]`, `object_id` uint32 `[n]` (0: none), `rgb`
 uint8 `[n, 3]`.
@@ -3106,6 +3186,11 @@ metric ids of evaluation.md, and share `tools/replay_eval/rpl_api.py` (client, t
 
 * `tools/replay_eval/replay_eval.py` replays recorded episodes against the simulator truth
   (`tools/replay_eval/README.md`).
+* `grid.drops` (oms/2.9) is listed by both and measured by neither yet (`no_samples` in the
+  replay, `not_measured` in the reference run): an episode's truth gives a worktop's height,
+  not a drop's extent, and evaluation.md does not say which truth-drop cells a keyframe
+  observed (the strip an edge hides, *Drops* above). `grid.camera_cells_free` still asks the
+  whole blind ring to be free, drop cells included.
 * `tools/evaluate/evaluate.py` runs the reference captures camera-only, each in one job and split
   (`halves`, `interleaved`: three jobs dealt round-robin, `per_frame`, and `truth`:
   office_sequence's ground-truth splits). Cameras: office_sequence from its EXIF 35 mm focal

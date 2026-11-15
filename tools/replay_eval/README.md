@@ -288,7 +288,11 @@ The C10 targets are the round-4 values in `examples/targets.json` (`objects.cent
 These items are not measured by the replay:
 * C13 and the split runs: the reference evaluator measures them;
 * the reference captures;
-* the contracts "job continues after a client disconnect" and "bird's-eye `pixel_to_map`".
+* the contracts "job continues after a client disconnect" and "bird's-eye `pixel_to_map`";
+* `grid.drops` (oms/2.9): it is listed, with its two parts `marked` and `free_by_rule`, and
+  reported `no_samples`. An episode's truth gives the worktop's height, not the extent of a
+  drop, and evaluation.md does not yet say which truth-drop cells count as observed by a
+  keyframe (the edge hides a strip of the lower floor from every camera on the top).
 
 ## Output
 
