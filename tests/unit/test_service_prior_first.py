@@ -818,6 +818,23 @@ def test_the_dry_run_scale_of_a_new_map() -> None:
     assert _scale({"scale_source": "depth", "scale_sigma_rel": 0.02}, None, []) == ("depth", 0.02)
 
 
+def test_the_dry_run_camera_height_sigma_is_the_sent_one() -> None:
+    """map.md §1: several camera_height frames do not shrink the sent relative sigma."""
+    from types import SimpleNamespace
+
+    from oh_my_slam.service.dry_run import _scale
+
+    def fr(h: float, sig: float) -> Any:
+        return SimpleNamespace(reason=None, depth_m=None, work=SimpleNamespace(
+            trust="none", prior=None, height_m=h, height_sigma_m=sig),
+            cam=SimpleNamespace(height_above_floor_m=None, height_sigma_m=None))
+
+    src, sig = _scale(None, None, [fr(0.37, 0.03) for _ in range(8)])
+    assert src == "camera_height" and sig == pytest.approx(0.03 / 0.37)
+    assert _scale(None, None, [fr(1.0, 0.01), fr(0.5, 0.02), fr(0.5, 0.01)])[1] == \
+        pytest.approx(0.02)
+
+
 def test_a_stored_kept_frame_is_re_registered_by_a_later_job(client: Client) -> None:
     """map.md §2: a frame kept at its prior (nothing mapped there yet) is confirmed by a later
     job whose frames reach it: fused in that version and listed in quality.reregistered, its

@@ -222,11 +222,11 @@ def test_the_older_mapper_measures_a_registered_frames_floor() -> None:
 def test_an_own_floor_plane_and_its_inlier_share() -> None:
     z, Kg, T = _floor_points(0.5)
     R = T[:3, :3]
-    got = an.own_floor_plane(z, Kg, R, 0.5)
+    got = an.own_floor_plane(z, Kg, R, 0.5, 0.06)
     assert got is not None and got[0] == pytest.approx(0.5, abs=0.01)
     assert got[1] == pytest.approx([0.0, 0.0, 1.0], abs=0.05)
     share = an.floor_share(z, Kg, R, got[0], got[1])
     assert 0.0 < share < 1.0
     assert an.floor_share(np.zeros_like(z), Kg, R, 0.5, got[1]) == 0.0
-    assert an.own_floor_plane(np.zeros_like(z), Kg, R, 0.5) is None
+    assert an.own_floor_plane(np.zeros_like(z), Kg, R, 0.5, 0.06) is None
     assert analysis.scale_check(z, Kg, R, 0.5, "sensor")["ratio"] == pytest.approx(1.0, abs=0.03)

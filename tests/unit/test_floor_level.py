@@ -281,3 +281,124 @@ def test_the_service_keeps_the_floor_and_analyses_at_the_sent_height(
     # ... and where the pose sees too little of it, by its height above the map's floor
     monkeypatch.setattr(analysis, "MAP_ALIGN_MIN_POINTS", 10 ** 9)
     assert abs(on_map(CAM) - 1.0) <= sigma
+
+
+def _level_floor(n: int, rng: np.random.Generator, half: float = 1.5) -> np.ndarray:
+    """A level floor at z 0 around the camera at ``AT``, 3 mm noise."""
+    xy = np.asarray(AT) + rng.uniform(-half, half, (n, 2))
+    return np.column_stack([xy, rng.normal(0.0, 0.003, n)])
+
+
+def test_the_floor_sigma_is_taken_under_the_robot(tmp_path: Path) -> None:
+    """map.md §6 "Floor sigma": where priors fixed the frame, the floor's spread is that of the
+    points under the robot at the floor's level (within ``FLOOR_SPREAD_M``); walls and counters
+    within 0.12 m of z 0 but farther than ``FLOOR_NEAR_M`` from every camera do not widen it. A
+    camera-only map takes its spread over all the cloud's points at the floor's level."""
+    rng = np.random.default_rng(5)
+    floor = _level_floor(6000, rng, an.FLOOR_NEAR_M * 0.9)
+    far = np.column_stack([AT[0] + rng.uniform(2.5, 3.0, 6000), AT[1] + rng.uniform(-1, 1, 6000),
+                           rng.uniform(-0.12, 0.12, 6000)])
+    assert (np.hypot(far[:, 0] - AT[0], far[:, 1] - AT[1]) > an.FLOOR_NEAR_M).all()
+    cloud = np.vstack([floor, far])
+    z, sigma = _map_with(tmp_path, cloud, "metric", 0.37)._floor_estimate()
+    assert z == 0.0 and sigma == pytest.approx(0.003, abs=0.001)  # the floor's noise only
+    m = _map_with(tmp_path, cloud, "none", 0.37)
+    z, every = m._floor_estimate()
+    assert z == pytest.approx(0.0, abs=0.01)
+    assert every == an.floor_spread(m.cloud.points()[:, 2], z)  # every point at its level
+    assert every > 2.5 * sigma  # the far points widen it where they are not left out
+
+
+def test_a_camera_only_map_takes_no_sliver_below_its_floor(tmp_path: Path) -> None:
+    """map.md §2, §6: one minimum share (``FLOOR_MIN_SHARE`` of all the points) makes a plane
+    large at map level too. A camera-only map whose cloud holds a 0.4 m patch 1 m below its
+    floor (1.5 % of the points, but half the floor's sampled inliers) keeps the floor at z 0;
+    before, the patch was the lowest candidate and became ``floor_z_m``."""
+    rng = np.random.default_rng(6)
+    floor = _level_floor(200_000, rng)
+    patch = np.column_stack([AT[0] + rng.uniform(-0.2, 0.2, 3000),
+                             AT[1] + rng.uniform(-0.2, 0.2, 3000),
+                             rng.normal(-1.0, 0.003, 3000)])
+    cloud = np.vstack([floor, patch])
+    assert len(patch) < an.FLOOR_MIN_SHARE * len(cloud)
+    m = _map_with(tmp_path, cloud, "none", 0.37)
+    q = cloud - np.array([0.0, 0.0, 0.37])
+    # the patch is a candidate on the sampled share alone, not with the minimum share
+    every = an.floor_candidates(q, an.MAP_FLOOR_SHARE, sampled=True)
+    assert sorted({round(h, 1) for h in every}) == [0.4, 1.4]
+    assert [round(h, 1) for h in an.floor_candidates(
+        q, an.MAP_FLOOR_SHARE, min_share=an.FLOOR_MIN_SHARE, sampled=True)] == [0.4]
+    z, _ = m._floor_estimate()
+    assert z == pytest.approx(0.0, abs=0.01)
+
+
+def _session(c: An, name: str, cam: dict[str, Any]) -> None:
+    """The client's session (``test_the_service_keeps_the_floor_...``) on map ``name``."""
+    for i, yaw in enumerate((0.0, 20.0, -20.0, 40.0)):
+        f, files, _, _ = _sent(c, f"f{i}", yaw, TILT_DEG if i == 0 else 0.0)
+        job = c.update(name, [f], files, cameras={"cam": cam} if i == 0 else None)
+        assert job["state"] == "committed" and job["scale_source"] == "camera_height", job
+
+
+def _scale_on(c: An, name: str, camera: dict[str, Any], img: bytes, P: np.ndarray,
+              z: np.ndarray) -> float:
+    """The scale a view analysed on map ``name`` takes, over the true depth ``z``."""
+    doc = c.analyse({"image": "i", "camera": camera, "map": name, "T_map_cam": P.tolist(),
+                     "outputs": ["depth"]}, {"i": img})
+    assert (doc["frame"], doc["scale_source"]) == ("map", "camera_height")
+    return float(np.median(decode(doc["depth"]) * 0.001 / z))
+
+
+def test_the_sent_height_scale_is_bounded_by_the_map_s_k(
+        svc: An, monkeypatch: pytest.MonkeyPatch) -> None:
+    """api.md §7: on a camera_height map a monocular frame takes its own sent-height scale only
+    within the monocular scale bound (``MONO_FLOOR_BOUND_REL``) of the map's monocular depth
+    scale k, recorded with the version (``mono_depth_scale``); beyond it, and on a version that
+    records no k, the map's cloud scale. A height sent 1.2 x the true one gives 1.2 (within the
+    bound), 2 x gives the cloud's 1.0 (beyond it)."""
+    cam = {**CAM, "height_above_floor_m": H, "height_sigma_m": HS}
+    _session(svc, "m", cam)
+    k = svc.service.store.version("m")["mono_depth_scale"]
+    assert k == pytest.approx(1.0 / BIAS, rel=0.03)
+    _, files, z, P = _sent(svc, "q", 10.0)
+    img = files["q"]
+    assert _scale_on(svc, "m", cam, img, P, z) == pytest.approx(1.0, abs=0.02)
+    near = {**cam, "height_above_floor_m": 1.2 * H}
+    assert 1.2 - 1.0 < an.MONO_FLOOR_BOUND_REL < 2.0 - 1.0
+    assert _scale_on(svc, "m", near, img, P, z) == pytest.approx(1.2, abs=0.03)
+    far = {**cam, "height_above_floor_m": 2.0 * H}
+    assert abs(_scale_on(svc, "m", far, img, P, z) - 1.0) <= HS / H  # the cloud's
+    # a version recorded without k (before it was recorded): the cloud's, whatever the height
+    real = svc.service.store.commit
+
+    def without_k(name: str, record: dict[str, Any], *a: Any, **kw: Any) -> Any:
+        record.pop("mono_depth_scale", None)
+        return real(name, record, *a, **kw)
+
+    monkeypatch.setattr(svc.service.store, "commit", without_k)
+    _session(svc, "old", cam)
+    assert "mono_depth_scale" not in svc.service.store.version("old")
+    assert abs(_scale_on(svc, "old", near, img, P, z) - 1.0) <= HS / H
+
+
+def test_the_frame_s_floor_takes_the_band_of_its_scale_check(
+        svc: An, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Outside the map frame the analysis's own floor (``own_floor_z``) is asked with the
+    depth's kind and the sent height's sigma, the band ``scale_check`` and ``height_factor``
+    take (``floor_band``)."""
+    seen: list[tuple[Any, ...]] = []
+    real = analysis.own_floor_z
+
+    def spy(*a: Any) -> Any:
+        seen.append(a[3:])
+        return real(*a)
+
+    monkeypatch.setattr(analysis, "own_floor_z", spy)
+    _, files, _, P = _sent(svc, "q", 10.0)
+    _, dep, _ = service_shot(base_pose(10.0))
+    cam = {**CAM, "height_above_floor_m": H, "height_sigma_m": 0.1}
+    svc.analyse({"image": "i", "depth": "d", "camera": cam, "T_map_cam": P.tolist(),
+                 "outputs": ["depth"]}, {"i": files["q"], "d": dep})
+    svc.analyse({"image": "i", "camera": cam, "T_map_cam": P.tolist(), "outputs": ["depth"]},
+                {"i": files["q"]})
+    assert seen == [(H, "sensor", 0.1), (H, "mono", 0.1)]

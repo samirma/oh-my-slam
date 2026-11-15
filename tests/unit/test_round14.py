@@ -248,7 +248,7 @@ def test_floor_verdicts() -> None:
     assert an.floor_verdict("sensor", 0.5, 0.01, T, 0.05, np.zeros_like(z), Kg) == an.FloorCheck()
     wall = np.full_like(z, 2.0)  # a frontal wall: no floor plane below
     assert an.floor_verdict("sensor", 0.5, 0.01, T, 0.05, wall, Kg) == an.FloorCheck()
-    assert an.own_floor(z, Kg, T[:3, :3], 0.5) == pytest.approx(0.5, abs=0.01)
+    assert an.own_floor(z, Kg, T[:3, :3], 0.5, 0.06) == pytest.approx(0.5, abs=0.01)
 
 
 def _cloud_floor(m: AnchoredMap) -> np.ndarray:

@@ -135,9 +135,9 @@ def test_the_worktop_under_the_robot_is_its_floor_among_wider_counters() -> None
     got = an.floor_verdict("mono", 0.5, 0.01, T, 0.05, z * 1.2, K640)
     assert got.judged and got.factor == pytest.approx(1 / 1.2, rel=0.02)
     assert analysis.height_factor(z * 1.2, K640, R, 0.5, 0.01) == pytest.approx(1 / 1.2, rel=0.02)
-    assert an.own_floor(z, K640, R, None) == pytest.approx(0.7, abs=0.005)
-    assert analysis.own_floor_z(z, K640, T, None) == pytest.approx(0.9, abs=0.005)
-    assert analysis.own_floor_z(z, K640, T, 0.5) == pytest.approx(1.1, abs=0.005)
+    assert an.own_floor(z, K640, R, None, 0.0) == pytest.approx(0.7, abs=0.005)
+    assert analysis.own_floor_z(z, K640, T, None, "sensor") == pytest.approx(0.9, abs=0.005)
+    assert analysis.own_floor_z(z, K640, T, 0.5, "sensor", 0.01) == pytest.approx(1.1, abs=0.005)
     # no plane near the height: the widest plausible one, and none when none is plausible
     assert an.own_floor(z, K640, R, 0.6, 0.03) == pytest.approx(0.7, abs=0.005)
     assert an.own_floor(z, K640, R, 0.05, 0.01) is None
@@ -149,12 +149,40 @@ def test_the_worktop_under_the_robot_is_its_floor_among_wider_counters() -> None
     assert an.floor_band("mono", 0.1, 0.03) == pytest.approx(3 * np.hypot(0.03, 0.001))
 
 
+def test_the_widest_plausible_plane_when_the_widest_is_implausible() -> None:
+    """map.md §2: with no plane near the expected height, the widest plane whose implied scale
+    lies within ``SCALE_RANGE`` (0.2-5); a widest one beyond it gives way to the next widest.
+    The worktop view: counters 0.7 m below (the widest), the worktop 0.5 m; a height of 0.12 m
+    implies 0.17 on the counters (implausible) and 0.24 on the worktop."""
+    z, T = _view(TOP, 1.6, -30.0)
+    R = T[:3, :3]
+    assert an.SCALE_RANGE == (0.2, 5.0)
+    assert 0.12 / 0.7 < an.SCALE_RANGE[0] <= 0.12 / 0.5
+    assert an.own_floor(z, K640, R, 0.6, 0.03) == pytest.approx(0.7, abs=0.005)  # the widest
+    assert an.own_floor(z, K640, R, 0.12, 0.01) == pytest.approx(0.5, abs=0.005)  # the next
+
+
+def test_the_frame_s_floor_and_its_scale_check_take_one_plane() -> None:
+    """Frame analysis (api.md §7): its own floor (``own_floor_z``) takes the plane in the same
+    band (``floor_band`` of the depth's kind and the height's sigma) as ``scale_check``. A depth
+    image of the worktop view sent 0.57 m up: with a 0.01 m sigma no plane is that near and both
+    take the widest (the counters, 0.7 m); with 0.1 m both take the nearest (the worktop, 0.5
+    m). Before, the floor took a fixed 0.06 m band: the counters, whatever the sigma."""
+    z, T = _view(TOP, 1.6, -30.0)
+    for sigma, h in ((0.01, 0.7), (0.1, 0.5)):
+        check = analysis.scale_check(z, K640, T[:3, :3], 0.57, "sensor", sigma)
+        assert check["model_height_m"] == pytest.approx(h, abs=0.005)
+        floor = analysis.own_floor_z(z, K640, T, 0.57, "sensor", sigma)
+        assert floor == pytest.approx(float(T[2, 3]) - check["model_height_m"], abs=1e-4)
+
+
 def test_a_frame_with_slivers_only_has_no_floor() -> None:
     """A wall and two ledges of 1-2 % of the frame: no measurable floor plane, so no scale from
     the camera's height and an empty ``scale_check`` (before: the ledge nearest the height)."""
     z, T = _view(LEDGES, 0.9, 12.0)
     R = T[:3, :3]
-    assert an.own_floor(z, K640, R, 0.37) is None and an.own_floor(z, K640, R, None) is None
+    assert an.own_floor(z, K640, R, 0.37, 0.06) is None
+    assert an.own_floor(z, K640, R, None, 0.0) is None
     assert analysis.height_factor(z, K640, R, 0.37) is None
     check = analysis.scale_check(z, K640, R, 0.37, "monocular")
     assert check["ratio"] is None and check["floor_inlier_share"] == 0.0

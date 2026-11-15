@@ -836,7 +836,11 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     floor, floor_sigma, pts = om.floor_z, om.floor_sigma, am.bounds()
     record = {"kind": "update", "engine": "anchored", "job_id": job.id,
               "sim3": Sim3().to_dict(), "scale_source": source,
-              "scale_sigma_rel": round(sigma, 5), "frames": rows, "objects": n_objects,
+              "scale_sigma_rel": round(sigma, 5),
+              # the map's monocular depth scale k (raw model depth to map metres): frame
+              # analysis bounds a frame's own sent-height scale by it (api.md §7)
+              "mono_depth_scale": round(float(am.scale.k), 6),
+              "frames": rows, "objects": n_objects,
               "floor_z_m": None if floor is None else round(floor, 4),
               "floor_sigma_m": round(floor_sigma, 4), "pose_states": POSE_STATES,
               "bounds_m": {"min": pts.min(0).round(4).tolist(),

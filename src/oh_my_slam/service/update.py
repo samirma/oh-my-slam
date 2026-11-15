@@ -705,7 +705,8 @@ class Updater:
             r = np.array([h[0] for h in heights])
             rel = np.array([h[1] for h in heights])
             mad = 1.4826 * float(np.median(np.abs(np.log(r) - np.median(np.log(r)))))
-            sigma = math.sqrt(mad ** 2 + float(np.median(rel)) ** 2) / math.sqrt(len(r))
+            # map.md §1: never below the sent heights' median relative sigma (not / sqrt n)
+            sigma = math.sqrt(float(np.median(rel)) ** 2 + mad ** 2 / len(r))
             return float(np.median(r)), "camera_height", max(sigma, MIN_SCALE_SIGMA_REL)
         return 1.0, "monocular", MONOCULAR_SIGMA_REL
 
