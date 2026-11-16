@@ -330,7 +330,8 @@ def test_colmap_extracts_no_keypoint_on_ignored_pixels(tmp_path: Path) -> None:
         db.close()
     assert len(a) > 20 and (a[:, 0] >= 159.0).all()
     assert (b[:, 0] < 159.0).sum() > 20
-    assert Sfm(tmp_path / "db2.db", frames, tmp_path / "w2")._keypoint_masks(["b.jpg"]) is None
+    assert Sfm(tmp_path / "db2.db", frames, tmp_path / "w2")._keypoint_inputs(["b.jpg"]) \
+        == (frames, None)
 
 
 def test_detections_mostly_on_ignored_pixels_are_dropped() -> None:
@@ -376,9 +377,37 @@ def test_mapanything_depth_on_ignored_pixels_counts_for_nothing() -> None:
     v = rm.MvView(np.eye(4), np.ones((10, 15), np.float32), np.eye(3))
     K = Intrinsics(30.0, 30.0, 15.0, 10.0, 30, 20)
     chunk = [rm.New(0, Path("a"), K, ignore=ign), rm.New(1, Path("b"), K)]
-    out = rm._without_ignored([v, v, v], 1, chunk)
+    out = rm._without_ignored([v, v, v], [None] + [f.ignore for f in chunk])
     assert out[0] is v and out[2] is v
     assert not out[1].depth[5:].any() and out[1].depth[:5].all()
+    # an anchor's ignored pixels too: MapAnything saw every image unaltered (map.md §2)
+    out = rm._without_ignored([v, v], [ign, np.zeros((20, 30), bool)])
+    assert not out[0].depth[5:].any() and out[0].depth[:5].all() and out[1] is v
+
+
+def test_a_thumbnail_takes_no_ignored_pixel(tmp_path: Path) -> None:
+    """The anchors' thumbnail similarity (``register_ma._thumb``): the ignored pixels take no
+    part, so a frame with the robot's body over half of it matches its view without it."""
+    import cv2
+
+    from oh_my_slam.mapping import register_ma as rm
+    from tests.fakes.service import textured
+
+    (tmp_path / "a.jpg").write_bytes(textured(4, 320, 240))
+    img = cv2.imread(str(tmp_path / "a.jpg"))
+    body = img.copy()
+    body[120:] = 255  # the robot's body over the bottom half
+    cv2.imwrite(str(tmp_path / "b.png"), body)
+    ign = np.zeros((240, 320), bool)
+    ign[120:] = True
+    a, b = rm._thumb(tmp_path / "a.jpg", ign), rm._thumb(tmp_path / "b.png", ign)
+    raw = rm._thumb(tmp_path / "b.png")
+    assert a is not None and b is not None and raw is not None
+    assert float((a * b).sum()) > 0.99 and float((a * raw).sum()) < 0.9
+    assert not b[12:].any()  # the ignored cells hold the mean
+    full = rm._thumb(tmp_path / "a.jpg", np.ones((240, 320), bool))
+    assert full is not None and not full.any()
+    assert rm._thumb(tmp_path / "none.jpg") is None
 
 
 # -- P18: the label vocabulary (oms/2.3) --------------------------------------------------------
@@ -576,10 +605,18 @@ def test_ignore_mask_files_of_the_older_mapper(tmp_path: Path) -> None:
     (a / "bad.jpg").write_bytes(b"no image")
     ignore_mask_path(a, "y.jpg").write_bytes(b"no png")
     (a / "y.jpg").write_bytes(textured(2, 16, 12))
-    out = Sfm(tmp_path / "db", a, tmp_path / "w")._keypoint_masks(["x.jpg", "bad.jpg", "y.jpg"])
+    images, out = Sfm(tmp_path / "db", a, tmp_path / "w")._keypoint_inputs(
+        ["x.jpg", "bad.jpg", "y.jpg"])
     assert out is not None and not (out / "bad.jpg.png").exists()
     assert not cv2.imread(str(out / "x.jpg.png"), cv2.IMREAD_GRAYSCALE).any()
     assert cv2.imread(str(out / "y.jpg.png"), cv2.IMREAD_GRAYSCALE).all()
+    # COLMAP reads the ignored pixels filled (no keypoint on the body's outline); the map's
+    # frames stay unaltered, as the models see them; the others are linked as they are
+    assert (images / "x.jpg").is_file() and not (images / "x.jpg").is_symlink()
+    assert (images / "x.jpg").read_bytes() != (a / "x.jpg").read_bytes()
+    assert (a / "x.jpg").read_bytes() == textured(1, 16, 12)
+    assert (images / "y.jpg").is_symlink() and (images / "bad.jpg").is_symlink()
+    assert (images / "y.jpg").read_bytes() == (a / "y.jpg").read_bytes()
     assert sm.main(["--keep-versions", "0", "--data", str(tmp_path / "d")]) == 2
 
 

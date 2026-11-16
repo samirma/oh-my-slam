@@ -231,23 +231,35 @@ the version. A rejected or failed job leaves the map as it was.
   camera's. The canonical intrinsics are given to the mapper (`mapping.api.update(intrinsics=)`)
   in place of EXIF and the monocular focal estimate; the mapper holds them as it holds an EXIF
   focal length (refined within 1.15, see *A focal length the keyframes carry*). A canonical JPEG
-  without a mask reaches the mapper byte for byte. EXIF orientation is not applied: intrinsics
+  reaches the mapper byte for byte, with or without a mask. EXIF orientation is not applied: intrinsics
   describe the stored pixels.
 * **Ignore mask.** The camera's mask and the frame's own (`FrameInput.ignore_mask`) are combined,
   and a pixel in their union contributes nothing anywhere, on every engine (map.md §2 "Ignored
-  pixels", oms/2.3 P18). Their pixels take no part in the per-frame checks and are filled from
-  their surroundings (`cv2.inpaint`) in the image the mapper gets. Then, per sink:
+  pixels", oms/2.3 P18). Their pixels take no part in the per-frame checks. **The models see
+  the image unaltered** (oms/2.13): every model input — monocular depth (analysis, an update's
+  frames, the older mapper's keyframes, the `too_close` median, `Backend.median_depth` with the
+  mask), MapAnything (new frames and anchors), detection — is the rectified image as sent, and
+  the outputs drop the ignored pixels afterwards. Until oms/2.13 the image was filled from its
+  surroundings (`cv2.inpaint`) before every model: a large filled region (the robot's body) is a
+  smooth blob that a monocular depth model reads as a near surface, and its depth blended past
+  the mask edge into the unmasked floor, beyond the beam margin: a range scan showed phantom
+  returns at 0.3–0.5 m along the mask's edges in open space. Only keypoint extraction sees the
+  ignored pixels filled (`core.images.filled`, `anchored.features`; the older mapper's COLMAP
+  extraction reads filled copies, `Sfm._keypoint_inputs`), so that no keypoint lies on the body's
+  outline or has a descriptor across it; the stored keyframe images stay unaltered. The anchor
+  thumbnails (`register_ma._thumb`) average only the unignored pixels. Then, per sink:
   * **keypoints and matches**: the prior-first engine's SIFT (`anchored.features`, every job and
     dry-run frame) takes none there; the older mapper writes each keyframe's mask beside its
     frames (`frame_masks/<image>.png`, `sfm.ignore_mask_path`, kept with the map for a later
     re-extraction) and the Homebrew `colmap feature_extractor` gets them as
-    `--ImageReader.mask_path` (`Sfm._keypoint_masks`), so neither SIFT matching nor the LightGlue
+    `--ImageReader.mask_path` (`Sfm._keypoint_inputs`), so neither SIFT matching nor the LightGlue
     re-matching, both on those keypoints, has a match there; the locate index of every version
     extracts its keyframes' features without them (`InternalMap.ignore`, the mask in the feature
     cache key), as locate's own frames do;
   * **depth, cloud, occupancy, free space and floor**: a depth image is zero there
     (`cameras.mapper_depth`), so is the monocular depth (`prior_first._waiter`: no scale
-    evidence or scene distance either) and MapAnything's depth of a new frame (`register_ma.
+    evidence or scene distance either; `prior_first.without_ignored`, the dry run's too) and
+    MapAnything's depth of every view of a call, anchors included (`register_ma.
     _without_ignored`: no scale, agreement or fusion); a prior-first keyframe stores its depth
     grid with them zeroed and its mask as `kf/<id>.ignore.png` (`AnchoredMap.ignore_of`), so the
     cloud, the derived occupancy volume (no ray: neither occupied nor free evidence) and the
@@ -2289,7 +2301,12 @@ It is an update's own code on one frame, kept nowhere.
   than `BEAM_MARGIN_PX` = 3 px (Chebyshev) from every pixel without depth (the model's
   low-confidence pixels, which MoGe's validity mask leaves at 0 — its mask is binary, so this
   is the confidence there is; a sensor's holes; ignored pixels, whose edge is the model's blend
-  with what they hide) and from every depth edge (the flying-pixel rule, a 4 % jump in a 3 × 3
+  with what they hide — the robot's body, a real near surface the model saw unaltered: their
+  border is a depth edge, its first unignored pixel flagged by the flying-pixel rule (the jump
+  to 0) and the margin added, 4 px in all as around any other occlusion; no wider margin, since
+  the model now blends across the body's outline as across any occlusion, and the mask's
+  nearest resampling onto the depth grid moves its edge by under one cell) and from every depth
+  edge (the flying-pixel rule, a 4 % jump in a 3 × 3
   window), and outside the image's outer `BEAM_BORDER_REL` = 2 % of its larger side (13 px on
   the 640 px grid). A model's depth blends across an occlusion over a few pixels, wider than
   the 3 × 3 window, and its depth bends at the border (`reconstruction.borders`: up to 6 % in

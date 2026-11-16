@@ -132,6 +132,9 @@ class FakeBackend:
     up: Any = (0.0, -1.0, 0.0)
     other_detections: list[Any] = field(default_factory=list)
     other_depth: np.ndarray | None = None
+    # the bytes of every image a model got (``infer``, ``detect``, ``register``'s inputs), in
+    # call order: map.md §2 "Ignored pixels", a model sees the image unaltered
+    received: list[bytes] = field(default_factory=list)
 
     def add(self, image: bytes, T: np.ndarray, depth_m: float = 2.0) -> bytes:
         sha = hashlib.sha256(image).hexdigest()
@@ -150,7 +153,8 @@ class FakeBackend:
         if not self.ready:
             raise ApiError("inference_unavailable", "down (test)")
 
-    def median_depth(self, image: Path, K: Intrinsics) -> float | None:
+    def median_depth(self, image: Path, K: Intrinsics, ignore: Any = None) -> float | None:
+        self.median_ignores = [*getattr(self, "median_ignores", []), ignore]
         return self.mono
 
     def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
@@ -159,6 +163,7 @@ class FakeBackend:
         from oh_my_slam.service.errors import ApiError
 
         self.infers.append((image.name, gravity))
+        self.received.append(image.read_bytes())
         if self.infer_error:
             raise ApiError("inference_unavailable", "down (test)")
         sha = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -208,6 +213,7 @@ class FakeBackend:
         from oh_my_slam.service.errors import ApiError
 
         self.detected.append((image.name, grid))
+        self.received.append(image.read_bytes())
         self.prompted.append(list(labels))
         self.asked.append((min_score or 0.0, defaults))
         if self.detect_error:
@@ -240,6 +246,7 @@ class FakeBackend:
                  log: Path, masks: dict[Path, Path] | None = None, labels: Any = ()
                  ) -> Registered:
         self.calls.append([p.name for p in inputs])
+        self.received += [p.read_bytes() for p in inputs]
         self.prompted.append(list(labels))
         self.masks.append({p.name: m.name for p, m in (masks or {}).items()})
         if self.nothing:

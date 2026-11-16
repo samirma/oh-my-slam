@@ -852,8 +852,13 @@ def test_a_frame_mask_is_combined_with_the_camera_s(client: Client) -> None:
     frames, files, _ = frames_of(client, 1, start=2)
     frames[0]["ignore_mask"] = "fm"
     files["fm"] = png(slice(0, 60))
+    client.backend.received.clear()
     job = client.update("n", frames, files, {"cam": CAMERA})
-    assert job["inputs"][0]["reason"] == "no_overlap"  # inpainted: the mapper's input changed
+    # the mapper (its features and its models) gets the frame unaltered on its ignored pixels,
+    # with the mask beside it (map.md §2 "Ignored pixels"): placed as without one
+    assert job["inputs"][0]["status"] == "registered"
+    assert client.backend.received == [files["img2"]]
+    assert list(client.backend.masks[-1].values()) == ["0000.mask.png"]
     doc = client.post_update("m", {"frames": [{**frames[0], "ignore_mask": "x"}],
                                    "cameras": {"cam": CAMERA}},
                              {**files, "x": png16(np.zeros((10, 10)))}, status=400)

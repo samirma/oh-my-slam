@@ -220,6 +220,25 @@ def on_grid(mask: NDArray[np.bool_] | None, shape: tuple[int, ...]) -> NDArray[n
     return out
 
 
+FILL_RADIUS_PX = 5  # ``filled``: cv2.inpaint's neighbourhood
+
+
+def filled(rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None) -> NDArray[np.uint8]:
+    """The image a feature extractor gets (map.md §2 "Ignored pixels"): its ignored pixels
+    (``ignore``, any grid of the image) filled from their surroundings (``cv2.inpaint``), so that
+    no keypoint lies on the outline of the robot's body and no descriptor spans it; ``rgb``
+    itself without ignored pixels. Only for keypoints: a model gets the image unaltered (a large
+    filled region reads as a near, smooth surface whose depth bleeds past it)."""
+    m = on_grid(ignore, rgb.shape)
+    if m is None:
+        return rgb
+    import cv2
+
+    out = cv2.inpaint(np.ascontiguousarray(rgb), m.astype(np.uint8), FILL_RADIUS_PX,
+                      cv2.INPAINT_TELEA)
+    return np.asarray(out, np.uint8)
+
+
 def masked_view(corners_cam: NDArray[Any], K: Intrinsics, ignore: NDArray[np.bool_] | None
                 ) -> bool:
     """Whether a view is no view of an object (map.md §2, §5 "Ignored pixels"; every engine):

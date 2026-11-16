@@ -566,6 +566,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   ignored region exceeds `IGNORED_DETECTION_MAX_SHARE` (`README.md`, 0.5): the share of its
   mask, or of its box when it has no mask. On every engine, a view where the object lies mostly
   in ignored pixels, by that same share, is not a view of it (§5, Ignored pixels).
+  Every model (monocular depth, MapAnything, detection, segmentation) gets the image unaltered
+  on its ignored pixels, rectified only; their outputs on those pixels are dropped after
+  inference, and so is any image-level comparison of them (thumbnails). The image is never
+  filled or painted over before a model sees it: a filled region reads as a near, smooth
+  surface whose depth bleeds past the mask into the pixels around it, so the ignored pixels
+  would contribute there. Only keypoint extraction may see them filled, so that no keypoint lies
+  on the outline of the robot's body. The ignored region's border is an occlusion edge for the
+  range scan's beam support (api.md §7, Unsupported beams): the robot's body is a real near
+  surface in the image the model saw.
 * **Reads.**
   * A read without `?version=` answers from the latest committed version at the moment the
     request arrives.

@@ -554,6 +554,73 @@ def test_ignored_pixels_give_nothing(an: An, shot: tuple[bytes, bytes, np.ndarra
     assert np.array_equal(decode(doc["depth"]), sent) and len(doc["objects"]) == 4
 
 
+def test_the_models_see_the_image_unaltered_on_its_ignored_pixels(
+        an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]]) -> None:
+    """map.md §2 "Ignored pixels" (oms/2.13): the depth and detection models get the image as
+    sent, never filled on the ignored pixels (a filled robot body reads as a near surface whose
+    depth bleeds past the mask and moves the floor fit); the outputs drop those pixels after
+    inference. The fake's depth answers only the bytes as sent: a filled image would get its
+    flat 2 m, no floor, and no camera-height scale."""
+    img, dep, T, _ = shot
+    z, eye = metres(dep), T[:3, 3]
+    an.backend.mono_depth[hashlib.sha256(img).hexdigest()] = z * 0.8
+    an.backend.up = T[:3, :3].T @ np.array([0.0, 0.0, 1.0])
+    body = np.zeros((480, 640), np.uint8)
+    body[BOTTOM:] = 255
+    body[200:BOTTOM, 260:380] = 255  # an arm across the floor
+    req = {"image": "i", "outputs": ["range_scan", "depth", "objects"], "ignore_mask": "fm",
+           "camera": {**CAM, "height_above_floor_m": float(eye[2])}}
+    an.backend.received.clear()
+    doc = an.analyse(req, {"i": img, "fm": png(body)})
+    assert len(an.backend.received) == 2 and all(b == img for b in an.backend.received)
+    assert doc["scale_source"] == "camera_height"  # the floor fit on the model's own depth
+    out = decode(doc["depth"]) * 0.001
+    assert not out[body > 0].any() and np.abs(out[body == 0] - z[body == 0]).max() < 0.03
+    plain = an.analyse({k: v for k, v in req.items() if k != "ignore_mask"}, {"i": img})
+    # the same model depth; the scale only as the floor pixels left differ
+    assert np.allclose(decode(plain["depth"])[body == 0], decode(doc["depth"])[body == 0],
+                       rtol=0.01)
+    # a camera that is not its canonical pinhole: rectified, not filled
+    cam = {**CAM, "cx": 300.0}
+    an.backend.received.clear()
+    an.analyse({"image": "i", "T_map_cam": T.tolist(), "outputs": ["depth"],
+                "ignore_mask": "fm", "camera": cam}, {"i": img, "fm": png(body)})
+    got = np.asarray(Image.open(io.BytesIO(an.backend.received[0])), np.float32)
+    canon = Camera.from_json(cam)
+    want = canon.rectify(np.asarray(Image.open(io.BytesIO(img))))
+    ign = canon.rectify(body, nearest=True) > 0
+    from oh_my_slam.core.images import filled
+
+    fill = filled(want, ign).astype(np.float32)
+    assert np.abs(got - want)[ign].mean() < 4.0 < np.abs(fill - want)[ign].mean()
+
+
+def test_the_ignored_border_holds_no_beam() -> None:
+    """api.md §7 "Unsupported beams" (oms/2.13): the ignored region's border is a depth edge (the
+    model saw the robot's body there): its first unignored pixel is flagged as a depth edge's
+    is, then the ``BEAM_MARGIN_PX`` margin, as around any occlusion; without the mask the same
+    pixels hold returns."""
+    T = np.eye(4)
+    z = np.full((48, 64), 2.0, np.float32)
+    rgb = np.zeros((48, 64, 3), np.uint8)
+    ignore = np.zeros((48, 64), bool)
+    ignore[:, :20] = True
+    K = K_TABLE.resized(64, 48)
+    held = analysis.frame_points(View("frame", T, 0.0, K, z, rgb, [], ignore, 0.01), [])
+    free = analysis.frame_points(View("frame", T, 0.0, K, z, rgb, [], None, 0.01), [])
+    def pixels(p: analysis.FramePoints) -> tuple[np.ndarray, np.ndarray]:
+        uv = p.xyz[:, :2] / p.xyz[:, 2:] * [K.fx, K.fy] + [K.cx, K.cy]
+        return np.rint(uv[:, 1]).astype(int), np.rint(uv[:, 0]).astype(int)
+
+    first = 20 + 1 + analysis.BEAM_MARGIN_PX
+    r, c = pixels(held)
+    mid = (r >= 5) & (r < 40)  # clear of the image's border band
+    assert (c >= 20).all() and not held.supported[c < first].any()
+    assert held.supported[mid & (c >= first) & (c < 40)].all()
+    r, c = pixels(free)
+    assert free.supported[(r >= 5) & (r < 40) & (c >= 20) & (c < first)].all()
+
+
 def test_a_camera_that_is_not_its_canonical_pinhole(
         an: An, shot: tuple[bytes, bytes, np.ndarray, list[Detection]],
         monkeypatch: pytest.MonkeyPatch) -> None:

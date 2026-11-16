@@ -116,8 +116,10 @@ class Backend(Protocol):
         """This backend with its inference requests served ahead of fusion (dry runs:
         inference.md, single worker)."""
 
-    def median_depth(self, image: Path, K: Intrinsics) -> float | None:
-        """The median monocular depth of an image (metres), or None."""
+    def median_depth(self, image: Path, K: Intrinsics,
+                     ignore: NDArray[np.bool_] | None = None) -> float | None:
+        """The median monocular depth of an image (metres) without its ignored pixels
+        (``ignore``, any grid of the image), or None."""
 
     def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
         """The monocular depth of a canonical image with its intrinsics ``K`` (and the camera's
@@ -248,7 +250,9 @@ class MapperBackend:
 
         inference_ready()
 
-    def median_depth(self, image: Path, K: Intrinsics) -> float | None:
+    def median_depth(self, image: Path, K: Intrinsics,
+                     ignore: NDArray[np.bool_] | None = None) -> float | None:
+        from oh_my_slam.core.images import on_grid
         from oh_my_slam.mapping.checks import median_depth
         from oh_my_slam.reconstruction.api import connect_server, reconstruct_image
 
@@ -261,7 +265,11 @@ class MapperBackend:
                 client.close()
         except OhMySlamError as exc:
             raise api_error(exc) from exc
-        return median_depth(np.where(fr.valid, fr.depth, 0.0).astype(np.float32))
+        valid = fr.valid
+        m = on_grid(ignore, fr.depth.shape)
+        if m is not None:
+            valid = valid & ~m
+        return median_depth(np.where(valid, fr.depth, 0.0).astype(np.float32))
 
     def infer(self, image: Path, K: Intrinsics, gravity: bool = False) -> Mono:
         from oh_my_slam.reconstruction.api import connect_server, reconstruct_image

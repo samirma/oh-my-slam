@@ -148,7 +148,8 @@ class _MaRun:
         am = self.am
         am.save()  # this update's keyframes get their image and depth on disk: anchors
         stored = [register_ma.Stored(k.id, img, k.K, k.T, i, _anchor_depth(am, k),
-                                     k.depth_kind == "sensor" and k.lifts())
+                                     k.depth_kind == "sensor" and k.lifts(),
+                                     functools.partial(am.ignore_of, k.id))
                   for i, k in enumerate(am.keyframes)
                   if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
         if not stored:  # nothing confirmed to register against (a camera-only map, no origin)
@@ -212,7 +213,8 @@ class _MaRun:
         am.save()  # their image and depth on disk: anchors
         self.reg.add_anchors([register_ma.Stored(k.id, img, k.K, k.T, ANCHOR_ORDER + i,
                                                  _anchor_depth(am, k),
-                                                 k.depth_kind == "sensor" and k.lifts())
+                                                 k.depth_kind == "sensor" and k.lifts(),
+                                                 functools.partial(am.ignore_of, k.id))
                               for i, k in enumerate(extra)
                               for img in [am.image_path(k.id)] if img is not None])
         got = set(self.reg.recheck())
@@ -371,11 +373,18 @@ def _waiter(fut: Future[Mono], ignore: NDArray[np.bool_] | None = None
     """A frame's monocular depth when it is ready, none on its ignored pixels (map.md §2: no
     depth point, scale evidence or scene distance from them)."""
     def get() -> tuple[Any, Any, Any, Any]:
-        d, K, desc, up = fut.result().as_tuple()
-        m = on_grid(ignore, d.shape)
-        return (d if m is None else np.where(m, 0.0, d).astype(np.float32)), K, desc, up
+        return without_ignored(fut.result().as_tuple(), ignore)
 
     return get
+
+
+def without_ignored(mono: tuple[Any, Any, Any, Any], ignore: NDArray[np.bool_] | None
+                    ) -> tuple[Any, Any, Any, Any]:
+    """A monocular depth ``(depth, K_grid, descriptor, up)``, inferred on the unaltered image,
+    with no depth on its ignored pixels (``ignore``, any grid of the image; map.md §2)."""
+    d, K, desc, up = mono
+    m = on_grid(ignore, d.shape)
+    return (d if m is None else np.where(m, 0.0, d).astype(np.float32)), K, desc, up
 
 
 def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:

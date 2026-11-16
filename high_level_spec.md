@@ -242,7 +242,11 @@ at least 100 off-floor inliers and no rival fit among its matches may move a dri
 alone (map.md §1). New optional fields: the input status's
 `prior_residual_sent_m` / `prior_residual_sent_deg` (against the prior as sent) and
 `inlier_floor_share`, the locate result's `prior_residual_m` / `prior_residual_deg` and
-`inlier_floor_share`, and `quality.drift_correction`'s `held` and `agreeing_frames`.
+`inlier_floor_share`, and `quality.drift_correction`'s `held` and `agreeing_frames`. Ignored
+pixels are never filled before a model sees the image: every model gets it unaltered and its
+outputs drop them afterwards; only keypoint extraction sees them filled, and the ignored
+region's border is a depth edge for a range-scan beam's support (map.md §2, Ignored pixels;
+api.md §7, Unsupported beams).
 
 ## 8. Concurrency and latency
 

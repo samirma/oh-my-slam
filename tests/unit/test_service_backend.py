@@ -256,6 +256,11 @@ def test_median_depth_asks_the_depth_model(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(rec, "reconstruct_image", reconstruct)
     assert be.MapperBackend().median_depth(tmp_path / "a.jpg", K) == 3.0
     assert seen["intrinsics"] == K and seen["max_side"] == 512
+    # its ignored pixels (any grid of the image) hold no depth for the median (map.md §2)
+    ignore = np.zeros((4, 4), bool)
+    ignore[2:, :2] = True  # the 5 m pixel
+    assert be.MapperBackend().median_depth(tmp_path / "a.jpg", K, ignore) == 2.0
+    assert be.MapperBackend().median_depth(tmp_path / "a.jpg", K, np.zeros((4, 4), bool)) == 3.0
     for exc, code in ((ServerUnavailableError("down"), "inference_unavailable"),
                       (DeviceMemoryError("oom"), "out_of_memory"), (InputError("bad"), "internal")):
         def boom(e: Exception = exc) -> Any:

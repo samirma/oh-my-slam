@@ -577,9 +577,10 @@ class Sfm:
         lst = self.work / "extract_list.txt"
         lst.write_text("\n".join(names) + "\n")
         doubled = not video or max(prior.width, prior.height) < SIFT_UNDOUBLED_VIDEO_SIDE
+        images, masks = self._keypoint_inputs(names)
         args = [
             "feature_extractor", "--database_path", str(self.db), "--image_path",
-            str(self.image_dir), "--image_list_path", str(lst),
+            str(images), "--image_list_path", str(lst),
             "--ImageReader.camera_model", "SIMPLE_PINHOLE",
             "--FeatureExtraction.use_gpu", "0", "--log_level", "1",
             "--FeatureExtraction.num_threads",
@@ -588,40 +589,52 @@ class Sfm:
             str(MAX_FEATURES), "--SiftExtraction.first_octave", "-1" if doubled else "0",
         ]
         args += ["--ImageReader.existing_camera_id", str(camera)]
-        masks = self._keypoint_masks(names)
         if masks is not None:
             args += ["--ImageReader.mask_path", str(masks)]
         _run(args, self.log_path)
         return camera
 
-    def _keypoint_masks(self, names: list[str]) -> Path | None:
-        """COLMAP's masks for ``names`` (``--ImageReader.mask_path``: ``<name>.png`` at the
-        image's size, 0 where no keypoint may lie) from their ignore masks (``ignore_mask_path``:
-        8-bit PNG, non-zero = the robot's own body; map.md §2 "Ignored pixels": no keypoints and
-        so no matches there, SIFT's or LightGlue's on them); None when none has one. An image
-        without its own mask gets an all-keep one, so every listed image is masked the same way."""
+    def _keypoint_inputs(self, names: list[str]) -> tuple[Path, Path | None]:
+        """The images COLMAP extracts ``names`` from and its masks for them, from their ignore
+        masks (``ignore_mask_path``: 8-bit PNG, non-zero = the robot's own body; map.md §2
+        "Ignored pixels": no keypoints and so no matches there, SIFT's or LightGlue's on them):
+        the map's frames and None when none has one. Else a copy of the frames with each one's
+        ignored pixels filled (``core.images.filled``: no keypoint on the body's outline; the
+        map keeps the frames unaltered, as the models see them) and the masks
+        (``--ImageReader.mask_path``: ``<name>.png`` at the image's size, 0 where no keypoint
+        may lie). An image without its own mask is linked as it is with an all-keep mask, so
+        every listed image is masked the same way."""
         import cv2
+
+        from oh_my_slam.core.images import filled
 
         found = {n: ignore_mask_path(self.image_dir, n) for n in names}
         if not any(p.exists() for p in found.values()):
-            return None
-        out = self.work / "keypoint_masks"
+            return self.image_dir, None
+        out, images = self.work / "keypoint_masks", self.work / "keypoint_images"
         shutil.rmtree(out, ignore_errors=True)
+        shutil.rmtree(images, ignore_errors=True)
         for name, src in found.items():
-            img = cv2.imread(str(self.image_dir / name), cv2.IMREAD_GRAYSCALE)
+            to = images / name
+            to.parent.mkdir(parents=True, exist_ok=True)
+            img = cv2.imread(str(self.image_dir / name), cv2.IMREAD_COLOR)
             if img is None:
+                to.symlink_to((self.image_dir / name).absolute())
                 continue  # COLMAP reports the unreadable image itself
-            keep = np.full(img.shape, 255, np.uint8)
-            if src.exists():
-                ign = cv2.imread(str(src), cv2.IMREAD_GRAYSCALE)
-                if ign is not None:
-                    ign = cv2.resize(ign, (img.shape[1], img.shape[0]),
-                                     interpolation=cv2.INTER_NEAREST)
-                    keep[ign > 0] = 0
+            keep = np.full(img.shape[:2], 255, np.uint8)
+            ign = cv2.imread(str(src), cv2.IMREAD_GRAYSCALE) if src.exists() else None
+            if ign is not None:
+                ign = cv2.resize(ign, (img.shape[1], img.shape[0]),
+                                 interpolation=cv2.INTER_NEAREST)
+                keep[ign > 0] = 0
+            if ign is not None and (ign > 0).any():
+                cv2.imwrite(str(to), filled(img, ign > 0), [cv2.IMWRITE_JPEG_QUALITY, 100])
+            else:
+                to.symlink_to((self.image_dir / name).absolute())
             dst = out / f"{name}.png"
             dst.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(dst), keep)
-        return out
+        return images, out
 
     def _without_features(self, names: list[str]) -> list[str]:
         """``names`` whose features the database does not hold yet."""

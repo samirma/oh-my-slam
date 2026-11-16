@@ -7,8 +7,9 @@ principal point at the centre. A frame whose camera is not already that pinhole 
 resampled once to the camera's *canonical pinhole*: same size, focal length ``sqrt(fx fy)``,
 principal point at the image centre, no distortion, no rotation. The optical frame is unchanged,
 so the poses the mapper estimates are the camera's own. Its depth PNG and ignore mask are
-resampled with it (nearest neighbour). Ignored pixels are filled from their surroundings
-(``cv2.inpaint``) so that no feature is extracted on the robot's body."""
+resampled with it (nearest neighbour). The image itself is left unaltered on its ignored pixels:
+every model gets it so, and their outputs drop those pixels afterwards; only the feature
+extractors fill them (``core.images.filled``; map.md §2 "Ignored pixels")."""
 
 from __future__ import annotations
 
@@ -27,7 +28,6 @@ from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.service.errors import invalid
 
 DEFAULT_DEPTH_SCALE_M = 0.001
-INPAINT_RADIUS_PX = 5
 
 
 @dataclass(frozen=True)
@@ -167,17 +167,6 @@ def decode_mask(data: bytes, field: str) -> NDArray[np.bool_]:
     if fmt != "PNG":
         raise invalid(field, f"{field}: an 8-bit PNG mask is expected (got {fmt})")
     out: NDArray[np.bool_] = arr > 0
-    return out
-
-
-def mapper_image(rgb: NDArray[np.uint8], cam: Camera, mask: NDArray[np.bool_] | None
-                 ) -> NDArray[np.uint8]:
-    """The frame as the mapper gets it: rectified to the canonical pinhole, the ignored pixels
-    filled from their surroundings."""
-    out = cam.rectify(rgb)
-    if mask is not None and mask.any():
-        m = cam.rectify(mask.astype(np.uint8), nearest=True)
-        out = cv2.inpaint(np.ascontiguousarray(out), m, INPAINT_RADIUS_PX, cv2.INPAINT_TELEA)
     return out
 
 

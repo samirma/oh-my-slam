@@ -93,7 +93,7 @@ error code `invalid_request` (§9).
   * an optional `depth`, a part name;
   * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
     union of the two masks contributes nothing anywhere, on every engine, in every use (map.md §2,
-    Ignored pixels).
+    Ignored pixels): the models see the image unaltered and their outputs drop those pixels.
 * **`labels`** (update requests, optional, oms/2.3) — text prompts added to the map's label
   vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. Labels are
   compared as map.md §5 defines (case-folded, `_` as a space). An invalid label refuses the
@@ -636,7 +636,9 @@ The versions read, revert and `--keep-versions` are O2.
   are all unsupported is `unseen`, never a short-range `obstacle`. Each beam carries `support`,
   the number of pixels holding its return (for `floor_end`, the beam's supported floor pixels; 0
   for `unseen`). The model's low-confidence pixels are those without depth and a margin around
-  them (a constant in `README.md`).
+  them (a constant in `README.md`). The ignored pixels' border (§4 `ignore_mask`) is a depth
+  edge: the model saw the robot's body there unaltered (map.md §2, Ignored pixels), so the pixels
+  next to it hold no return either.
 * **Upload.** An analysis stores nothing: only the upload cap applies (`payload_too_large`), not
   the free-disk rule of an update.
 * **Scale.** The response carries `scale_source` and `scale_sigma_rel`: `baseline` with `frames` as

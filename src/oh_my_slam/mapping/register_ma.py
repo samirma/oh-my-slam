@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from oh_my_slam.core.images import on_grid
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import anchor
 from oh_my_slam.mapping.anchor import Anchor, Sim3
@@ -111,6 +112,9 @@ class Stored:
     order: int  # its position in the map (later = more recent)
     depth: Callable[[], NDArray[np.float32] | None] = lambda: None  # metric, on its grid
     sensor: bool = False  # its depth is a depth image (the depth confirmation's references)
+    # its ignored pixels (any grid of the image), None: none; MapAnything's depth there and its
+    # thumbnail's pixels count for nothing (map.md §2 "Ignored pixels")
+    ignore: Callable[[], NDArray[np.bool_] | None] = lambda: None
 
 
 @dataclass
@@ -128,16 +132,16 @@ class New:
     ignore: NDArray[np.bool_] | None = None
 
 
-def _without_ignored(out: list[MvView], na: int, chunk: list[New]) -> list[MvView]:
-    """A call's views with the new frames' ignored pixels (``New.ignore``) holding no depth."""
+def _without_ignored(out: list[MvView], ignores: list[NDArray[np.bool_] | None]
+                     ) -> list[MvView]:
+    """A call's views (anchors, then new frames) with their ignored pixels (``ignores``, one
+    per view, any grid of its image) holding no depth: MapAnything saw the unaltered images."""
     views = list(out)
-    for i, f in enumerate(chunk):
-        if f.ignore is None or not f.ignore.any():
-            continue
-        v = views[na + i]
-        m = cv2.resize(f.ignore.astype(np.uint8), (v.depth.shape[1], v.depth.shape[0]),
-                       interpolation=cv2.INTER_NEAREST) > 0
-        views[na + i] = MvView(v.pose, np.where(m, 0.0, v.depth).astype(np.float32), v.K)
+    for i, ign in enumerate(ignores):
+        v = views[i]
+        m = on_grid(ign, v.depth.shape)
+        if m is not None:
+            views[i] = MvView(v.pose, np.where(m, 0.0, v.depth).astype(np.float32), v.K)
     return views
 
 
@@ -211,14 +215,22 @@ def median_depth(d: NDArray[np.float32]) -> float | None:
     return float(np.median(v)) if v.size else None
 
 
-def _thumb(path: Path) -> NDArray[np.float32] | None:
+def _thumb(path: Path, ignore: NDArray[np.bool_] | None = None) -> NDArray[np.float32] | None:
+    """A view's normalised 32 x 24 thumbnail, its ignored pixels (``ignore``, any grid of the
+    image) taking no part: each cell the mean of its other pixels, 0 (the mean) without any."""
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
-    t = cv2.resize(img, (32, 24), interpolation=cv2.INTER_AREA).astype(np.float32)
-    t -= t.mean()
+    m = on_grid(ignore, img.shape)
+    keep = np.ones(img.shape, np.float32) if m is None else (~m).astype(np.float32)
+    num = cv2.resize(img.astype(np.float32) * keep, (32, 24), interpolation=cv2.INTER_AREA)
+    den = cv2.resize(keep, (32, 24), interpolation=cv2.INTER_AREA)
+    has = den > 1e-6
+    t = num / np.maximum(den, 1e-6)
+    t = np.where(has, t - float(t[has].mean()) if has.any() else 0.0, 0.0)
     n = float(np.linalg.norm(t))
-    return t / n if n > 1e-6 else t
+    out: NDArray[np.float32] = (t / n if n > 1e-6 else t).astype(np.float32)
+    return out
 
 
 def confirms(f: New, T: Array, depth: NDArray[np.float32], Kd: Array, images: list[Ref],
@@ -264,6 +276,7 @@ class _Posed:
     order: int
     depth: Callable[[], tuple[NDArray[np.float32], Array] | None]  # metric depth, grid's K
     sensor: bool = False  # that depth is a depth image
+    ignore: Callable[[], NDArray[np.bool_] | None] = lambda: None  # its ignored pixels
     _cache: list[tuple[NDArray[np.float32], Array] | None] = field(default_factory=list)
 
     def ref(self) -> Ref | None:
@@ -297,7 +310,7 @@ class Registration:
         self.ambiguous = ambiguous
         self.new = new
         self.pool: list[_Posed] = [
-            _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor)
+            _Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor, s.ignore)
             for s in stored]
         self.placements: dict[int, Placement] = {}
         self.scenes: dict[int, float | None] = {}  # each new frame's median scene depth
@@ -316,19 +329,20 @@ class Registration:
         # the pool's size when each frame was inferred (``retry``: again only once it grew)
         self.pool_at: dict[int, int] = {}
 
-    def _thumb(self, key: str, path: Path) -> NDArray[np.float32] | None:
+    def _thumb(self, key: str, path: Path, ignore: Callable[[], NDArray[np.bool_] | None]
+               ) -> NDArray[np.float32] | None:
         if key not in self._thumbs:
-            self._thumbs[key] = _thumb(path)
+            self._thumbs[key] = _thumb(path, ignore())
         return self._thumbs[key]
 
     def anchors(self, chunk: list[New]) -> list[_Posed]:
         """The pool views most similar to the chunk by thumbnail among the most recent, the
         most recent first on ties."""
         recent = sorted(self.pool, key=lambda v: -v.order)[:RECENT_POOL]
-        thumbs = [self._thumb(f"new{f.index}", f.image) for f in chunk]
+        thumbs = [self._thumb(f"new{f.index}", f.image, lambda f=f: f.ignore) for f in chunk]
 
         def sim(v: _Posed) -> float:
-            t = self._thumb(v.key, v.image)
+            t = self._thumb(v.key, v.image, v.ignore)
             vals = [float((t * c).sum()) for c in thumbs if c is not None and t is not None]
             return max(vals) if vals else 0.0
 
@@ -437,13 +451,13 @@ class Registration:
             self.scenes.get(f.index), anchors)
         got = (depth, Kd)
         self.pool.append(_Posed(f"new{f.index}", f.image, f.K, T, 10 ** 9 + f.index,
-                                lambda: got, f.depth is not None))
+                                lambda: got, f.depth is not None, lambda: f.ignore))
 
     def add_anchors(self, stored: list[Stored]) -> None:
         """Views another engine registered during the job, joining the pool: anchors of later
         calls (``retry``: a frame is inferred again once the pool grew since its call) and
         references of ``recheck``."""
-        self.pool += [_Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor)
+        self.pool += [_Posed(s.name, s.image, s.K, s.T, s.order, _stored_depth(s), s.sensor, s.ignore)
                       for s in stored]
 
     def recheck(self, extra: list[Ref] | None = None) -> list[int]:
@@ -510,7 +524,7 @@ class Registration:
                 continue
             for f in chunk:
                 self.pool_at[f.index] = len(self.pool)
-            out = _without_ignored(out, len(anchors), chunk)
+            out = _without_ignored(out, [a.ignore() for a in anchors] + [f.ignore for f in chunk])
             S, src, ma_sigma = self._align(anchors, chunk, out)
             self._place_chunk(chunk, out, anchors, S, ma_sigma)
             self.notes["calls"].append({"anchors": len(anchors), "new": len(chunk),

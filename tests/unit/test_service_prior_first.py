@@ -20,6 +20,7 @@ import pytest
 from PIL import Image
 from starlette.testclient import TestClient
 
+from oh_my_slam.mapping.anchored import AnchoredMap
 from oh_my_slam.service.app import CAPABILITIES, Service, create_app
 from oh_my_slam.service.jobs import Jobs
 from oh_my_slam.service.store import Store
@@ -276,8 +277,19 @@ def test_ignore_mask_and_new_map_without_priors(client: Client) -> None:
     Image.fromarray(mask).save(buf, "PNG")
     fr, files = frames_for(client, [base_pose(0), base_pose(20)], tag="a")
     fr[0]["ignore_mask"] = "m0"
+    client.backend.received.clear()
     job = client.update("m", fr, {**files, "m0": buf.getvalue()}, cameras={"cam": CAM})
     assert [i["status"] for i in job["inputs"]] == ["registered", "registered"]
+    # its models got the masked frame as sent, never filled (map.md §2 "Ignored pixels"); its
+    # keyframe image is stored unaltered too, as later models see it
+    sent = files[fr[0]["image"]]
+    assert sent in client.backend.received
+    am = AnchoredMap.load(client.service.store.mapper_dir("m"))
+    kf = am.image_path(am.keyframes[0].id)
+    assert kf is not None
+    raw = np.asarray(Image.open(io.BytesIO(sent)), np.float32)
+    stored = np.asarray(Image.open(kf), np.float32)
+    assert np.abs(stored - raw)[200:].mean() < 4.0
     # a new map without priors is anchored too: its first frame is the origin, level by its
     # gravity, and a turn in place registers on the images alone
     fr, files = frames_for(client, [base_pose(0), base_pose(20), base_pose(40)], tag="z",

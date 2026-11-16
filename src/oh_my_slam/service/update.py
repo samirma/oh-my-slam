@@ -93,7 +93,6 @@ from oh_my_slam.service.cameras import (
     decode_png16,
     decode_rgb,
     mapper_depth,
-    mapper_image,
 )
 from oh_my_slam.service.errors import ApiError
 from oh_my_slam.service.jobs import Job
@@ -504,12 +503,13 @@ class Updater:
                                       fr.cam, mask)
             med = checks.median_depth(fr.depth_m)
         fr.path = indir / f"{f.index:04d}.jpg"
-        if fr.cam.is_canonical and (mask is None or not mask.any()) \
-                and f.image[:3] == b"\xff\xd8\xff":
+        # the image as every model gets it, unaltered on its ignored pixels: their outputs drop
+        # them afterwards, and only the feature extractors fill them (map.md §2 "Ignored pixels")
+        if fr.cam.is_canonical and f.image[:3] == b"\xff\xd8\xff":
             fr.path.write_bytes(f.image)
             fr.rgb = rgb
         else:
-            fr.rgb = mapper_image(rgb, fr.cam, mask)
+            fr.rgb = fr.cam.rectify(rgb)
             save_jpeg(fr.rgb, fr.path, quality=JPEG_QUALITY)
         if mask is not None and mask.any():
             fr.ignore = fr.cam.rectify(mask.astype(np.uint8), nearest=True) > 0
@@ -546,7 +546,7 @@ class Updater:
 
         def one(fr: _Frame) -> None:
             assert fr.path is not None
-            fr.scene_m = self.backend.median_depth(fr.path, fr.cam.canonical())
+            fr.scene_m = self.backend.median_depth(fr.path, fr.cam.canonical(), fr.ignore)
             Updater._verdict(fr)
 
         with ThreadPoolExecutor(CHECK_THREADS) as pool:

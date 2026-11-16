@@ -80,6 +80,7 @@ from oh_my_slam.service.prior_first import (
     frame_class,
     job_drift_correction,
     none_engine,
+    without_ignored,
 )
 
 if TYPE_CHECKING:
@@ -324,8 +325,9 @@ def _frame_in_lazy(up: Updater, fr: _Frame, gravity: bool) -> Any:
     f = _frame_in(fr, None)
     if not _has_depth(fr) or gravity:
         assert fr.path is not None
-        path, K = fr.path, fr.cam.canonical()
-        f.mono = functools.cache(lambda: up.backend.infer(path, K, gravity).as_tuple())
+        path, K, ignore = fr.path, fr.cam.canonical(), fr.ignore
+        f.mono = functools.cache(lambda: without_ignored(
+            up.backend.infer(path, K, gravity).as_tuple(), ignore))
     return f
 
 

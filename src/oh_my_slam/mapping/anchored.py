@@ -142,7 +142,7 @@ from oh_my_slam.core.constants import (
     floor_band_m,
 )
 from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
-from oh_my_slam.core.images import on_grid
+from oh_my_slam.core.images import filled, on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
 from oh_my_slam.mapping import sigmas
@@ -689,8 +689,9 @@ class Features:
 
 
 def features(rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None = None) -> Features:
-    """SIFT keypoints and RootSIFT descriptors of a canonical image, none on ``ignore``."""
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    """SIFT keypoints and RootSIFT descriptors of a canonical image, none on ``ignore``, which
+    is filled first (``core.images.filled``: no keypoint on the body's outline)."""
+    gray = cv2.cvtColor(filled(rgb, ignore), cv2.COLOR_RGB2GRAY)
     mask = None if ignore is None else (~ignore).astype(np.uint8) * 255
     sift: Any = cv2.SIFT_create(nfeatures=MAX_FEATURES,  # type: ignore[attr-defined]
                                 contrastThreshold=SIFT_CONTRAST)

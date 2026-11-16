@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from oh_my_slam.core.images import filled
 from oh_my_slam.mapping import anchor, checks
 from oh_my_slam.mapping.anchor import Anchor, Sim3
 from oh_my_slam.service import schema
@@ -25,7 +26,6 @@ from oh_my_slam.service.cameras import (
     Camera,
     decode_png16,
     mapper_depth,
-    mapper_image,
     same_camera,
 )
 from oh_my_slam.service.errors import ApiError
@@ -157,17 +157,20 @@ def test_yaw_frame_puts_the_first_camera_at_the_origin_looking_along_x() -> None
 def test_canonical_cameras_pass_through_and_others_are_rectified() -> None:
     cam = Camera.from_json(CAMERA)
     rgb = np.asarray(Image.open(io.BytesIO(textured(1))))
-    assert cam.is_canonical and mapper_image(rgb, cam, None) is rgb
+    assert cam.is_canonical and cam.rectify(rgb) is rgb
     bent = Camera.from_json({**CAMERA, "fy": 310.0, "distortion": {"model": "opencv",
                                                                    "coefficients": [-0.2, 0, 0, 0]}})
     assert not bent.is_canonical and bent.canonical().fx == pytest.approx(math.sqrt(300 * 310))
-    out = mapper_image(rgb, bent, np.zeros((240, 320), bool))
+    out = bent.rectify(rgb)
     assert out.shape == rgb.shape and not np.array_equal(out, rgb)
     mask = np.zeros((240, 320), bool)
     mask[100:140, 100:140] = True
-    filled = mapper_image(rgb, cam, mask)
-    assert filled[120, 120].tolist() != rgb[120, 120].tolist() or True
-    assert filled[:50].tolist() == rgb[:50].tolist()
+    # only a feature extractor gets the ignored pixels filled (map.md §2 "Ignored pixels")
+    assert filled(rgb, None) is rgb and filled(rgb, np.zeros((240, 320), bool)) is rgb
+    fill = filled(rgb, mask)
+    assert fill.dtype == np.uint8 and fill[:50].tolist() == rgb[:50].tolist()
+    assert not np.array_equal(fill[100:140, 100:140], rgb[100:140, 100:140])
+    assert filled(rgb, mask[::2, ::2]).shape == rgb.shape  # a mask on any grid of the image
     d = mapper_depth(np.full((240, 320), 1500, np.uint16), cam, mask)
     assert d[0, 0] == pytest.approx(1.5) and d[120, 120] == 0
     assert mapper_depth(np.full((240, 320), 1500, np.uint16), cam, None)[120, 120] == pytest.approx(1.5)

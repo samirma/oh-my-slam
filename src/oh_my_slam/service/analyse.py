@@ -98,7 +98,6 @@ from oh_my_slam.service.cameras import (
     decode_png16,
     decode_rgb,
     mapper_depth,
-    mapper_image,
 )
 from oh_my_slam.service.derived import DerivedVersion
 from oh_my_slam.service.errors import invalid
@@ -496,7 +495,7 @@ class Analyser:
             if f.mask is not None and f.mask.any():
                 own = cam.rectify(f.mask.astype(np.uint8), nearest=True) > 0
                 ignore_other = own if ignore_other is None else (ignore_other | own)
-            others.append(motion.Other(mapper_image(f.rgb, cam, f.mask), ignore_other,
+            others.append(motion.Other(cam.rectify(f.rgb), ignore_other,
                                        f.T_ref_frame, f.sigma_pos_m, f.sigma_rot_deg))
         return motion.motion_stereo(rgb, ignore, K, others, depth, K_grid)
 
@@ -507,8 +506,10 @@ class Analyser:
         asked) and its image on the canonical pinhole, the two requests sent together as
         interactive ones."""
         cam = w.camera
-        plain = cam.is_canonical and (w.mask is None or not w.mask.any())
-        rgb = w.rgb if plain else mapper_image(w.rgb, cam, w.mask)
+        # the models get the image unaltered on its ignored pixels, which their outputs drop
+        # afterwards (map.md §2 "Ignored pixels": a filled region reads as a near surface)
+        plain = cam.is_canonical
+        rgb = cam.rectify(w.rgb)
         if not (geometry or w.wants_objects):
             return None, [], rgb
         backend = self.backend.interactive()
