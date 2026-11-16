@@ -383,8 +383,10 @@ def _drift_frame(name: str, c: tuple[float, float, float], shift: np.ndarray, ya
     f = FrameIn(name, "cam", np.zeros((2, 2, 3), np.uint8), K,
                 prior={"trust": "drifting", "T_map_cam": P.tolist(), "sigma_pos_m": sp,
                        "sigma_rot_deg": 5.0})
+    # 200 inliers, 20 off the floor: weakly supported, so the agreement of views decides
     pl = Placement(name, "registered", None, V, 0.05, 0.5, 200, "pnp", (0.0, 0.0), align_T=V,
-                   image_sigmas=(0.05, 0.5), inlier_share=0.5, measurable=True)
+                   image_sigmas=(0.05, 0.5), inlier_share=0.5, measurable=True,
+                   inlier_floor_share=0.9)
     return f, pl
 
 
@@ -562,6 +564,11 @@ def test_locate_results_validate() -> None:
 
 
 def _replay(q: str, r: str, tag: str = "", placed: bool = False) -> Placement:
+    return _replay_full(q, r, tag, placed)[2]
+
+
+def _replay_full(q: str, r: str, tag: str = "", placed: bool = False
+                 ) -> tuple[AnchoredMap, FrameIn, Placement]:
     meta = json.loads((DATA / f"{tag}meta.json").read_text())
     z = np.load(DATA / f"{tag}{q}_{r}.npz")
     m = AnchoredMap(Path("/nonexistent"))
@@ -590,7 +597,7 @@ def _replay(q: str, r: str, tag: str = "", placed: bool = False) -> Placement:
     P = np.asarray(qk["T"] if placed else p["T"], np.float64)
     sp, sr = (qk["sigma_pos_m"], qk["sigma_rot_deg"]) if placed \
         else (p["sigma_pos_m"], p["sigma_rot_deg"])
-    return m.place(f, an.Features(z["q_kps"], z["q_desc"]), None, (P, sp, sr), [ref])
+    return m, f, m.place(f, an.Features(z["q_kps"], z["q_desc"]), None, (P, sp, sr), [ref])
 
 
 @pytest.mark.parametrize(("q", "r"), [("k000011", "k000002"), ("k000013", "k000007")])
@@ -668,3 +675,92 @@ def test_few_features_counts_what_registration_extracts() -> None:
     assert m.suspicious == (m.strong < checks.SUSPECT_FEATURES or m.texture < checks.SUSPECT_TEXTURE)
     assert checks.Measures(500, 0.2, 0.3).suspicious is False  # strong defaults to features
     assert checks.Measures(500, 0.2, 0.3, 10).suspicious is True
+
+
+
+def test_a_strongly_supported_view_moves_the_drift_alone(tmp_path: Path) -> None:
+    """A view resting on ``MEASURABLE_INLIERS`` off-floor inliers with no rival fit among its
+    matches is evidence of its own: the one-view rule does not hold it (oms/2.13)."""
+    m = mapper(tmp_path)
+    m.created_with = "drifting"
+    f, pl = _drift_frame("a", (2.0, 0.0, 0.5), SHIFT)
+    pl.inlier_floor_share = 0.3  # 140 off the floor
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert not m.drift_rule()["held"]  # (the robust support of the fit still applies)
+    pl.rival = True  # the same with a rival fit elsewhere: held
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert m.drift_rule()["held"]
+
+
+def test_e205_k8_is_ambiguous_and_stays_held() -> None:
+    """dev_ainex_e205 k000008 (oms/2.13): against k000000 its matches hold two strong off-floor
+    fits 1.2 m apart ((0.0, 0.73), 176 inliers, 162 off the floor, at the archived scale; the
+    replay at the scale of the time preferred (0.07, -0.39), 137 inliers, 101 off). Such a view
+    is no evidence on its own: rival, held."""
+    m, f, pl = _replay_full("k000008", "k000000", "e205_")
+    assert pl.inlier_floor_share is not None
+    assert pl.inliers * (1.0 - pl.inlier_floor_share) >= an.MEASURABLE_INLIERS and pl.rival
+    m.created_with = "drifting"
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert m.drift_rule()["held"]
+
+
+def test_a_rival_fit_among_the_matches(tmp_path: Path) -> None:
+    uv, X, is_floor = scene(np.random.default_rng(11), floor=200, wall=150)
+    m = mapper(tmp_path, floor=False)
+    ref = ref_keyframe()
+    f = FrameIn("q", "cam", np.zeros((K.height, K.width, 3), np.uint8), K)
+    corr = corr_of(uv, X, ref)
+    got = image_pose(m, uv, X)  # the floor's alias, 0.6 m ahead, explains the most
+    assert got is not None
+    assert m._rival_fit(f, corr, got[0][0])  # the wall's true pose remains a rival
+    clean = corr_of(uv, np.where(is_floor[:, None], X - TILE, X), ref)
+    good = image_pose(m, uv, np.where(is_floor[:, None], X - TILE, X))
+    assert good is not None and not m._rival_fit(f, clean, good[0][0])
+    few = corr_of(uv[:30], X[:30], ref)
+    assert not m._rival_fit(f, few, got[0][0])
+
+
+def test_the_rule_still_holds_a_weakly_supported_view(tmp_path: Path) -> None:
+    """The same move resting on fewer off-floor inliers (a floor-dominated fit) is held."""
+    m = mapper(tmp_path)
+    m.created_with = "drifting"
+    f, pl = _drift_frame("a", (2.0, 0.0, 0.5), SHIFT)
+    pl.inliers, pl.inlier_floor_share = 200, 0.9  # 20 off the floor
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert m.drift_rule()["held"]
+    pl.inlier_floor_share = None  # no map floor: every inlier is off the floor
+    m._fit_drift([f], {0: pl}, m.drift)
+    assert not m.drift_rule()["held"]
+
+
+def test_the_j6_lap_end_registers_near_its_first_pass() -> None:
+    """dev_ainex_j6 k000037 (oms/2.13): the lap's end over ground the lap saw first (k000012,
+    registered at (0.05, 1.79)) registers there."""
+    pl = _replay("k000037", "k000012", "j6_", placed=True)
+    assert pl.status == "registered" and pl.T is not None
+    assert np.linalg.norm(pl.T[:2, 3] - np.array([0.05, 1.79])) < 0.3
+
+
+def test_a_small_fit_never_recurses(tmp_path: Path) -> None:
+    """dev_ainex_e205 replay: a fit below the registration minimum, all off the floor, from a
+    frame without depth of its own, was refitted on the same correspondences forever. A fit
+    with fewer than ``MIN_INLIERS`` inliers is no pose."""
+    uv, X, _ = scene(np.random.default_rng(10), floor=0, wall=40)
+    m = mapper(tmp_path)
+    ref = ref_keyframe()
+    f = FrameIn("q", "cam", np.zeros((K.height, K.width, 3), np.uint8), K)
+    feats = an.Features(uv.astype(np.float32), np.zeros((len(uv), 128), np.uint8))
+    real = an.refine_pose
+
+    def few(*a: Any, **k: Any) -> Any:
+        s, sc = real(*a, **k)
+        inl = np.zeros(len(s.inliers), bool)
+        inl[:5] = True
+        return an.dataclasses.replace(s, inliers=inl), sc
+
+    an.refine_pose = few  # type: ignore[assignment]
+    try:
+        assert m._image_pose(f, feats, corr_of(uv, X, ref), [ref], None, 0.0) is None
+    finally:
+        an.refine_pose = real

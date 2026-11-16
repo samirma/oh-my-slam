@@ -338,6 +338,10 @@ DRIFT_AGREE_MIN = 3
 DRIFT_INDEPENDENT_M = 0.5
 DRIFT_INDEPENDENT_DEG = 10.0
 DRIFT_PENDING_MAX = 20
+# ... unless one view rests on MEASURABLE_INLIERS off-floor inliers with no rival fit farther than
+# these among its matches (``AnchoredMap._rival_fit``; locate's rival distances, api.md §6)
+RIVAL_POS_M = 0.10
+RIVAL_ROT_DEG = 5.0
 MEASURABLE_INLIERS = 100  # map.md §1 "Measurable pair": at least this many inliers ...
 MEASURABLE_OVERLAP = 0.10  # ... covering at least this share of the 8 x 8 cells
 STATIC_PX = 2.0  # map.md §1 "Static image content": a feature fixed within this (px) ...
@@ -2061,6 +2065,9 @@ class Placement:
     # the share of its image pose's inliers that are floor points (map.md §2 "Texture-aliasing
     # guards", oms/2.13: ``inlier_floor_share``); None without a points fit or a map floor
     inlier_floor_share: float | None = None
+    # its image pose's matches hold a second fit of comparable support elsewhere (``_rival_fit``;
+    # map.md §1 "No correction from one view", oms/2.13): it then never moves the drift alone
+    rival: bool = False
 
 
 def _lifted(corr: _Corr, cands: list[Keyframe]) -> tuple[Array, Array]:
@@ -2371,7 +2378,8 @@ def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[i
                                      o.pl.inliers, o.pl.method, pose_residual(o.T, T),
                                      align_T=o.T.copy(), image_sigmas=o.sigma_image,
                                      has_prior=True, prior_ref=T,
-                                     inlier_share=o.pl.inlier_share, measurable=True)
+                                     inlier_share=o.pl.inlier_share, measurable=True,
+                                     inlier_floor_share=o.pl.inlier_floor_share, rival=o.pl.rival)
         else:
             out[o.index] = Placement(o.name, "kept_at_prior", "no_overlap", T.copy(),
                                      round(sp, 4),
@@ -2380,7 +2388,9 @@ def _drift_outliers(d: Drift, obs: list[_DriftObs], inliers: set[int]) -> dict[i
                                      (0.0, 0.0), align_T=o.T.copy(),
                                      image_sigmas=o.sigma_image, has_prior=True,
                                      detail="conflict_unsupported",
-                                     inlier_share=o.pl.inlier_share)
+                                     inlier_share=o.pl.inlier_share,
+                                     inlier_floor_share=o.pl.inlier_floor_share,
+                                     rival=o.pl.rival)
     return out
 
 
@@ -3183,6 +3193,8 @@ class AnchoredMap:
         refs = self._refs(cands)
         sub = (corr.uv[inl], corr.X[inl], corr.d[inl], corr.kf[inl])
         s, _ = refine_pose(R, c, *sub, refs, f.K, fix_centre=rot_only)
+        if int(s.inliers.sum()) < MIN_INLIERS:
+            return None  # no pose (the guards below never refit a fit this small)
         if not rot_only:
             got = self._depth_guard(f, s, sub, refs)
             if got is None:
@@ -3210,8 +3222,7 @@ class AnchoredMap:
         # 2): a lattice pose is never registered; a translational twin picked over it
         # replaces it (P28)
         gate = self.depth_confirms(f, s, sub[3][s.inliers], cands, corr, feats,
-                                   None if T0 is None else (T0[:3, 3], sp0)) \
-            if n >= MIN_INLIERS else None
+                                   None if T0 is None else (T0[:3, 3], sp0))
         if not gate:
             return None
         if gate[1] is not None:
@@ -3282,6 +3293,24 @@ class AnchoredMap:
         s, _ = refine_pose(T0[:3, :3].copy(), T0[:3, 3].copy(), *sub, refs, f.K)
         got = self._depth_guard(f, s, sub, refs)
         return None if got is None else (got, sub)
+
+    def _rival_fit(self, f: FrameIn, corr: _Corr, s: Solve) -> bool:
+        """Whether a points fit ``s`` meets a rival among its correspondences ``corr`` (map.md §1
+        "No correction from one view", oms/2.13): the lifted matches it leaves unexplained hold
+        a second PnP fit with at least ``SUPPORT_MIN`` of its inliers (and ``MIN_INLIERS``)
+        farther than ``RIVAL_POS_M`` or ``RIVAL_ROT_DEG`` from it, as locate's ambiguity."""
+        has = np.isfinite(corr.X).all(axis=1)
+        Xh = np.where(has[:, None], corr.X, 0.0)
+        err = np.linalg.norm(_project(s.R, s.c, Xh, f.K, False) - corr.uv, axis=1)
+        rest = has & (err > 2.0 * self._thr(f.K))
+        need = max(MIN_INLIERS, SUPPORT_MIN * int(s.inliers.sum()))
+        if rest.sum() < need:
+            return False
+        got = pnp(corr.X[rest], corr.uv[rest], f.K, 2.0 * self._thr(f.K))
+        if got is None or got[2].sum() < need:
+            return False
+        dp, dr = pose_residual(pose(got[0], got[1]), s.T)
+        return dp > RIVAL_POS_M or dr > RIVAL_ROT_DEG
 
     def _floor(self) -> tuple[float, float] | None:
         """The running job's map floor and its sigma (``begin_job``: ``map_floor``), which
@@ -3385,10 +3414,12 @@ class AnchoredMap:
             else None
         img = None
         floor_share: float | None = None
+        rival = False
         if corr is not None:
             got = self._image_pose(f, feats, corr, cands, T0, sp0, sr0)
             if got is not None:
                 img, corr, floor_share = got
+                rival = img[3] == "pnp" and self._rival_fit(f, corr, img[0])
         if T0 is None:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
@@ -3411,7 +3442,7 @@ class AnchoredMap:
                              refs=_ref_ids(cands, sub[3][s.inliers]),
                              inlier_share=ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K),
                              unconstrained=method != "rotation" and self._unconstrained(
-                                 f, feats, s, sub[3], cands), inlier_floor_share=floor_share)
+                                 f, feats, s, sub[3], cands), inlier_floor_share=floor_share, rival=rival)
         assert f.prior is not None
         prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
         ref = T0 if f.prior["trust"] == "drifting" else prior_T
@@ -3431,7 +3462,7 @@ class AnchoredMap:
         tested = self._image_conflict(f, img, cands, T0, sp0, sr0)
         if tested is None:
             kept = self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
-            kept.inlier_floor_share = floor_share
+            kept.inlier_floor_share, kept.rival = floor_share, rival
             return kept
         dp, dr, ci, conflict = tested
         share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
@@ -3445,7 +3476,7 @@ class AnchoredMap:
                 kept = self.kept_at(f, "no_overlap", n, detail="conflict_unsupported",
                                     pred=pred)
                 kept.align_T, kept.image_sigmas, kept.inlier_share = s.T, ci, share
-                kept.inlier_floor_share = floor_share
+                kept.inlier_floor_share, kept.rival = floor_share, rival
                 return kept
             assert corr is not None
             hyp = None if rot_only else self._near_prior(f, corr, cands, T0, sp0, sr0, n)
@@ -3453,9 +3484,10 @@ class AnchoredMap:
                 return Placement(f.name, "rejected", "prior_conflict", None, None, None, n,
                                  method, (dp, dr), align_T=s.T, image_sigmas=ci, has_prior=True,
                                  prior_ref=ref, inlier_share=share, measurable=True,
-                                 inlier_floor_share=floor_share)
+                                 inlier_floor_share=floor_share, rival=rival)
             s, n, sub, refs = hyp
             floor_share = self._floor_count(s, sub, refs)[1]
+            rival = True  # a hypothesis near the prior: a stronger one lay elsewhere
             spi, sri = s.sigmas()
             spi, sri = max(spi, MIN_SIGMA_POS_M), max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
         assert corr is not None
@@ -3465,7 +3497,7 @@ class AnchoredMap:
         pl.inlier_share = ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
-        pl.inlier_floor_share = floor_share
+        pl.inlier_floor_share, pl.rival = floor_share, rival
         return pl
 
     def _image_conflict(self, f: FrameIn, img: Any, cands: list[Keyframe], T0: Array,
@@ -4851,6 +4883,10 @@ class AnchoredMap:
         for o in sorted(obs, key=lambda o: o.name):
             size = _correction(used, o)
             if size is None:
+                continue
+            # a pose resting on many off-floor inliers and no rival is evidence of its own
+            share = o.pl.inlier_floor_share or 0.0
+            if o.pl.inliers * (1.0 - share) >= MEASURABLE_INLIERS and not o.pl.rival:
                 continue
             agree = _agreeing(DriftView.of(o), pool, used.odo_scale)
             names = sorted(v.name for v in agree)

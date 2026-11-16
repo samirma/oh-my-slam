@@ -1410,7 +1410,28 @@ place with hundreds of inliers. map.md §1-§2 and api.md §6 define three guard
   priors `DRIFT_INDEPENDENT_M` = **0.5 m** apart or optical axes `DRIFT_INDEPENDENT_DEG` =
   **10°** apart. Agreement: 3 × hypot(both image sigmas, `DRIFT_POS_REL` 0.10 × distance) in
   position, 3 × hypot(both, `DRIFT_ROT_DEG_PER_M` 2°/m × distance) in rotation. Held views are
-  kept in `state.json` (`drift.pending`), the newest `DRIFT_PENDING_MAX` = **20**.
+  kept in `state.json` (`drift.pending`), the newest `DRIFT_PENDING_MAX` = **20**. One view
+  suffices when it has at least `MEASURABLE_INLIERS` (100) off-floor inliers and no rival
+  (`AnchoredMap._rival_fit`: the lifted matches it leaves unexplained hold no second PnP fit with
+  at least `SUPPORT_MIN` 0.25 of its inliers farther than `RIVAL_POS_M` 0.10 m or `RIVAL_ROT_DEG`
+  5°, locate's rival distances).
+
+  Off-floor inliers of the known fits (current floor classification):
+
+  | Fit | Truth | Inliers | Off-floor | Rival | Margin to 100 |
+  | --- | --- | --- | --- | --- | --- |
+  | j3 k000011 vs k000002 (start-spot planks) | false | 286 | 3 | - | 97 below |
+  | j3 k000013 vs k000007 (reference lifted × 2.09) | false | 187 | 0 | - | 100 below |
+  | j6 k000009/k000010/k000011 pooled lap fits on the start look | false | 128/129/61 | 0/0/0 | - | 100 below |
+  | j5 k000001 vs k000000 | true | 90 | 4 | - | (floor fit confirming its prior) |
+  | j6 k000009 vs k000008 | true | 119 | 100 | - | at the threshold |
+  | e205 k000008 vs k000000, archived scale | one of two | 176 | 162 | yes | ambiguous |
+  | e205 k000008 vs k000000, replayed scale | one of two | 137 | 101 | (0.0, 0.73) | ambiguous |
+
+  The j3 aliases sit far below the count only because the floor guard classifies them (the
+  per-reference floor ratio); e205 k000008 shows that off-floor counts alone do not separate a
+  true view from an alias, two strong off-floor fits 1.2 m apart in one frame's matches, hence
+  the rival condition. On the replays of j3, j5, j6 and e205 the exemption changes no outcome.
 * **Details** (as implemented):
   * `_correction` tests the position only, against `sigma_pos_m` as sent (an earlier draft also
     tested the rotation against `sigmas.axes_rms(sigma_rot_deg, sigma_tilt_deg)`: see the j5
@@ -1447,6 +1468,16 @@ reference). Now a floor fit that only confirms the prior stands, and the one-vie
 positions: the replayed start look registers 10 of 10 views on j5 (8 of 8 on j3), while j3's lap
 frames k000009-k000014 (floor fits 1.3-2.4 m from priors of sigma 0.9-1.4 m) stay kept at their
 priors (fixture `tests/data/aliasing/j5_*`).
+
+`dev_ainex_e205` (cold start, one keyframe per job): replayed, the opening look registers 1 of 8.
+k000001, k000002 and k000007 overlap k000000, the only confirmed keyframe, weakly (29/172, 49/158,
+20/83 PnP inliers, loose poses; a rotation-only fit explains no more), k000003-k000005 look more
+than 100° from it (no candidate) and k000006 has 12 matches: no 2.13 guard refuses them. The later
+look's k000008 is ambiguous (above) and stays a prior conflict. The final locate's index held
+only k000000, k000006 and k000007 (every other keyframe kept at its prior), hence no overlap 0.34 m
+from the start. The replay also found an endless recursion: a fit below the registration minimum,
+all off the floor, from a frame without depth of its own, was refitted on the same
+correspondences; a fit below the minimum after refinement is now no pose.
 
 Regression fixed on `dev_ainex_j6` (one keyframe per job, drifting priors, an arm ignore mask;
 replayed the same way with the stored images, depths, masks and sent priors): the look

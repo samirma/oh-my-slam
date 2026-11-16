@@ -237,7 +237,9 @@ confirms the prior (it is fitted again without the floor points), and a frame th
 §2, Texture-aliasing guards); locate applies the floor rule, a floor-dominated fit becoming a
 rival (api.md §6). A drifting prior's position is moved by more than its own sigma only when three
 independent views agree on that correction, otherwise the frame is held as a prior conflict
-(map.md §1, No correction from one view). It also changes behaviour with no change of shape: a `floor_not_judged` keyframe's depth lifts a later frame's points fit for its pose only (never alignment, scale evidence, depth confirmation or locate; map.md §2), and `few_features` counts keypoints as registration extracts them (api.md §6). New optional fields: the input status's
+(map.md §1, No correction from one view). It also changes behaviour with no change of shape: a `floor_not_judged` keyframe's depth lifts a later frame's points fit for its pose only (never alignment, scale evidence, depth confirmation or locate; map.md §2), and `few_features` counts keypoints as registration extracts them (api.md §6); one view with
+at least 100 off-floor inliers and no rival fit among its matches may move a drifting prior
+alone (map.md §1). New optional fields: the input status's
 `prior_residual_sent_m` / `prior_residual_sent_deg` (against the prior as sent) and
 `inlier_floor_share`, the locate result's `prior_residual_m` / `prior_residual_deg` and
 `inlier_floor_share`, and `quality.drift_correction`'s `held` and `agreeing_frames`.

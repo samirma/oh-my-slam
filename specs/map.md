@@ -220,7 +220,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     3 × hypot(σ_image of both, the drift-grown rate of this section over their priors'
     distance), position and rotation separately. Views count as independent when their priors
     lie at least `DRIFT_INDEPENDENT_M` apart or look at least `DRIFT_INDEPENDENT_DEG` apart
-    (`README.md`); the frame itself counts as one. A frame whose correction does not reach
+    (`README.md`); the frame itself counts as one. One view suffices when its image-only pose
+    rests on at least the measurable-pair count (100) of off-floor inliers (§2, Texture-aliasing
+    guards) and its matches hold no rival: the lifted matches it leaves unexplained give no
+    second fit with at least 0.25 of its inliers (and the registration minimum) farther than
+    0.10 m or 5° from it (locate's rival distances, api.md §6). Repeated off-floor texture (a
+    wood-grain panel) can give such counts; it then gives a rival too. A frame whose correction does not reach
     that agreement is **held**: it is left out of the fit and treated as a prior conflict
     (rejected `prior_conflict` when its image-only pose meets the measurable-pair threshold,
     else `kept_at_prior`, `conflict_unsupported`), its view kept for later jobs; the estimate
@@ -414,7 +419,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        other than `monocular` measured it, else the monocular registration sigma, `README.md`),
        σ_point a per-point floor (`README.md`). An inlier beyond its bound is no inlier. When at
        least the registration minimum of inliers carry both depths and |median r| exceeds the
-       median of their bounds, the whole fit is inconsistent and is no pose. A monocular frame's
+       median of their bounds, the whole fit is inconsistent and is no pose. A fit with fewer
+       than the registration minimum of inliers after its refinement is no pose either, before
+       any guard. A monocular frame's
        own depth scale is not tested here: the floor check judges it (a frame beyond the
        monocular scale bound keeps its pose, `floor_not_judged`), so for monocular depth r is
        taken about its median (the depth's shape is tested, not its scale) and the median test
