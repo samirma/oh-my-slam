@@ -3,7 +3,10 @@
 
 Every frame of an update is measured before it reaches the mapper:
 
-* ``features`` — SIFT keypoints on the image scaled to at most ``WORK_SIDE`` px;
+* ``features`` — SIFT keypoints on the image scaled to at most ``WORK_SIDE`` px, at the contrast
+  threshold registration extracts with (``SIFT_CONTRAST``, oms/2.13): ``few_features`` asks
+  whether registration can have enough; ``strong`` the keypoints at OpenCV's default contrast,
+  which the ``suspicious`` test was calibrated on;
 * ``texture`` — the share of pixels whose intensity gradient exceeds ``TEXTURE_GRADIENT`` grey
   levels per pixel, at ``TEXTURE_SIDE`` px: a bare wall or ceiling has almost none;
 * ``sharpness`` — the variance of the Laplacian at the working size over its variance at a
@@ -36,6 +39,9 @@ TEXTURE_GRADIENT = 4.0  # grey levels per pixel (Sobel / 8)
 PLAIN_TEXTURE = 0.01  # bare walls 0.0003-0.0024; the 128 reference frames >= 0.0395
 BLUR_SHARPNESS = 0.035  # the reference frames >= 0.12; a Gaussian blur of >= 1.2 px < 0.035
 FEW_FEATURES = REGISTRATION_MIN  # fewer keypoints than a pose needs inliers (api.md §4, §6)
+# the SIFT contrast threshold registration and locate extract with (``anchored.SIFT_CONTRAST``,
+# ``relocalize.SIFT_CONTRAST``): a quarter of OpenCV's default
+SIFT_CONTRAST = 0.01
 SUSPECT_FEATURES = 150  # below this (or a low texture) the median depth is measured
 SUSPECT_TEXTURE = 0.05
 TOO_CLOSE_M = 0.30  # median depth along the optical axis
@@ -47,11 +53,13 @@ class Measures:
     features: int
     texture: float
     sharpness: float
+    strong: int | None = None  # keypoints at OpenCV's default contrast (None: ``features``)
 
     @property
     def suspicious(self) -> bool:
         """Whether the median depth is worth measuring (``too_close`` is likely)."""
-        return self.features < SUSPECT_FEATURES or self.texture < SUSPECT_TEXTURE
+        strong = self.features if self.strong is None else self.strong
+        return strong < SUSPECT_FEATURES or self.texture < SUSPECT_TEXTURE
 
 
 def _scaled(gray: NDArray[np.uint8], side: int) -> NDArray[np.uint8]:
@@ -71,8 +79,11 @@ def measure(rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None = None) -> 
     if ignore is not None and ignore.any():
         keep = (cv2.resize((~ignore).astype(np.uint8), (work.shape[1], work.shape[0]),
                            interpolation=cv2.INTER_NEAREST) > 0)
+    mask = None if keep is None else keep.astype(np.uint8) * 255
     sift: Any = cv2.SIFT_create()  # type: ignore[attr-defined]
-    kps = sift.detect(work, None if keep is None else keep.astype(np.uint8) * 255)
+    strong = sift.detect(work, mask)
+    low: Any = cv2.SIFT_create(contrastThreshold=SIFT_CONTRAST)  # type: ignore[attr-defined]
+    kps = low.detect(work, mask)
     tex = _scaled(gray, TEXTURE_SIDE).astype(np.float32)
     mag = np.hypot(cv2.Sobel(tex, cv2.CV_32F, 1, 0), cv2.Sobel(tex, cv2.CV_32F, 0, 1)) / 8.0
     if keep is not None:
@@ -84,7 +95,7 @@ def measure(rgb: NDArray[np.uint8], ignore: NDArray[np.bool_] | None = None) -> 
     small = cv2.resize(work, (max(1, work.shape[1] // 4), max(1, work.shape[0] // 4)),
                        interpolation=cv2.INTER_AREA)
     coarse = float(cv2.Laplacian(small.astype(np.float32), cv2.CV_32F).var())
-    return Measures(len(kps), texture, fine / coarse if coarse > 1e-6 else 0.0)
+    return Measures(len(kps), texture, fine / coarse if coarse > 1e-6 else 0.0, len(strong))
 
 
 def median_depth(depth_m: NDArray[np.float32]) -> float | None:

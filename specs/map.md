@@ -380,22 +380,22 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     below).
   * **A `floor_not_judged` keyframe as a reference** (oms/2.6). An image-confirmed keyframe whose
     `detail` is `floor_not_judged` (its own depth scale lay beyond the monocular scale bound,
-    above) stays a registration reference for image matching and pose: its features are used,
-    without its depth. Its pose is trusted, its depth is the out-of-bound part, so that depth
-    lifts no later frame:
-    * no keypoint depth for metric lifting or alignment of a frame registered against it;
+    above) stays a registration reference for image matching and pose. Its pose is trusted, its
+    depth is the out-of-bound part. Since oms/2.13 that depth, at the map's scale k as any
+    monocular keyframe's, lifts the matches of a later frame's points fit (its pose only: the
+    texture-aliasing guards and the reference depth scale of the refinement bound what a wrong
+    scale can do); on a monocular robot whose frames' own scales spread beyond the bound, a lap
+    otherwise has no lifted reference at all. It gives nothing else:
+    * no alignment of a frame registered against it (its lifted points are no alignment residual);
     * no depth confirmation (§1, Measurable pair; step 2 of the match graph below) of a
       candidate pose against it;
     * no scale evidence for any later frame: not the alignment residual, not camera-height
       evidence, not the monocular depth scale k (§1, Scale).
 
-    A frame whose only references that carry depth are `floor_not_judged` ones is a frame with no
-    depth reference: the case of a reference without depth, which §1 (Measurable pair: the
-    depth confirmation applies only where both frames carry depth) and the match graph (step 2:
-    only against a reference that carries depth images) already define. Its pose comes from the
-    images alone, it gets no depth confirmation and no scale evidence from those references, and
-    the update's scale source is chosen from the evidence that remains (§1, Scale). Locate
-    follows the same rule (api.md §6).
+    A frame whose only references that carry depth are `floor_not_judged` ones gets no depth
+    confirmation and no scale evidence from those references, and the update's scale source is
+    chosen from the evidence that remains (§1, Scale). Locate keeps the oms/2.6 rule: such a
+    keyframe's features without its depth (api.md §6).
   * **Texture-aliasing guards** (oms/2.13). Repeated texture (floor planks, tiles, carpet, a
     wood-grain panel) matches a frame to the wrong place with hundreds of inliers. Two guards
     apply to every points fit (PnP) of a frame against the map's lifted points, on every engine
@@ -442,7 +442,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        pose, never relocate it; its rotation is the conflict bound's. Otherwise the fit is made
        again on the off-floor correspondences alone (the floor points left out), and that fit,
        with the same guards, is the frame's candidate; when it has none the frame has no image
-       pose. A candidate pose near the prior (api.md §4, Choosing a status) is refitted the same
+       pose, unless the frame has a prior: the fit is then made once more on the correspondences
+       consistent with the prior as placed (those reprojecting at it within 3 × its sigmas'
+       reach), where a floor fit stands only by confirming the prior (above). Repeated texture
+       elsewhere (the start spot's floor matched from the lap) may outvote the frame's own
+       surroundings in the first fit; it cannot outvote them there. A candidate pose near the prior (api.md §4, Choosing a status) is refitted the same
        way. A translational twin picked over a fit by the depth confirmation (§1) is a
        candidate only when it passes both guards itself; it is not refitted. A map without a
        floor has no floor points, and this guard does not apply.

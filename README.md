@@ -1448,6 +1448,32 @@ positions: the replayed start look registers 10 of 10 views on j5 (8 of 8 on j3)
 frames k000009-k000014 (floor fits 1.3-2.4 m from priors of sigma 0.9-1.4 m) stay kept at their
 priors (fixture `tests/data/aliasing/j5_*`).
 
+Regression fixed on `dev_ainex_j6` (one keyframe per job, drifting priors, an arm ignore mask;
+replayed the same way with the stored images, depths, masks and sent priors): the look
+registered 6 of 8 views and the lap 1 of 31 (k000008). Causes:
+* k000004/k000005 `few_features`: the image check counted SIFT keypoints at OpenCV's default
+  contrast (3 and 10 outside the mask) while registration extracts at a quarter of it (105
+  inliers k000005 against k000004). The check now counts at registration's contrast
+  (`checks.SIFT_CONTRAST` 0.01; the `suspicious` too-close test keeps the default count,
+  `Measures.strong`).
+* the lap: k000008 and the lap frames are monocular keyframes the floor check did not judge
+  (own depth scales 1.3-2.0 × k 0.51), and their depth lifted nothing (oms/2.6, P30d), so a lap
+  frame's only lifted matches were the start look's floor: the pooled fit aliased onto the start
+  spot and the floor guard refused it, leaving no pose. Their depth now lifts a later frame's
+  points fit, at k, for its pose only (no alignment residual, scale evidence, depth confirmation
+  or content; locate unchanged). A fit refused by the floor guard with no off-floor pose is also
+  tried on the correspondences consistent with the prior as placed.
+* per upload against a batch: the rules are the same; a batch lets the job's frames reference
+  each other, but a reference the floor check did not judge lifted nothing either way.
+* the odometry scale (0.54-0.69) is right: the client's ground truth has its dead reckoning
+  1.33-1.65 × long, and the placed priors were within 0.05 m of truth (k000009, k000011).
+
+After: look 8 of 8, lap 12 of 31 (k000008-k000014, k000016, k000018, k000020, k000035,
+k000036); k000009 at (−0.07, 0.81) against truth (−0.07, 0.73). The far side of the lap (k000021
+on) is placed over 1 m from truth by the odometry's heading drift (k000027: placed (1.27, 1.92),
+truth (2.60, 0.42)), beyond its candidates. j5: look 8 of 8, lap 24 of 31; j3's lap frames are not
+placed on the start spot (fixtures `tests/data/aliasing/j6_*`).
+
 ### Objects, surfaces and relations (O8)
 
 * **Label vocabulary** (oms/2.3, map.md §5). An update's optional `labels` (at most 64, each

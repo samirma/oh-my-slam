@@ -561,7 +561,7 @@ def test_locate_results_validate() -> None:
 # -- the client's map (oms/2.13 evidence, offline replay on small copies) ----------------------
 
 
-def _replay(q: str, r: str, tag: str = "") -> Placement:
+def _replay(q: str, r: str, tag: str = "", placed: bool = False) -> Placement:
     meta = json.loads((DATA / f"{tag}meta.json").read_text())
     z = np.load(DATA / f"{tag}{q}_{r}.npz")
     m = AnchoredMap(Path("/nonexistent"))
@@ -573,7 +573,8 @@ def _replay(q: str, r: str, tag: str = "") -> Placement:
     ref = an.Keyframe(r, rk["name"], rk["camera_id"], Intrinsics.from_dict(rk["K"]),
                       np.asarray(rk["T"], np.float64), rk["sigma_pos_m"], rk["sigma_rot_deg"],
                       "fused", rk["prior"], "mono", rk["k_used"], rk["median_depth"],
-                      floor_factor=rk["floor_factor"], grid_scale=rk["grid_scale"])
+                      floor_factor=rk["floor_factor"], grid_scale=rk["grid_scale"],
+                      floor_unjudged=bool(rk.get("floor_unjudged", False)))
     ref.feats = an.Features(z["r_kps"], z["r_desc"])
     ref.kdepth = z["r_kdepth"]
     qk = meta["keyframes"][q]
@@ -585,9 +586,11 @@ def _replay(q: str, r: str, tag: str = "") -> Placement:
     own = (z["q_depth"].astype(np.float32) * float(m.scale.k / qk["k_used"]), Kg, "mono")
     f = FrameIn(qk["name"], qk["camera_id"], np.zeros((Kq.height, Kq.width, 3), np.uint8), Kq,
                 prior, own_depth=own)
-    P = np.asarray(p["T"], np.float64)
-    return m.place(f, an.Features(z["q_kps"], z["q_desc"]), None,
-                   (P, p["sigma_pos_m"], p["sigma_rot_deg"]), [ref])
+    # the prior as sent, or as the drift estimate placed it (a frame the map kept: its pose)
+    P = np.asarray(qk["T"] if placed else p["T"], np.float64)
+    sp, sr = (qk["sigma_pos_m"], qk["sigma_rot_deg"]) if placed \
+        else (p["sigma_pos_m"], p["sigma_rot_deg"])
+    return m.place(f, an.Features(z["q_kps"], z["q_desc"]), None, (P, sp, sr), [ref])
 
 
 @pytest.mark.parametrize(("q", "r"), [("k000011", "k000002"), ("k000013", "k000007")])
@@ -624,3 +627,44 @@ def test_locate_on_the_floor_may_confirm_the_prior() -> None:
     idx, q = _index(np.random.default_rng(9), wall=0)  # the alias, a tile from the prior
     q.prior, q.prior_sigma_pos_m, q.prior_sigma_rot_deg = A.copy(), 0.5, 10.0
     assert not rl.locate(q, idx).located
+
+
+# dev_ainex_j6 ground truth (base pose in the start frame; the camera adds the head transform)
+J6_TRUTH = {"k000009": (-0.069, 0.732), "k000011": (0.041, 1.578)}
+
+
+@pytest.mark.parametrize(("q", "r"), [("k000009", "k000008"), ("k000011", "k000009"),
+                                      ("k000005", "k000004"), ("k000006", "k000005")])
+def test_the_j6_frames_register_near_their_references(q: str, r: str) -> None:
+    """dev_ainex_j6 (oms/2.13 regression): one frame per job with an arm ignore mask. The lap
+    frames' references (k000008, and k000009 itself) are monocular keyframes the floor check did
+    not judge (own scales 1.3-2.0 x k); their depth now lifts a later frame's pose, so k000009 and
+    k000011 register near truth, and the look frames k000005 / k000006 near their neighbours."""
+    pl = _replay(q, r, "j6_", placed=True)
+    assert pl.status == "registered" and pl.method == "pnp" and pl.T is not None
+    meta = json.loads((DATA / "j6_meta.json").read_text())
+    if q in J6_TRUTH:
+        # (one reference each, kept at its placed prior in the live map: a few decimetres)
+        assert np.linalg.norm(pl.T[:2, 3] - np.array(J6_TRUTH[q])) < 0.35
+    else:
+        ref_c = np.asarray(meta["keyframes"][r]["T"])[:2, 3]
+        assert np.linalg.norm(pl.T[:2, 3] - ref_c) < 0.3
+
+
+def test_few_features_counts_what_registration_extracts() -> None:
+    """api.md §6 ``few_features`` (oms/2.13): keypoints at registration's contrast threshold; a
+    faint texture OpenCV's default contrast barely sees still registers (dev_ainex_j6 k000005: 3
+    keypoints at the default, 105 inliers in registration). ``suspicious`` keeps the default."""
+    from oh_my_slam.mapping import checks
+
+    rng = np.random.default_rng(0)
+    img = np.full((240, 320), 128.0)
+    for _ in range(300):  # faint blobs
+        x, y = rng.integers(10, 310), rng.integers(10, 230)
+        img[y - 2:y + 3, x - 2:x + 3] += rng.choice([-6.0, 6.0])
+    rgb = np.repeat(np.clip(img, 0, 255).astype(np.uint8)[..., None], 3, axis=2)
+    m = checks.measure(rgb)
+    assert m.strong is not None and m.features > m.strong and m.features >= checks.FEW_FEATURES
+    assert m.suspicious == (m.strong < checks.SUSPECT_FEATURES or m.texture < checks.SUSPECT_TEXTURE)
+    assert checks.Measures(500, 0.2, 0.3).suspicious is False  # strong defaults to features
+    assert checks.Measures(500, 0.2, 0.3, 10).suspicious is True

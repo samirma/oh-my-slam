@@ -2063,8 +2063,12 @@ class Placement:
     inlier_floor_share: float | None = None
 
 
-def _lifted(corr: _Corr) -> tuple[Array, Array]:
-    has = np.isfinite(corr.X).all(axis=1)
+def _lifted(corr: _Corr, cands: list[Keyframe]) -> tuple[Array, Array]:
+    """The lifted points of ``corr`` (and their pixels) that may serve as scale evidence: none
+    from a keyframe the floor check did not judge (map.md §2, P30d: its depth lifts a pose
+    only, oms/2.13)."""
+    lifts = np.array([k.lifts() for k in cands], bool)
+    has = np.isfinite(corr.X).all(axis=1) & lifts[corr.kf]
     return corr.X[has], corr.uv[has]
 
 
@@ -2124,6 +2128,11 @@ def floor_points(X: Array, floor: tuple[float, float] | None, point_sigma: Any =
     band = np.maximum(FLOOR_BAND_MIN_M, FLOOR_BAND_SIGMAS * np.hypot(floor[1], point_sigma))
     with np.errstate(invalid="ignore"):
         return np.isfinite(X).all(axis=1) & (np.abs(X[:, 2] - floor[0]) <= band)
+
+
+def _sub_corr(corr: _Corr, keep: NDArray[np.bool_]) -> _Corr:
+    """The correspondences ``keep`` of ``corr``."""
+    return _Corr(corr.uv[keep], corr.X[keep], corr.d[keep], corr.kf[keep])
 
 
 def _real_sigmas(s: Solve, refs: Refs) -> tuple[float, float]:
@@ -2977,10 +2986,10 @@ class AnchoredMap:
                     or not len(k.feats.kps):
                 continue  # a keyframe without features or keypoint depths: no reference
             ray = rays(k.K, k.feats.kps)
-            # a keyframe the floor check did not judge lifts nothing (P30d): its matches are
-            # rays only, as a reference without depth
-            z = k.kdepth.astype(np.float64) * self._depth_factor(k) if k.lifts() \
-                else np.full(len(k.kdepth), np.nan)
+            # every keyframe's depth lifts its matches for the pose (oms/2.13), one the floor
+            # check did not judge too, at the map's k: such a depth gives the pose no scale
+            # evidence (``_lifted``, ``_register``), depth confirmation or content (P30d)
+            z = k.kdepth.astype(np.float64) * self._depth_factor(k)
             R, c = k.T[:3, :3], k.centre
             Xk = c + (ray * z[:, None]) @ R.T
             dk = unit(ray @ R.T)
@@ -3155,13 +3164,15 @@ class AnchoredMap:
         return self._place(f, feats, cands, pred)
 
     def _image_pose(self, f: FrameIn, feats: Features, corr: _Corr, cands: list[Keyframe],
-                    T0: Array | None, sp0: float
+                    T0: Array | None, sp0: float, sr0: float = 0.0, fallback: bool = True
                     ) -> tuple[tuple[Any, ...], _Corr, float | None] | None:
         """A frame's image-only pose on its correspondences ``corr`` (``place``): the first pose
         (``_init``) refined, the texture-aliasing guards of a points fit (map.md §2, oms/2.13:
         ``_depth_guard``, then the floor points: a fit with fewer than ``MIN_INLIERS`` off-floor
-        inliers is fitted again on the off-floor correspondences alone, which hold no floor point:
-        the fit ends there), and
+        inliers is fitted again on the off-floor correspondences alone, which hold no floor point;
+        when that gives no pose, on the correspondences consistent with the prior as placed
+        (``_prior_matches``, ``fallback``), where a floor fit stands only by confirming the prior:
+        repeated texture elsewhere outvoting the frame's own surroundings), and
         the depth confirmation (``depth_confirms``). Returns the image pose (``(s, n, share,
         method, spi, sri, sub, refs)``), the correspondences it was fitted on and its inliers'
         floor share (None: no points fit, or no map floor); None: no image pose."""
@@ -3185,9 +3196,15 @@ class AnchoredMap:
                 keep = ~self._on_floor(corr.X, corr.kf, refs)
                 log.info("%s: %d of %d inliers off the floor: fitted again on the %d off-floor "
                          "correspondences", f.name, off, int(s.inliers.sum()), int(keep.sum()))
-                return self._image_pose(f, feats, _Corr(corr.uv[keep], corr.X[keep],
-                                                        corr.d[keep], corr.kf[keep]),
-                                        cands, T0, sp0)
+                alt = self._image_pose(f, feats, _sub_corr(corr, keep), cands, T0, sp0, sr0,
+                                       False)
+                if alt is None and fallback and T0 is not None:
+                    near = self._prior_matches(f, corr, T0, sp0, sr0)
+                    log.info("%s: no off-floor pose: fitted again on the %d correspondences "
+                             "consistent with its prior", f.name, int(near.sum()))
+                    alt = self._image_pose(f, feats, _sub_corr(corr, near), cands, T0, sp0,
+                                           sr0, False)
+                return alt
         n = int(s.inliers.sum())
         # a candidate pose the depth images do not confirm is no placement (map.md §2 step
         # 2): a lattice pose is never registered; a translational twin picked over it
@@ -3242,6 +3259,20 @@ class AnchoredMap:
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
                                f.prior["trust"])
         return float(np.linalg.norm(s.c - T0[:3, 3])) <= min(sp0, K_SIGMA * ci[0])
+
+    def _prior_matches(self, f: FrameIn, corr: _Corr, T0: Array, sp0: float, sr0: float
+                       ) -> NDArray[np.bool_]:
+        """The lifted correspondences that reproject at the prior as placed (``T0``, sigmas
+        ``sp0``, ``sr0``) within ``K_SIGMA`` of its sigmas' reach (as the guided matching)."""
+        has = np.isfinite(corr.X).all(axis=1)
+        Xh = np.where(has[:, None], corr.X, 0.0)
+        z = ((Xh - T0[:3, 3]) @ T0[:3, :3])[:, 2]
+        P = _project(T0[:3, :3], T0[:3, 3], Xh, f.K, False)
+        reach = K_SIGMA * f.K.fx * (math.radians(sr0) + sp0 / np.maximum(z, MIN_DEPTH_M)) \
+            + 2.0 * self._thr(f.K)
+        out: NDArray[np.bool_] = has & (z > MIN_DEPTH_M) & (
+            np.linalg.norm(P - corr.uv, axis=1) <= reach)
+        return out
 
     def _near_fit(self, f: FrameIn, corr: _Corr, sel: NDArray[np.bool_], refs: Refs, T0: Array
                   ) -> tuple[Solve, tuple[Array, Array, Array, NDArray[np.intp]]] | None:
@@ -3355,7 +3386,7 @@ class AnchoredMap:
         img = None
         floor_share: float | None = None
         if corr is not None:
-            got = self._image_pose(f, feats, corr, cands, T0, sp0)
+            got = self._image_pose(f, feats, corr, cands, T0, sp0, sr0)
             if got is not None:
                 img, corr, floor_share = got
         if T0 is None:
@@ -3373,7 +3404,7 @@ class AnchoredMap:
             # translation (map.md §1)
             T, fsp, fsr, ht = self.with_height(f, s.T, s.cov, rp, rr)
             return Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), n,
-                             method, lifted=_lifted(corr),  # type: ignore[arg-type]
+                             method, lifted=_lifted(corr, cands),  # type: ignore[arg-type]
                              align_T=s.T,
                              map_residual=_displacement(T, s.T, method == "rotation"),
                              image_sigmas=(rp, rr) if ht else None, height_term=ht,
@@ -3509,13 +3540,7 @@ class AnchoredMap:
         ``SUPPORT_MIN`` of the best hypothesis's ``best`` (and ``MIN_INLIERS``) and its pose
         lies within the combined conflict bound (``sigmas.conflicts``, its own calibrated
         sigmas). None otherwise."""
-        has = np.isfinite(corr.X).all(axis=1)
-        Xh = np.where(has[:, None], corr.X, 0.0)
-        z = ((Xh - T0[:3, 3]) @ T0[:3, :3])[:, 2]
-        P = _project(T0[:3, :3], T0[:3, 3], Xh, f.K, False)
-        reach = K_SIGMA * f.K.fx * (math.radians(sr0) + sp0 / np.maximum(z, MIN_DEPTH_M)) \
-            + 2.0 * self._thr(f.K)
-        near = has & (z > MIN_DEPTH_M) & (np.linalg.norm(P - corr.uv, axis=1) <= reach)
+        near = self._prior_matches(f, corr, T0, sp0, sr0)
         need = max(MIN_INLIERS, SUPPORT_MIN * best)
         if near.sum() < need:
             return None
@@ -3794,7 +3819,7 @@ class AnchoredMap:
         pl = Placement(f.name, "registered", None, T, round(max(fsp, REPORT_MIN_SIGMA_POS_M), 4),
                        round(max(fsr, REPORT_MIN_SIGMA_ROT_DEG), 3), n, method,
                        pose_residual(T, ref),
-                       lifted=_lifted(corr), align_T=s.T,  # type: ignore[arg-type]
+                       lifted=_lifted(corr, cands), align_T=s.T,  # type: ignore[arg-type]
                        map_residual=_displacement(T, s.T, rot_only), prior_ref=ref,
                        image_sigmas=(rp, rr), has_prior=True, height_term=hz is not None)
         if method == "pnp":
@@ -3805,7 +3830,7 @@ class AnchoredMap:
             ev = functools.partial(self._scale_evidence, s,
                                    np.asarray(f.prior["T_map_cam"], np.float64),
                                    f.prior["trust"], j, (k.centre.copy(), copy.deepcopy(k.prior),
-                                                         k.depth_kind),
+                                                         k.depth_kind if k.lifts() else "none"),
                                    (sub, refs, f.K, _prior_sigmas(f.prior)), self.scale.k)
             pl.evidence = lambda: self._record_evidence(ev())
         return pl

@@ -649,11 +649,12 @@ def test_floor_not_judged_on_a_registered_or_provisional_frame(tmp_path: Any) ->
 def test_an_unjudged_keyframe_lifts_no_later_frame(tmp_path: Any,
                                                    monkeypatch: pytest.MonkeyPatch) -> None:
     """map.md §2 "A floor_not_judged keyframe as a reference" (P30d): the half-scale sweep's s5
-    and s6 stay references for matching and pose, but their depth lifts no later frame (no
-    keypoint depth: their matches are rays), so the map's k and its evidence equal those of the
-    same sweep whose s5 and s6 carry no depth at all; before, the frames lifted on their
-    half-scale depth took it as their own (monocular residuals at log 0.5, a wider
-    ``scale_sigma_rel``)."""
+    and s6 stay references for matching and pose, but their depth gives no later frame scale
+    evidence, so the map's k and its evidence match those of the same sweep whose s5 and s6 carry
+    no depth at all; before, the frames lifted on their half-scale depth took it as their own
+    (monocular residuals at log 0.5, a wider ``scale_sigma_rel``). Since oms/2.13 their depth
+    lifts a later frame's pose (map.md §2): that pose moves slightly, and with it that frame's own
+    alignment residual (under 1e-3 in log), never by their scale."""
     from oh_my_slam.mapping.anchored import AnchoredMap
     from tests.unit.test_round14 import frame as f14
     from tests.unit.test_round16 import _half_scale_sweep
@@ -672,14 +673,16 @@ def test_an_unjudged_keyframe_lifts_no_later_frame(tmp_path: Any,
     assert a.scale.k == pytest.approx(b.scale.k, rel=1e-9)
     assert a.scale.depth_residuals.keys() == b.scale.depth_residuals.keys()
     for kind, got in a.scale.depth_residuals.items():
-        # (the same evidence: the guided matching's radius alone differs, by the stored
-        # median depth of s5 and s6, a few rays of s7 at 1e-5 in the log residual)
-        assert np.allclose(got, b.scale.depth_residuals[kind], rtol=0.0, atol=1e-4)
+        # (the same evidence: s7's pose rests on s5's and s6's lifted points too, oms/2.13, its
+        # own residual moving by under 1e-3 in log; a half-scale lift would read log 0.5)
+        assert np.allclose(got, b.scale.depth_residuals[kind], rtol=0.0, atol=1e-3)
     unjudged = [k for k in a.keyframes if k.name in half]
     assert unjudged and all(k.floor_unjudged and not k.lifts() and k.usable() for k in unjudged)
     feats = an.features(f14("q", base_pose(170.0), depth=None, mono=1.3).rgb)
     corr = a._correspondences(feats, unjudged)
-    assert len(corr.uv) and not np.isfinite(corr.X).any()  # rays only
+    # lifted for the pose (oms/2.13), none of it alignment or scale evidence
+    assert len(corr.uv) and np.isfinite(corr.X).all(axis=1).any()
+    assert not len(an._lifted(corr, unjudged)[0])
     monkeypatch.setattr(an.Keyframe, "lifts", lambda self: True)  # as before P30d
     c, _ = _half_scale_sweep(tmp_path / "c")
     # the frames lifted on s5's and s6's half-scale depth took it as their own (log 0.5): the
