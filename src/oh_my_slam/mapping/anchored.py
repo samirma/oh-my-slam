@@ -361,6 +361,12 @@ MONOCULAR_REGISTRATION_SIGMA_REL = 0.30  # raw monocular units: a camera this lo
 # ``MONOCULAR_SIGMA_REL``
 FLOOR_DEPTH_SIGMA_REL = 0.01
 MONO_FLOOR_BOUND_REL = 0.30
+# a keyframe's own depth scale by motion stereo (map.md §1 "Keyframe depth scale", oms/2.14):
+# neighbours whose priors' optical axes lie at most this far apart, and the floor of a drifting
+# pair's relative translation sigma (a walking robot's odometry over a short move)
+KEYFRAME_PAIR_MAX_DEG = 60.0
+KEYFRAME_BASELINE_SIGMA_MIN_M = 0.03
+KEYFRAME_PAIR_MAX_GAP = 4  # ... and at most this many keyframes of its camera apart in addition order
 
 
 def recorded_scale_sigma(source: str, sigma: float) -> float:
@@ -1570,13 +1576,31 @@ class Keyframe:
     # whatever its reason, api.md §4, P30b/P30c): no content, no free-by-rule cells, no
     # too-close exception, until a later job's images confirm it
     conflict: bool = False
+    # its own monocular depth scale measured by motion stereo against neighbour keyframes (map.md
+    # §1 "Keyframe depth scale", oms/2.14; ``AnchoredMap._measure_scales``): raw depth to map
+    # metres, its relative sigma and the neighbours' names; None: not measured
+    stereo_scale: float | None = None
+    stereo_sigma: float | None = None
+    stereo_pairs: list[str] | None = None
+    # the floor check judged it only about its measured scale (``AnchoredMap._measure_scales``):
+    # its content is given at its floor-check scale, while its depth serves later frames as an
+    # unjudged keyframe's does (``lifts``)
+    stereo_judged: bool = False
+
+    def confident_scale(self) -> float | None:
+        """Its measured scale when confident (map.md §1 "Keyframe depth scale", oms/2.14): its
+        sigma lies below the monocular scale bound (``MONO_FLOOR_BOUND_REL``); None otherwise."""
+        if self.depth_kind != "mono" or self.stereo_scale is None or self.stereo_sigma is None \
+                or self.stereo_sigma >= MONO_FLOOR_BOUND_REL:
+            return None
+        return self.stereo_scale
 
     def lifts(self) -> bool:
         """Whether its depth serves later frames (map.md §2 "A floor_not_judged keyframe as a
         reference", oms/2.6 P30d): keypoint depth for their lifting and alignment, depth
         confirmation, scale evidence. A keyframe the floor check did not judge stays a reference
         for image matching and pose, its features used without its depth."""
-        return not self.floor_unjudged
+        return not self.floor_unjudged and not self.stereo_judged
 
     def floor_withheld(self) -> bool:
         """Whether the floor check keeps its content out (map.md §2): it excluded the frame
@@ -1616,7 +1640,9 @@ class Keyframe:
                 "K_grid": None if self.K_grid is None else self.K_grid.to_dict(),
                 "floor_ok": self.floor_ok, "grid_scale": self.grid_scale,
                 "floor_factor": self.floor_factor, "floor_unjudged": self.floor_unjudged,
-                "conflict": self.conflict}
+                "conflict": self.conflict, "stereo_scale": self.stereo_scale,
+                "stereo_sigma": self.stereo_sigma, "stereo_pairs": self.stereo_pairs,
+                "stereo_judged": self.stereo_judged}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1633,7 +1659,10 @@ class Keyframe:
                         floor_ok=bool(d.get("floor_ok", True)),
                         grid_scale=d.get("grid_scale"), floor_factor=d.get("floor_factor"),
                         floor_unjudged=bool(d.get("floor_unjudged", False)),
-                        conflict=bool(d.get("conflict", False)))
+                        conflict=bool(d.get("conflict", False)),
+                        stereo_scale=d.get("stereo_scale"), stereo_sigma=d.get("stereo_sigma"),
+                        stereo_pairs=d.get("stereo_pairs"),
+                        stereo_judged=bool(d.get("stereo_judged", False)))
 
     @property
     def centre(self) -> Array:
@@ -3981,14 +4010,16 @@ class AnchoredMap:
 
     def floor_check(self, kind: str, height_m: float | None, height_sigma_m: float | None,
                     T: Array, sigma_pos_m: float, depth: NDArray[np.float32], K_grid: Intrinsics,
-                    raw_scale: float) -> FloorCheck:
+                    raw_scale: float, ref_scale: float | None = None) -> FloorCheck:
         """The floor check (``floor_verdict``) of a keyframe's depth (map metres as it would be
         fused, ``raw_scale`` times its raw monocular depth) on a map with a floor convention: a
-        monocular depth's own scale reported raw depth to map metres."""
+        monocular depth's own scale reported raw depth to map metres. The monocular scale bound
+        is taken about the map's k, or about ``ref_scale`` (raw depth to map metres): the
+        keyframe's own scale measured by motion stereo (map.md §1 "Keyframe depth scale")."""
         if not self.has_floor():
             return FloorCheck()
         chk = floor_verdict(kind, height_m, height_sigma_m, T, sigma_pos_m, depth, K_grid,
-                            raw_scale / self.scale.k)
+                            raw_scale / (ref_scale or self.scale.k))
         if chk.scale is not None:
             chk.scale = raw_scale * chk.factor
         return chk
@@ -4310,10 +4341,13 @@ class AnchoredMap:
         Returns the duplicates' placements by frame name and the seconds of the fusion."""
         t = time.perf_counter()
         dups, gone = self._drop_duplicates(self._job_duplicates())
+        judged = self._measure_scales()
         pending, self._defer = self._defer or [], None
         for kf, image, ignore, depth, K_grid in pending:
             if kf.id not in gone and kf.contributes():
-                self._fuse(image, ignore, kf, depth, K_grid)
+                got = self.content_grid(kf) if kf.id in judged else depth
+                assert got is not None
+                self._fuse(image, ignore, kf, got, K_grid)
         self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
         if new and self.created_with == "none" and self.keyframes:
             self._level_by_floor([pl for pl in pls if pl.name not in dups])
@@ -4326,6 +4360,139 @@ class AnchoredMap:
         self._evidence_from, self._rereg_by, self._rereg_state = set(), {}, {}
         self._mine, self._job_used, self.reran, self._retried_drifting = [], None, set(), False
         return dups, time.perf_counter() - t
+
+    def _measure_scales(self) -> set[str]:
+        """Each image-confirmed monocular keyframe's own depth scale by motion stereo (map.md §1
+        "Keyframe depth scale", oms/2.14), at a job's end, once its statuses are final: the
+        job's keyframes (added or re-registered), and every stored one the job gave a new
+        keyframe within ``KEYFRAME_PAIR_MAX_GAP`` (``_near``), measured again over all its
+        neighbours (``_scale_neighbours``; none clears it), in canonical order; each measurement
+        depends on the priors, the keyframes' features and its own raw depth only (never on a
+        pose its depth lifted), so the job's outcome does not depend on its frames' order. Then
+        a job keyframe the floor check did not judge about the map's k is judged about its
+        measured scale when that scale is confident (``Keyframe.confident_scale``) and its own
+        floor-check scale lies within the monocular scale bound of it (``stereo_judged``).
+        Returns the ids it judged."""
+        conf = [k for k in self.confirmed() if k.depth_kind == "mono" and k.prior is not None
+                and k.prior["trust"] in ("metric", "drifting")]
+        fresh = {k.id for k in conf if k.id not in self._stored_ids} | self._rereg_ids()
+        judged: set[str] = set()
+        for a in sorted(conf, key=lambda k: (natural_key(k.name), k.camera_id)):
+            if a.id not in fresh and not any(b.id in fresh and self._near(a, b) for b in conf):
+                continue
+            self._measure_scale(a, self._scale_neighbours(a, conf))
+            if a.id not in fresh:
+                continue
+            a.stereo_judged = False  # its floor verdict is the job's, about k
+            ref = a.confident_scale()
+            if not a.floor_unjudged or ref is None or a.K_grid is None:
+                continue
+            self._load_grid(a)
+            assert a.grid is not None
+            chk = self.floor_check(a.depth_kind, a.height_m, a.height_sigma_m, a.T,
+                                   a.sigma_pos_m, a.grid, a.K_grid, a.grid_scale or a.k_used,
+                                   ref)
+            if chk.judged and chk.scale is not None:
+                a.floor_ok, a.floor_unjudged, a.stereo_judged = chk.ok, False, True
+                a.floor_factor = chk.factor
+                judged.add(a.id)
+                log.info("%s: judged about its measured depth scale", a.name)
+        return judged
+
+    def _scale_neighbours(self, a: Keyframe, conf: list[Keyframe]
+                          ) -> list[tuple[Keyframe, Array, float, float]]:
+        """A keyframe's neighbours for its depth scale (map.md §1 "Keyframe depth scale"): the
+        other image-confirmed keyframes of its camera with a prior of the same trust whose
+        priors' optical axes lie within ``KEYFRAME_PAIR_MAX_DEG``, each with its pose in the
+        keyframe's optical frame from the two priors as sent (a drifting one's translation in
+        map metres: times the odometry scale) and that relative pose's sigmas: a drifting
+        pair's translation sigma hypot(``DRIFT_POS_REL`` × |t|, ``KEYFRAME_BASELINE_SIGMA_MIN_M``)
+        (the drift both priors share cancels; the odometry's error over the move between them
+        remains), a metric pair's the root sum of squares of both priors' position sigmas; the
+        rotation sigma the root sum of squares of both rotation sigmas. Only pairs whose σ_t /
+        |t| lies within ``KEYFRAME_BASELINE_REL_MAX``, the nearest in viewing direction first
+        (then name), at most ``KEYFRAME_SCALE_PAIRS``."""
+        from oh_my_slam.mapping import motion
+
+        assert a.prior is not None
+        Pa = np.asarray(a.prior["T"], np.float64)
+        odo = self._odo_sigma_rel()
+        out = []
+        for b in conf:
+            assert b.prior is not None  # ``conf``: keyframes with a prior
+            if b is a or not self._near(a, b) or b.prior["trust"] != a.prior["trust"]:
+                continue
+            Pb = np.asarray(b.prior["T"], np.float64)
+            ang = math.degrees(math.acos(max(-1.0, min(1.0, float(Pa[:3, 2] @ Pb[:3, 2])))))
+            if ang > KEYFRAME_PAIR_MAX_DEG:
+                continue
+            T = np.linalg.inv(Pa) @ Pb
+            if a.prior["trust"] == "drifting":
+                T[:3, 3] *= self.drift.odo_scale
+            tl = float(np.linalg.norm(T[:3, 3]))
+            sa, sb = float(a.prior["sigma_pos_m"]), float(b.prior["sigma_pos_m"])
+            st = math.hypot(math.hypot(DRIFT_POS_REL, odo) * tl, KEYFRAME_BASELINE_SIGMA_MIN_M,
+                            math.sqrt(abs(sa ** 2 - sb ** 2))) \
+                if a.prior["trust"] == "drifting" else math.hypot(sa, sb)
+            if st > motion.KEYFRAME_BASELINE_REL_MAX * tl:
+                continue
+            sr = math.hypot(a.prior["sigma_rot_deg"], b.prior["sigma_rot_deg"])
+            out.append((ang, natural_key(b.name), b, T, st, sr))
+        out.sort(key=lambda e: (e[0], e[1]))
+        return [(b, T, st, sr) for _, _, b, T, st, sr in out[:motion.KEYFRAME_SCALE_PAIRS]]
+
+    def _near(self, a: Keyframe, b: Keyframe) -> bool:
+        """Whether two keyframes are of one camera and at most ``KEYFRAME_PAIR_MAX_GAP``
+        keyframes of it apart in the map's order of addition (map.md §1 "Keyframe depth scale":
+        the odometry's error between two priors grows with the travel between them, which that
+        order bounds and their distance does not)."""
+        if a.camera_id != b.camera_id:
+            return False
+        order = [k.id for k in self.keyframes if k.camera_id == a.camera_id]
+        return abs(order.index(a.id) - order.index(b.id)) <= KEYFRAME_PAIR_MAX_GAP
+
+    def _odo_sigma_rel(self) -> float:
+        """The relative sigma of the odometry scale (map metres per odometry metre,
+        ``Drift.odo_scale``): 0 while the drift estimate has no correction (the priors' frame is
+        the map's: their metres are the map's), ``DRIFT_POS_REL`` with fewer than
+        ``SCALE_EVIDENCE_MIN`` odometry-scale baselines, else their robust spread in ln ratio
+        over the root of their count."""
+        if self.drift.ref_T is None:
+            return 0.0
+        ev = [e for e in self.drift.evidence if e[0] > 0 and e[1] > 0]
+        if len(ev) < SCALE_EVIDENCE_MIN:
+            return DRIFT_POS_REL
+        r = np.log(np.array([e[1] / e[0] for e in ev], np.float64))
+        return 1.4826 * float(np.median(np.abs(r - np.median(r)))) / math.sqrt(len(ev))
+
+    def _measure_scale(self, a: Keyframe,
+                       nbrs: list[tuple[Keyframe, Array, float, float]]) -> None:
+        """A keyframe's own depth scale against its neighbours (``_scale_neighbours``):
+        ``mapping.motion.pair_scale`` per neighbour on the keyframes' features and its raw depth
+        (its grid over ``grid_scale``), combined (``mapping.motion.keyframe_scale``); none (the
+        fields cleared) without a measurement."""
+        from oh_my_slam.mapping import motion
+
+        self._load_kf(a)
+        self._load_grid(a)
+        got = None
+        if a.feats is not None and a.grid is not None and a.K_grid is not None and nbrs:
+            raw = (a.grid / (a.grid_scale or a.k_used)).astype(np.float32)
+            pairs = []
+            for i, (b, T, st, sr) in enumerate(nbrs):
+                self._load_kf(b)
+                if b.feats is None:
+                    continue
+                o = motion.Other(np.zeros((0, 0, 3), np.uint8), None, T, st, sr)
+                pairs.append(motion.pair_scale(i, a.feats, b.feats, a.K, o, raw, a.K_grid))
+            got = motion.keyframe_scale(pairs, self.scale.k)
+        if got is None:
+            a.stereo_scale = a.stereo_sigma = a.stereo_pairs = None
+            return
+        a.stereo_scale, a.stereo_sigma = got.scale, got.sigma_rel
+        a.stereo_pairs = [nbrs[i][0].name for i in got.used]
+        log.info("%s: depth scale %.3f (k %.3f, sigma %.3f) from %s", a.name, got.scale,
+                 self.scale.k, got.sigma_rel, a.stereo_pairs)
 
     def _rereg_ids(self) -> set[str]:
         """The stored kept keyframes this job re-registered."""

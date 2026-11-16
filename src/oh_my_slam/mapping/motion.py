@@ -48,6 +48,8 @@ from oh_my_slam.reconstruction.stereo import (
     MATCH_SIGMA_PX,
     StereoDepth,
     Triangulated,
+    fit_scale,
+    sample,
     stereo_depth,
     triangulate,
 )
@@ -272,3 +274,90 @@ def motion_stereo(ref_rgb: NDArray[np.uint8], ref_ignore: NDArray[np.bool_] | No
     out.qualified = True
     out.scale_sigma_rel = math.hypot(t_rel, out.stereo.fit.sigma_a, out.stereo.fit.spread)
     return out
+
+
+# -- a keyframe's own monocular depth scale (map.md §1 "Keyframe depth scale", oms/2.14) -------
+
+KEYFRAME_SCALE_PAIRS = 4  # neighbours a keyframe's scale is measured against, at most
+KEYFRAME_BASELINE_REL_MAX = 0.20  # sigma_t / |t| of a neighbour pair that takes part
+KEYFRAME_SCALE_RANGE = (1.0 / 3.0, 3.0)  # a pair's scale over the map's k beyond: a false pair
+KEYFRAME_AGREE_K = 3.0  # a pair agrees within this many of its sigmas of the pairs' median
+
+
+@dataclass
+class PairScale:
+    """A neighbour pair's measurement of a keyframe's scale: the pair's status (``pair``'s, or
+    ``used`` once it gave a scale), the scale (raw depth to metres of the sent translation) and
+    its relative sigma, and the triangulated points."""
+
+    index: int
+    status: str
+    scale: float | None = None
+    sigma_rel: float | None = None
+    points: int = 0
+
+
+@dataclass
+class KeyframeScale:
+    """A keyframe's own depth scale (raw depth to map metres), its relative sigma and the
+    indices of the pairs that gave it."""
+
+    scale: float
+    sigma_rel: float
+    used: list[int]
+
+
+def pair_scale(index: int, ref: Features, other: Features, K: Intrinsics, o: Other,
+               depth: NDArray[np.float32], K_grid: Intrinsics) -> PairScale:
+    """One neighbour's measurement of a reference keyframe's scale (map.md §1 "Keyframe depth
+    scale"): the pair as frame analysis takes it (``pair``: refined on the images, triangulated
+    at the sent translation's length), qualifying when it triangulated at least
+    ``BASELINE_MIN_POINTS`` points below ``BASELINE_POINT_SIGMA_MAX`` with its refined rotation
+    consistent and σ_t / |t| within ``KEYFRAME_BASELINE_REL_MAX``; then the reference's raw
+    monocular ``depth`` (its grid, intrinsics ``K_grid``) fitted to its points
+    (``reconstruction.stereo.fit_scale``): the scale exp(a) with σ = hypot(σ_t / |t|, the fit's
+    standard error, its spread), the qualified scale's sigma of frame analysis."""
+    p = pair(index, ref, other, K, o)
+    if p.tri is None or p.status not in ("used", "baseline_short") \
+            or p.sigma_t_rel > KEYFRAME_BASELINE_REL_MAX:
+        return PairScale(index, p.status, points=p.points)
+    if p.points < BASELINE_MIN_POINTS:
+        return PairScale(index, "too_few_points", points=p.points)
+    ok = p.tri.ok
+    uv, _ = project(p.ra[ok], K_grid.K())
+    fit = fit_scale(sample(depth, uv), p.tri.z[ok], p.tri.sigma[ok])
+    if fit is None:
+        return PairScale(index, "too_few_points", points=p.points)
+    return PairScale(index, "used", math.exp(fit.a), math.hypot(p.sigma_t_rel, fit.sigma_a,
+                                                                fit.spread), p.points)
+
+
+def keyframe_scale(pairs: list[PairScale], k: float) -> KeyframeScale | None:
+    """A keyframe's scale from its neighbours' measurements (map.md §1 "Keyframe depth scale"):
+    the ``used`` pairs whose scale lies within ``KEYFRAME_SCALE_RANGE`` of the map's monocular
+    scale ``k`` (beyond any monocular frame's spread: a pair of false matches); of those, the
+    ones within ``KEYFRAME_AGREE_K`` of their own sigmas of the pairs' weighted median in ln
+    scale; more than half must agree (two pairs both), else the pairs contradict each other and there is no
+    measurement. The scale is the agreeing pairs' inverse-variance mean in ln scale, its sigma
+    the largest of their smallest sigma and their weighted spread: never less than the best
+    pair's, since the pairs share the keyframe's depth and the odometry's scale. None without a
+    qualifying pair."""
+    good = [p for p in pairs if p.status == "used" and p.scale is not None
+            and p.sigma_rel is not None
+            and KEYFRAME_SCALE_RANGE[0] * k <= p.scale <= KEYFRAME_SCALE_RANGE[1] * k]
+    if not good:
+        return None
+    ls = np.log(np.array([p.scale for p in good], np.float64))
+    sg = np.array([p.sigma_rel for p in good], np.float64)
+    w = 1.0 / sg ** 2
+    order = np.argsort(ls)
+    cum = np.cumsum(w[order])
+    med = float(ls[order][int(np.searchsorted(cum, 0.5 * cum[-1]))])
+    keep = np.abs(ls - med) <= KEYFRAME_AGREE_K * sg
+    if 2 * int(keep.sum()) <= len(good):
+        return None
+    lk, sk, wk = ls[keep], sg[keep], w[keep]
+    mean = float((wk * lk).sum() / wk.sum())
+    spread = math.sqrt(float((wk * (lk - mean) ** 2).sum() / wk.sum()))
+    return KeyframeScale(math.exp(mean), max(float(sk.min()), spread),
+                         [p.index for p, kept in zip(good, keep, strict=True) if kept])

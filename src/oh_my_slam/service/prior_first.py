@@ -474,10 +474,25 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     # a registered or provisional monocular frame the floor check did not judge (map.md §2,
     # api.md §4 ``detail``, oms/2.5)
     detail = "floor_not_judged" if k is not None and k.floor_unjudged else pl.detail
-    return input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
-                     pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, detail,
-                     _depth_scale(am, pl), sent_residual(pl.T, fr.work.prior, fr.work.trust),
-                     pl.inlier_floor_share)
+    row = input_row(fr.work.name, pl.status, pl.reason, pl.inliers, pl.T, pl.sigma_pos_m,
+                    pl.sigma_rot_deg, res, pl.scene_m, pl.duplicate_of, detail,
+                    _depth_scale(am, pl), sent_residual(pl.T, fr.work.prior, fr.work.trust),
+                    pl.inlier_floor_share)
+    got = stereo_scale(k)
+    if got is not None:
+        row["stereo_scale"] = got
+    return row
+
+
+def stereo_scale(k: Keyframe | None) -> dict[str, Any] | None:
+    """A keyframe's ``stereo_scale`` (api.md §4, oms/2.14): its own monocular depth scale by
+    motion stereo (map.md §1 "Keyframe depth scale"), its relative sigma, the neighbours it was
+    measured against and whether it decided the floor check (``Keyframe.stereo_judged``); None
+    without a measurement."""
+    if k is None or k.stereo_scale is None or k.stereo_sigma is None:
+        return None
+    return {"scale": round(k.stereo_scale, 5), "sigma_rel": round(k.stereo_sigma, 5),
+            "neighbours": list(k.stereo_pairs or []), "judged": k.stereo_judged}
 
 
 def sent_residual(T: Any, prior: dict[str, Any] | None, trust: str | None

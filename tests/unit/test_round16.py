@@ -620,11 +620,13 @@ def _behind_map(c: Client, name: str, u_scale: float) -> tuple[dict[str, Any], d
 
 
 def test_the_service_withholds_an_unjudged_frames_content_but_not_its_stand(
-        client: Client) -> None:  # noqa: F811
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
     """P29b, prior-first engine: the unjudged frame ``s3`` keeps its registration and pose, is no
     rejection and is not in ``floor_inconsistent``, but its version row has no content: it gives
     no occupancy, no free space from its depth, no floor seen; it still marks free-by-rule cells
-    (its stand). A dry run predicts the same quality as the job."""
+    (its stand). A dry run predicts the same quality as the job. Its own depth scale is not
+    measured here (oms/2.14: as without a baseline; the next test measures it)."""
+    monkeypatch.setattr(AnchoredMap, "_measure_scales", lambda self: set())
     d, job = _behind_map(client, "m", 0.5)
     _, ctrl = _behind_map(client, "c", 1.0)
     assert job["state"] == ctrl["state"] == "committed"
@@ -653,6 +655,27 @@ def test_the_service_withholds_an_unjudged_frames_content_but_not_its_stand(
     r, col = int((rec["s3"]["T_map_cam"][1][3] - oy) / g["cell_m"]), \
         int((rec["s3"]["T_map_cam"][0][3] - ox) / g["cell_m"])
     assert state[r, col] == 1 and seen[r, col] == 2  # free by rule, floor not seen
+
+
+def test_a_measured_scale_judges_the_frame_beyond_the_bound(client: Client) -> None:  # noqa: F811
+    """oms/2.14 (map.md §1 "Keyframe depth scale", §2 Floor check): ``s3``'s depth at half the
+    truth puts its floor-check scale 2 x k, beyond the bound; its motion stereo against the
+    turning frames 0.9 m ahead (metric priors 0.02 m) measures 2 x k too, so it is judged about
+    that scale: ``depth_scale`` and content, ``stereo_scale.judged``; its registration is the
+    unjudged frame's. The dry run predicts the measurement."""
+    d, job = _behind_map(client, "m", 0.5)
+    assert job["state"] == "committed"
+    rows = {i["name"]: i for i in job["inputs"]}
+    s3 = rows["s3"]
+    assert s3["status"] == "registered" and s3["detail"] is None and "depth_scale" in s3
+    st = s3["stereo_scale"]
+    assert st["judged"] is True and st["sigma_rel"] < 0.3 and st["neighbours"]
+    assert st["scale"] == pytest.approx(s3["depth_scale"], rel=0.3)
+    assert all(rows[n]["stereo_scale"]["judged"] is False for n in ("s0", "s1", "s2"))
+    pred = {f["name"]: f for f in d["frames"]}
+    assert pred["s3"]["stereo_scale"]["judged"] is True
+    rec = {f["name"]: f for f in client.service.store.version("m")["frames"]}
+    assert rec["s3"]["content"] and not rec["s3"]["floor_inconsistent"]
 
 
 def test_input_rows_carry_detail_by_status() -> None:

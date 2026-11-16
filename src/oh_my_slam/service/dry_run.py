@@ -80,6 +80,7 @@ from oh_my_slam.service.prior_first import (
     frame_class,
     job_drift_correction,
     none_engine,
+    stereo_scale,
     without_ignored,
 )
 
@@ -157,6 +158,11 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                 earlier.append((fr.work.name, fr.work.camera_id, T,
                                 functools.partial(feats.get, fr.work.index)))
         for fr, (row, pl, _) in zip(frames, rows, strict=True):
+            # the keyframe's own depth scale the update would measure (oms/2.14)
+            ss = None if am is None or pl is None or pl.keyframe is None \
+                or row["predicted_status"] == "rejected" else stereo_scale(am.keyframe(pl.keyframe))
+            if ss is not None:
+                row["stereo_scale"] = ss
             if row["predicted_status"] != "rejected":
                 kept.append((row["predicted_status"], pl))
                 if pl is not None and pl.T is not None and fr.work.trust == "metric":

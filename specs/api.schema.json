@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.13. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
+  "description": "Schema version oms/2.14. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -470,6 +470,10 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "oms/2.4. Present when a per-frame depth scale was applied to the frame's monocular depth (map.md section 2, floor check): the factor applied to its raw depth, in map metres, k x H / h_f, in place of the map's scale. Absent otherwise, also for a frame the floor check did not judge (detail floor_not_judged)."
+        },
+        "stereo_scale": {
+          "$ref": "#/$defs/StereoScale",
+          "description": "oms/2.14. Present when the frame's keyframe is monocular, image-confirmed and its own depth scale was measured by motion stereo at the end of this job (map.md section 1, Keyframe depth scale). Absent otherwise: no neighbour keyframe with a usable baseline (a turning look before the robot's first straight move), pairs that disagree, or a depth image."
         },
         "min_distance_m": {
           "type": "number",
@@ -1321,6 +1325,10 @@
         "duplicate_of": {
           "type": "string",
           "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior. Kept even if the partner ends differently when the fixed point is re-run (at most once per job)."
+        },
+        "stereo_scale": {
+          "$ref": "#/$defs/StereoScale",
+          "description": "oms/2.14. The keyframe depth scale the update would measure for this frame (as in inputs[]); absent when it would measure none."
         }
       },
       "allOf": [
@@ -3488,6 +3496,39 @@
           ]
         }
       }
+    },
+    "StereoScale": {
+      "type": "object",
+      "required": [
+        "scale",
+        "sigma_rel",
+        "neighbours",
+        "judged"
+      ],
+      "properties": {
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "The keyframe's own monocular depth scale measured by motion stereo against its neighbour keyframes (map.md section 1, Keyframe depth scale): the factor from its raw depth to map metres, comparable to depth_scale."
+        },
+        "sigma_rel": {
+          "type": "number",
+          "minimum": 0,
+          "description": "One relative sigma of scale: at least the best agreeing pair's hypot(sigma_t / |t|, the fit's standard error, its spread), and at least the agreeing pairs' weighted spread in ln scale."
+        },
+        "neighbours": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of the neighbour keyframes whose pairs gave the scale (relative translation from the two priors as sent)."
+        },
+        "judged": {
+          "type": "boolean",
+          "description": "Whether the floor check judged the frame only about this scale: its own floor-check scale lay beyond the monocular scale bound about the map's k but within it about this measured scale, confidently measured (sigma_rel below the bound), so its content is given at its floor-check scale (depth_scale) instead of being withheld as floor_not_judged."
+        }
+      },
+      "description": "oms/2.14. A monocular keyframe's own depth scale by motion stereo (map.md section 1, Keyframe depth scale). It decides the floor check of a frame the check did not judge about the map's k; it never changes registration (the keyframe's depth lifts later frames at the map's k as before)."
     }
   }
 }

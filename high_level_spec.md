@@ -248,6 +248,16 @@ outputs drop them afterwards; only keypoint extraction sees them filled, and the
 region's border is a depth edge for a range-scan beam's support (map.md §2, Ignored pixels;
 api.md §7, Unsupported beams).
 
+**oms/2.14** is additive: a monocular keyframe's own depth scale is measured by motion stereo
+against neighbour keyframes, the relative translation taken from the two priors as sent with a
+sigma that covers the odometry's error over the move, its scale and a client fix between them
+(map.md §1, Keyframe depth scale). A confident measurement decides the floor check of a frame
+the check did not judge about k: when its floor agrees with the measured scale, the frame is
+judged and gives its content at its floor-check scale (map.md §2, Floor check). It changes no
+registration: lifting at the measured scale was replayed and refused. New optional fields: the
+input status's and the dry run frame's `stereo_scale` `{scale, sigma_rel, neighbours, judged}`
+(api.md §4).
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

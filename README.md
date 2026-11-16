@@ -31,7 +31,7 @@ Model weights are downloaded on the first start of the inference server:
 
 ## The service (`server.sh`, `oh_my_slam.service`)
 
-The HTTP API of `specs/api.md` (schema oms/2.13) for the robot-guide skill. Implemented so far
+The HTTP API of `specs/api.md` (schema oms/2.14) for the robot-guide skill. Implemented so far
 (`/api/health → capabilities`): **O1** (anchored map frame and priors), **O2** (versions
 list, revert and retention: *Versions and revert*, below), **O3-jobs**
 (asynchronous jobs: 202, then poll; no provisional phase, cancel or lanes), **O4** (per-input
@@ -84,7 +84,7 @@ they need. New maps take the *prior-first registration* (below).
   `routes.ENDPOINTS` defines them once: the router and `/api/openapi.json` (OpenAPI 3.1, its
   `components.schemas` the `$defs` of `specs/api.schema.json`) both derive from it.
 * **Bodies.** Every request body is validated against `api.schema.json` (the package copy,
-  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.13; a test checks
+  `src/oh_my_slam/service/api.schema.json`, equals `specs/api.schema.json`, oms/2.14; a test checks
   it), and the tests validate every response body against it. Errors are `ErrorBody`
   (`{schema, error: {code, message, retryable, details}}`); `details.field` names the failing
   field. An unknown route or method is `invalid_request` with HTTP 404 or 405.
@@ -1510,7 +1510,7 @@ at the prior (11 / 2 / 11 / 21 / 17; one fallback; the centre sigma grows honest
 the j5 and j6 laps lose poses). The pre-52f3fed inpainting may itself have caused part of the
 unjudged flags and the scale spread; round 4 (on 52f3fed) will tell.
 
-*Design note, not implemented: a keyframe's own scale by motion stereo.* The common root of the
+*Design note (oms/2.14 implements the measurement and its floor-check use, not the lifting: below): a keyframe's own scale by motion stereo.* The common root of the
 e205/e305 failures and the j-series fragility is a monocular keyframe depth scale spreading
 0.5-2 × about the map's k, while the camera-height k and the per-frame floor-check scale are
 least reliable on the frames that matter. Each keyframe could measure its own scale against its
@@ -1552,6 +1552,98 @@ k000036); k000009 at (−0.07, 0.81) against truth (−0.07, 0.73). The far side
 on) is placed over 1 m from truth by the odometry's heading drift (k000027: placed (1.27, 1.92),
 truth (2.60, 0.42)), beyond its candidates. j5: look 8 of 8, lap 24 of 31; j3's lap frames are not
 placed on the start spot (fixtures `tests/data/aliasing/j6_*`).
+
+### Keyframe depth scale by motion stereo (oms/2.14)
+
+map.md §1 "Keyframe depth scale" and §2 Floor check; `AnchoredMap._measure_scales` (at
+`end_job`, after the pose-duplicate pass, before the fusion), `_scale_neighbours`,
+`_measure_scale`, `_odo_sigma_rel`, `_near`; `mapping.motion.pair_scale` and `keyframe_scale`;
+`Keyframe.stereo_scale` / `stereo_sigma` / `stereo_pairs` / `stereo_judged` in `state.json`
+(absent on older maps: none, as before); input status and dry run `stereo_scale`
+(`service.prior_first.stereo_scale`).
+
+Decisions:
+
+* **Baseline from the priors only.** The image-registered relative pose to a neighbour has the
+  length the neighbour's lifted depth gave it (k for every monocular keyframe): triangulating
+  over it re-measures that lifting, the alignment registration already applies. Only the
+  priors' relative translation is independent of every keyframe's depth, so the measurement uses
+  the two priors as sent (a drifting pair in map metres through `Drift.odo_scale`), never a
+  committed pose: no feedback from the scale to its own measurement, and a job's outcome is
+  order-independent. A first try with pairs chosen by distance alone (any two keyframes of a
+  map) gave scales from 0.02 to 40 × k on e305 and j6: the relative error of two priors is the
+  odometry's error over the travel between them, so pairs are limited to keyframes near in
+  the order of addition.
+* **Relative translation sigma** (drifting): hypot(hypot(`DRIFT_POS_REL` 0.10, σ_odo) × |t|,
+  `KEYFRAME_BASELINE_SIGMA_MIN_M` **0.03 m**, sqrt(|σ_a² − σ_b²|)); metric: hypot(σ_a, σ_b).
+  σ_odo: 0 without a drift correction, 0.10 below 3 odometry-scale baselines, else their
+  1.4826 MAD in ln ratio / √n (e305's final value: 0.21, which excludes its forward pairs).
+  The sqrt(|σ_a² − σ_b²|) term rejects pairs across a client fix (e305's live sigmas jump
+  0.14-0.5 between views).
+* Constants: `KEYFRAME_PAIR_MAX_GAP` **4**, `KEYFRAME_PAIR_MAX_DEG` **60°**,
+  `KEYFRAME_BASELINE_REL_MAX` **0.20**, `KEYFRAME_SCALE_PAIRS` **4**, `KEYFRAME_SCALE_RANGE`
+  **⅓-3 × k**, `KEYFRAME_AGREE_K` **3**; per pair `BASELINE_MIN_POINTS` 30 and
+  `BASELINE_POINT_SIGMA_MAX` 0.25 (oms/2.11). Confident: sigma below `MONO_FLOOR_BOUND_REL` 0.30.
+* **Floor check only.** A confident scale judges a job keyframe the check did not judge about k
+  when its floor-check scale lies within the bound of it; content at the floor-check scale
+  (sigma: the sent height's). The keyframe keeps its unjudged registration role (lifted at k for
+  pose only, no alignment, confirmation or scale evidence, no depth in locate). The measurement
+  never un-judges a frame (that frame's camera-height evidence is already in k).
+* **Lifting at the measured scale: tried, refused.** Replayed (keyframes registered, all):
+
+  | Variant | e305 | e205 | j3 | j5 | j6 |
+  | --- | --- | --- | --- | --- | --- |
+  | eb51509 (baseline) | 11/22 | 2/21 | 10/25 | 33/40 | 19/39 |
+  | lift at measured, any pair gap, half agreeing | 11 | 2 | 10 | 22 | 21 |
+  | lift at measured, gap 4, σ_odo and fix terms, more than half agreeing | 11 | 2 | 10 | 18 | 17 |
+  | **shipped: measure, report, judge the floor check** | **11** | **2** | **10** | **33** | **19** |
+
+  The corridor keyframes of j5/j6 measure 1.2-1.7 × k (agreeing with their floor checks), and
+  lifting them there broke the laps at k000018 (j5) and the corridor's end (j6): the map's poses
+  and the odometry scale were built at k, and references at two scales disagree. The cause of
+  e305's look failures (a camera turning in place on unjudged references) is untouched: a turning
+  look has no baseline (prior steps of 4-16 cm across 17-109° turns, and the client fixes
+  between them), so its keyframes carry no measurement.
+
+Replay (one keyframe per job, stored images, depths, masks and sent priors, through
+`AnchoredMap.update`; looks are k0-k7):
+
+| Map | Registered before / after | Look before / after | Measured | Judged by stereo | Notes |
+| --- | --- | --- | --- | --- | --- |
+| e305 | 11/22 / 11/22 | 6 / 6 | 0 of 13 | 0 | look: no baseline; k11/k12, k20/k21 forward pairs refused by σ_odo 0.21 and a 0.30→0.50 sigma change |
+| e205 | 2/21 / 2/21 | 2 / 2 | 0 of 3 | 0 | |
+| j3 | 10/25 / 10/25 | 8 / 8 | 0 of 10 | 0 | start-spot aliases k11/k13 still kept at their priors |
+| j5 | 33/40 / 33/40 | 8 / 8 | 26 of 39 | 4 | corridor 1.1-1.7 × k (σ 0.14-0.19); lap 0.4-0.9 × k, disagreeing with the floor checks: not judged |
+| j6 | 19/39 / 19/39 | 8 / 8 | 12 of 21 | 5 | corridor 1.4-1.6 × k |
+
+Statuses and poses are identical to eb51509 on all five maps. On j5's lap the measured scales
+(0.4-0.9 × k, σ 0.15-0.23) disagree with the floor checks' 1.2-2 × k by more than their sigmas:
+the odometry scale there (fitted on the registrations) is suspect, and the reported sigma may be
+optimistic; the agreement rule makes such a measurement judge nothing. What remains: lifting at
+a measured scale once the map's poses and odometry scale can be re-estimated with it, and a
+baseline for turning looks (the camera's offset from the turn axis is a known baseline a client
+could send as a metric relative prior).
+
+Capture advice (from the rule and the replays):
+
+* **Straight move for a usable baseline.** Drifting priors 0.2 m / 5° sent with the same sigma on
+  both views: σ_t / |t| ≤ 0.20 needs |t| ≥ 0.17 m before any drift correction (σ_odo 0), 0.21 m
+  with σ_odo 0.10, 0.35 m with σ_odo 0.15, never beyond σ_odo 0.17; the rotation sigma only
+  bounds the image-refined rotation. Metric priors 0.05 m: |t| ≥ 0.35 m (σ_t 0.071 m). Each
+  pair also needs 30 well-triangulated points (a forward move's image centre has no parallax),
+  the views within 60° and 4 keyframes. Two keyframes along a move of 0.3-0.5 m each give every
+  keyframe two agreeing pairs. A depth-image (RGB-D) robot is never measured: its scale is its
+  sensor's.
+* **Batch or one per job.** A job's frames register over its match graph: a job frame counts as
+  an edge once registered, so a look sent as one batch chains through its own views (map.md §2,
+  Match graph), and the scale measurement pairs job keyframes with each other and with stored
+  ones alike (it reads priors, not poses). One keyframe per job adds nothing to either.
+* **Turn step.** No step guarantees registration: it needs 15 PnP inliers and a fit that is not
+  loose, and a view registers only against registered references, so one failed view doubles
+  the next one's gap (e205: the first step of 67° failed, and every later look view was then
+  ≥ 87° from the one reference). Replayed looks of 35-50° steps registered 8/8 (j3, j5, j6);
+  e305's 17-38° steps failed on scale (sliding fits), not on overlap. Keep steps at or below
+  ~40° (≥ 60 % overlap at a 100° hfov), and send the first one smaller.
 
 ### Objects, surfaces and relations (O8)
 

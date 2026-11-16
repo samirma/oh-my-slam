@@ -134,7 +134,8 @@ error code `invalid_request` (§9).
   | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
-  | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's. Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
+  | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's; since oms/2.14 also for a frame judged about its measured scale (`stereo_scale.judged`). Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
+  | `stereo_scale` | Optional (oms/2.14). Present when the frame is an image-confirmed monocular keyframe with a `metric` or `drifting` prior whose own depth scale was measured by motion stereo at the job's end (map.md §1, Keyframe depth scale): `{scale, sigma_rel, neighbours, judged}`, `scale` the factor from its raw depth to map metres (comparable to `depth_scale`), `sigma_rel` its relative sigma, `neighbours` the names of the keyframes whose pairs gave it, `judged` whether it decided the floor check (map.md §2: the frame's own floor-check scale lay beyond the monocular bound about k but within it about this scale, so the frame has `depth_scale` and its content instead of `detail` `floor_not_judged`). Absent when nothing was measured: no neighbour within the pair limits (a turning look before the robot's first straight move; a move shorter than its translation sigma allows, map.md §1), pairs that disagree, or a depth image. It never changes the frame's registration or pose. |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `prior_residual_sent_m`, `prior_residual_sent_deg` | Optional (oms/2.13). The residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior **as sent**, before any drift estimate placed it; null without a prior or a pose. With `prior_residual_*` (against the prior as placed) and `quality.drift_correction`, a client separates what the drift estimate moved from what the images moved. |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the frame's image pose's inliers that are floor points (map.md §2, Texture-aliasing guards): near 1 when the pose rests on the floor's texture. Null when the frame has no points fit (no image pose, a rotation-only fit, the older mapper) or the map has no floor. |
@@ -334,7 +335,15 @@ error code `invalid_request` (§9).
   * the flags `plain` and `too_close`;
   * with `predicted_reason` `duplicate`: `duplicate_of`, as in `inputs[]`;
   * with `predicted_reason` `too_close`: `min_distance_m` and `scene_distance_m`, as in
-    `inputs[]`.
+    `inputs[]`;
+  * `stereo_scale` (oms/2.14): the keyframe depth scale the update would measure for the frame,
+    as in `inputs[]`, absent when it would measure none. A client reads it before it sends: a
+    monocular frame predicted `registered` without `stereo_scale` has no baseline yet, so its
+    depth keeps the map's k and, beyond the monocular bound, would be `floor_not_judged`; one
+    more straight move (map.md §1, Keyframe depth scale) gives it one. Whether a view will be
+    kept at its prior for lack of a baseline cannot be predicted beyond this: registration
+    depends on the matches, and its `predicted_status` and `predicted_reason` are the
+    prediction.
 
   It also gives a predicted `quality`, without fusion (`drift_correction` included, map.md §4),
   and `scale_source` and `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use
