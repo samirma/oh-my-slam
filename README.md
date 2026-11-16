@@ -1491,6 +1491,42 @@ from the start. The replay also found an endless recursion: a fit below the regi
 all off the floor, from a frame without depth of its own, was refitted on the same
 correspondences; a fit below the minimum after refinement is now no pose.
 
+`dev_ainex_e305` (round 3, cold start, live on c31e21d; replayed on 52f3fed, one keyframe per
+job): the opening look registers 6 of its 11 archived views (k000000-k000002, k000004-k000006;
+live it kept 4; 2 of the 12 views sent never reached the mapper). k000003, k000007, k000008 and
+k000010 have strong fits (k000003: 286 inliers) that land 0.9-1.1 m from the look spot along the
+camera's view, refused as loose (rotation sigma 2.1-3.5°): false fits, rightly refused, by no
+2.13 guard. Their references k000002, k000003, k000007 and k000008 are monocular keyframes the
+floor check did not judge (own scales 1.6-2 × k); lifted at k for the pose, a camera turning in
+place on one of them slides along its view by the scale error. The ambiguous locates, reproduced
+by locating the archived keyframe images on v22: k000005 located with a rival 1.23 m away at the
+same rotation, k000019 with rivals 0.45-0.63 m away at 6-9°, k000010 with one at 82°: the same
+view placed at two depths by reference groups whose monocular scales disagree, neither a texture
+alias nor a true second place (the 82° one is a direction alias of a weak floor fit). Tried and
+rejected by replay (keyframes registered, e305 / e205 / j3 / j5 / j6): lifting each monocular
+reference at its own floor-check scale (9 / 8 / 10 / 33 / 17 against 11 / 2 / 10 / 32 / 19),
+and freeing an unjudged reference's depth scale in the refinement with a rotation-only fallback
+at the prior (11 / 2 / 11 / 21 / 17; one fallback; the centre sigma grows honestly, which is why
+the j5 and j6 laps lose poses). The pre-52f3fed inpainting may itself have caused part of the
+unjudged flags and the scale spread; round 4 (on 52f3fed) will tell.
+
+*Design note, not implemented: a keyframe's own scale by motion stereo.* The common root of the
+e205/e305 failures and the j-series fragility is a monocular keyframe depth scale spreading
+0.5-2 × about the map's k, while the camera-height k and the per-frame floor-check scale are
+least reliable on the frames that matter. Each keyframe could measure its own scale against its
+registered neighbours with a known baseline (the drifting priors' relative translation through
+the drift estimate, or better the image-registered relative pose to a keyframe whose scale is
+established): triangulate the shared features over that baseline with the oms/2.11 machinery
+(rotation refinement, triangulation, `baseline` scale source, per-pixel depth sigma) and fit the
+keyframe's monocular depth to the triangulated points, a scale with a sigma. That scale, not k,
+would lift the keyframe for later frames' pose fits, set its floor ratio and decide "floor not
+judged" (a confidently measured scale beyond the bound is real, not a bad floor plane). A turning
+look has almost no baseline and keeps k until the first translation: lift at the measured scale
+when its sigma lies below the monocular bound, else at k, never at an unmeasured out-of-bound
+scale. Cost: one triangulation per new keyframe against a few neighbours, no model call; the
+scale is measured from poses it influences, so its update needs care. Validation: replays of j3,
+j5, j6, e205 and e305, and ground-truth containment on j6 and e115-like truths.
+
 Regression fixed on `dev_ainex_j6` (one keyframe per job, drifting priors, an arm ignore mask;
 replayed the same way with the stored images, depths, masks and sent priors): the look
 registered 6 of 8 views and the lap 1 of 31 (k000008). Causes:
