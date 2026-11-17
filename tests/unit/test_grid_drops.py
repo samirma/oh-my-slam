@@ -396,9 +396,11 @@ def test_a_drop_bounds_regions_but_is_no_jamb() -> None:
     frontier along them. A door in a real wall beside a drop is still found."""
     st = np.zeros((140, 140), np.uint8)
     st[20:120, 20:120] = ng.OCCUPIED
-    st[50:90, 60:82] = ng.FREE
-    walls = ng.features(_grid(st, 0.05, floor=1))  # chords across it, as along a corridor
-    assert walls.passages and len(walls.regions) == len(walls.passages) + 1
+    st[40:100, 60:82] = ng.FREE  # 3 m long: two places of POCKET_M2 at least as walls
+    walls = ng.features(_grid(st, 0.05, floor=1))
+    assert len(walls.passages) == 1 and len(walls.regions) == 2
+    st[40:50, 60:82] = st[90:100, 60:82] = ng.OCCUPIED  # 2 m: its halves are pockets
+    assert ng.features(_grid(st, 0.05, floor=1)).passages == []
     lay = _grid(st, 0.05, floor=1)
     lay.floor_observed[st == ng.OCCUPIED] = ng.FLOOR_DROP
     drops = ng.features(lay)

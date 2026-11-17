@@ -576,27 +576,40 @@ def test_a_chord_separates_only_when_it_cuts_the_free_space_locally() -> None:
     free = st == ng.FREE
     none = np.zeros(st.shape, np.uint8)
     across = (30.0, np.array([60.0, 35.0]), np.array([60.0, 65.0]), None, None)
-    assert ng._separates(free, none, across, 0.05) is True
+    assert ng._separates(free, none, across, 0.05) == "cuts"
     beside = (30.0, np.array([59.0, 35.0]), np.array([59.0, 65.0]), None, None)
     drawn = none.copy()
     ng._draw(drawn, across[1], across[2])
-    assert ng._separates(free, drawn, beside, 0.05) is None  # the rooms were apart already
+    assert ng._separates(free, drawn, beside, 0.05) == "beside"  # the rooms were apart already
     other = st.copy()
     other[75:85, 59:61] = ng.FREE  # a second gap 1.5 m away: one region still
-    assert ng._separates(other == ng.FREE, none, across, 0.05) is False
+    assert ng._separates(other == ng.FREE, none, across, 0.05) == "no"
     along = (10.0, np.array([58.0, 10.0]), np.array([58.0, 20.0]), None, None)
-    assert ng._separates(free, none, along, 0.05) is False  # no region on the wall's side
-    # chords that cut nothing alone, together: kept unless crossing a cut one, beside one,
-    # within a pocket or repeating an earlier one
+    assert ng._separates(free, none, along, 0.05) == "no"  # no region on the wall's side
+    # chords that cut nothing alone, together: kept unless crossing a cut one, beside one or
+    # repeating an earlier one
     gap2 = (10.0, np.array([60.0, 75.0]), np.array([60.0, 85.0]), None, None)
     assert len(ng._together(other == ng.FREE, [], [across, gap2, across], 0.05)) == 2
     cross = (10.0, np.array([55.0, 50.0]), np.array([65.0, 50.0]), None, None)
     assert ng._together(free, [across], [cross, beside], 0.05) == []
-    pocket = st.copy()
-    pocket[6:20, 6:22] = ng.OCCUPIED
-    pocket[12:14, 11:17] = ng.FREE  # a hole inside a block
-    inner = (1.0, np.array([14.5, 12.0]), np.array([14.5, 14.0]), None, None)
-    assert ng._together(pocket == ng.FREE, [], [inner], 0.05) == []
+
+
+def test_a_chord_that_cuts_off_a_niche_bounds_a_pocket() -> None:
+    """A 0.5 m by 0.75 m niche off a room: the chord across its mouth cuts off less than
+    POCKET_M2 (a pocket: it suppresses the chords beside it, kept for features' test), and the
+    niche is merged back into the room, the chord dropped."""
+    st = np.zeros((60, 60), np.uint8)
+    st[5:55, 5:55] = ng.FREE
+    st[5:20, 20:40] = ng.OCCUPIED
+    st[5:20, 25:35] = ng.FREE  # the niche, open at the bottom
+    free = st == ng.FREE
+    mouth = (10.0, np.array([25.0, 19.5]), np.array([35.0, 19.5]), None, None)
+    assert ng._separates(free, np.zeros(st.shape, np.uint8), mouth, 0.05) == "pocket"
+    assert ng._pockets(free, [mouth], 0.05) == []
+    st[30:46, 10:26] = ng.OCCUPIED
+    st[31:45, 11:25] = ng.FREE  # a closed hole: a pocket no chord bounds stays
+    assert ng._pockets(st == ng.FREE, [], 0.05) == []
+    assert len(ng.features(_grid(st, 0.05)).regions) == 2
 
 
 def test_a_door_whose_chords_cut_nothing_alone_keeps_the_rules_pick() -> None:

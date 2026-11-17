@@ -1298,7 +1298,8 @@ seen there.
   side, that a robot can drive through. A chord counts as a passage only when it cuts the free
   space: a chord with free space connecting its two sides beside it (around an isolated speck or
   a blob grown on a jamb) neither is a passage nor hides another chord of the same gap that
-  does cut it. Each has:
+  does cut it; nor does a chord that only cuts off a pocket, a part smaller than a place of its
+  own (README), which stays part of its neighbour. Each has:
   * `jambs_m`, the two end points of the free gap at floor level;
   * `centre_m`, the midpoint of the free gap between the jambs. It is not the midpoint of the
     door frame, nor of the open leaves' free ends;
