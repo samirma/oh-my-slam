@@ -1299,12 +1299,19 @@ seen there.
   space: a chord with free space connecting its two sides beside it (around an isolated speck or
   a blob grown on a jamb) neither is a passage nor hides another chord of the same gap that
   does cut it; nor does a chord that only cuts off a pocket, a part smaller than a place of its
-  own (README), which stays part of its neighbour. Each has:
+  own (README), which stays part of its neighbour. **Doorways:** a door object's chord is the
+  best-ranked chord near it that cuts the free space; else the shortest one of a door's width,
+  or in a wall, that cuts it; else its best chord by the rules alone, judged with the other
+  chords that cut nothing alone. A door object needs no chord of its own when a chord already
+  found passes within 0.6 m of it: one that cuts, one that cuts off a pocket, or an earlier door
+  object's fallback. Each has:
   * `jambs_m`, the two end points of the free gap at floor level;
   * `centre_m`, the midpoint of the free gap between the jambs. It is not the midpoint of the
     door frame, nor of the open leaves' free ends;
   * `width_m`, the clear width between the jambs: the free width at the narrowest point within
-    the height band, with open leaves counted as obstacles;
+    the height band, with open leaves counted as obstacles. An isolated speck of occupied cells
+    on the chord (a chair leg perhaps) does not end the chord, but it narrows the width: the
+    width is the longest free run along the chord;
   * `normal_deg`, the crossing direction: perpendicular to the jamb line, from `regions[0]` to
     `regions[1]` (or toward the unobserved side);
   * `regions [a, b]`, or `[a, null]` for a doorway whose far side was never observed;

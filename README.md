@@ -2533,8 +2533,9 @@ server.
 * **A chord must cut the free space** (`navgrid._separates`; bug fix, no API change). Each
   chord (plain, after narrowing, or a door's) is cut together with the chords kept before it and
   judged within 3 m of its midpoint (`SEPARATE_M`), its sides voted as `features` votes (the
-  commonest region 1–3 cells off its midpoint each side). *no*: its sides still connect (or one
-  has no region): not kept, suppresses no other chord of the gap; *beside*: they were apart
+  commonest region 1–3 cells off its midpoint each side). *no*: its sides still connect, or one
+  side has no part of 0.25 m² (`MIN_REGION_M2`) beside its midpoint: not kept, suppresses no
+  other chord of the gap; *beside*: they were apart
   already (a chord beside a kept one): dropped; *pocket*: it cuts off less than 1 m²
   (`POCKET_M2`) on a side: suppresses the chords beside it as before and goes to the global test;
   *cuts*: kept. 3 m holds the detour around an obstacle beside a gap (within a door's width,
@@ -2542,10 +2543,13 @@ server.
   doorways before they are cut; chords that cut only together (two doorways nearer than 3 m)
   still go to the global test unless they cross a kept chord or lie beside one (`_together`). A
   door object takes the best-ranked chord that cuts, else the shortest of a door's width or
-  walled that cuts, else its old pick for the global test. **Specks** (`navgrid._specks`):
+  walled that cuts, else its old pick for the global test, unless its midpoint lies within
+  0.3 m of a cut chord's; no door object gets a chord when one already found (cut, a pocket's,
+  or an earlier door's fallback) passes within 0.6 m of it. **Specks** (`navgrid._specks`):
   8-connected occupied pieces under 0.05 m² (as `DROP_MIN_M2`) with only free cells around them
   count as free in the chord search — no chord ends on one, none is wall evidence — and stay
-  obstacles for the regions.
+  obstacles for the regions and for `width_m`: the longest free run along the chord
+  (`navgrid._blocked`, sampled every quarter cell), so a chair leg in a doorway still narrows it.
 * **Pockets** (`navgrid._pockets`). A region under 1 m² (`POCKET_M2`) that a chord bounds is
   merged, smallest first, into its smallest neighbour across one of its chords, that chord
   dropped, until none is left: a niche, a corner or a slice of a corridor is no place of its own

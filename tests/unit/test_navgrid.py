@@ -250,7 +250,7 @@ def test_a_chord_screened_in_but_not_walled_exactly(monkeypatch: pytest.MonkeyPa
     st[16:24, 34:36] = 1
     assert len(ng._passage_chords(st, 0.1)[0]) == 1
     monkeypatch.setattr(ng, "_walled", lambda *a: False)
-    assert ng._passage_chords(st, 0.1) == ([], [])
+    assert ng._passage_chords(st, 0.1) == ([], [], [])
 
 
 def test_an_obstacle_beside_the_wall_narrows_the_passage() -> None:
@@ -260,7 +260,7 @@ def test_an_obstacle_beside_the_wall_narrows_the_passage() -> None:
     st[5:35, 34:36] = 2
     st[16:24, 34:36] = 1
     st[22:24, 36:44] = 2  # a leaf along the wall, beside the gap's upper jamb
-    (ch,), _ = ng._passage_chords(st, 0.1)
+    (ch,), _, _ = ng._passage_chords(st, 0.1)
     assert ch[0] < 8.0 - 1e-6
     assert float(np.linalg.norm(ch[2] - ch[1])) == pytest.approx(ch[0])
 
@@ -620,3 +620,58 @@ def test_a_door_whose_chords_cut_nothing_alone_keeps_the_rules_pick() -> None:
     st[75:85, 59:61] = ng.FREE
     f = ng.features(_grid(st, 0.05), 0.15, [(3.0, 2.5)])
     assert len(f.regions) == 2 and len(f.passages) == 2
+
+
+def test_a_speck_on_the_chord_narrows_the_width() -> None:
+    """A one-cell speck (a chair leg, perhaps) on the line of a 1.5 m doorway: the chord still
+    ends on the jambs, but the width is the longest free run along it (map.md §6)."""
+    st = _doorway()
+    st[50, 59] = ng.OCCUPIED
+    (p,) = ng.features(_grid(st, 0.05)).passages
+    assert 0.7 <= p.width <= 0.85
+    assert sorted(round(float(j[1]), 2) for j in p.jambs) == pytest.approx([1.73, 3.28], abs=0.03)
+    line = np.full((3, 12), ng.FREE, np.uint8)
+    e1, e2 = np.array([0.0, 1.5]), np.array([12.0, 1.5])
+    assert ng._blocked(line, e1, e2) == pytest.approx(0.0)
+    line[1, 3] = ng.OCCUPIED
+    assert ng._blocked(line, e1, e2) == pytest.approx(4.0)  # 8 cells free beyond it
+
+
+def test_door_objects_beside_chords_already_found() -> None:
+    """A door object within 0.6 m of a pocket's chord gets no chord of its own; a door's fallback chord within NMS_M of a cut
+    chord is not repeated."""
+    st = _doorway()
+    lay, free = _grid(st, 0.05), st == ng.FREE
+    across = (30.0, np.array([60.0, 35.0]), np.array([60.0, 65.0]), None, None)
+    picked, _ = ng._door_chords(st, lay, [], [(3.0, 2.5)], free)
+    assert len(picked) == 1
+    assert ng._door_chords(st, lay, [], [(3.0, 2.5)], free, [across]) == ([], [])
+    # 0.7 m from the cut chord: searched, nothing more cuts, its fallback repeats the chord
+    assert ng._door_chords(st, lay, [across], [(2.3, 2.5)], free) == ([], [])
+    assert len(ng._door_chords(st, lay, [], [(2.3, 2.5)], free)[0]) == 1
+
+
+@pytest.mark.parametrize(("rows", "width"), [((35, 65), 1.55), ((40, 60), 1.05)])
+def test_a_door_seen_without_its_wall_line_takes_the_shortest_chord_that_cuts(
+        monkeypatch: pytest.MonkeyPatch, rows: tuple[int, int], width: float) -> None:
+    """No chord near the door lies in its wall line: the shortest one that cuts the free space,
+    of a door's width (1.0 m gap) or in a wall (1.5 m gap)."""
+    st = _doorway()
+    st[35:65, 59:61] = ng.OCCUPIED
+    st[rows[0]:rows[1], 59:61] = ng.FREE
+    monkeypatch.setattr(ng, "_door_walled", lambda *a: None)
+    picked, rest = ng._door_chords(st, _grid(st, 0.05), [], [(3.0, 2.5)], st == ng.FREE)
+    assert len(picked) == 1 and rest == []
+    assert (picked[0][0] + 1) * 0.05 == pytest.approx(width, abs=0.06)
+
+
+def test_pockets_merge_smallest_first_into_the_smallest_neighbour() -> None:
+    """A room, then along a 1 m wide dead end a 0.35 m² part, then a 0.65 m² one: the smallest
+    goes first, into its smaller neighbour (the 0.65 m² part, not the room); together they make
+    1 m², a place, and keep the chord to the room."""
+    st = np.zeros((60, 70), np.uint8)
+    st[2:58, 2:40] = ng.FREE
+    st[20:40, 40:62] = ng.FREE
+    c1 = (20.0, np.array([40.5, 20.0]), np.array([40.5, 40.0]), None, None)
+    c2 = (20.0, np.array([48.5, 20.0]), np.array([48.5, 40.0]), None, None)
+    assert ng._pockets(st == ng.FREE, [c1, c2], 0.05) == [c1]
