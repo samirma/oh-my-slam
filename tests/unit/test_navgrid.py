@@ -248,9 +248,9 @@ def test_a_chord_screened_in_but_not_walled_exactly(monkeypatch: pytest.MonkeyPa
     st[5:35, 36:68] = 1
     st[5:35, 34:36] = 2
     st[16:24, 34:36] = 1
-    assert len(ng._passage_chords(st, 0.1)) == 1
+    assert len(ng._passage_chords(st, 0.1)[0]) == 1
     monkeypatch.setattr(ng, "_walled", lambda *a: False)
-    assert ng._passage_chords(st, 0.1) == []
+    assert ng._passage_chords(st, 0.1) == ([], [])
 
 
 def test_an_obstacle_beside_the_wall_narrows_the_passage() -> None:
@@ -260,7 +260,7 @@ def test_an_obstacle_beside_the_wall_narrows_the_passage() -> None:
     st[5:35, 34:36] = 2
     st[16:24, 34:36] = 1
     st[22:24, 36:44] = 2  # a leaf along the wall, beside the gap's upper jamb
-    (ch,) = ng._passage_chords(st, 0.1)
+    (ch,), _ = ng._passage_chords(st, 0.1)
     assert ch[0] < 8.0 - 1e-6
     assert float(np.linalg.norm(ch[2] - ch[1])) == pytest.approx(ch[0])
 
@@ -526,3 +526,84 @@ def test_a_gap_between_two_sides_of_one_region_is_no_passage() -> None:
     st[16:24, 34:36] = 1
     f = ng.features(_grid(st))
     assert len(f.regions) == 1 and f.passages == []
+
+
+def _doorway(cell: float = 0.05) -> np.ndarray:
+    """Two 2.85 m by 4.8 m rooms, the wall between them (x 2.95-3.05) with a 1.5 m gap
+    (y 1.75-3.25), at 5 cm cells."""
+    st = np.zeros((100, 120), np.uint8)
+    st[2:98, 2:118] = ng.FREE
+    st[2:98, 59:61] = ng.OCCUPIED
+    st[35:65, 59:61] = ng.FREE
+    return st
+
+
+@pytest.mark.parametrize("doors", [[], [(3.0, 2.5)]])
+def test_a_doorway_whose_jamb_grows_a_blob_and_specks_stays_a_passage(doors: list) -> None:
+    """A later version sees a blob grown on the lower jamb into room B, and one-cell specks of
+    depth noise in the gap: the chords that end on specks, or leave free space beside them, are
+    no passage and suppress none; the gap still separates the rooms, now between the upper jamb
+    and the blob's tip (map.md §6)."""
+    st = _doorway()
+    (p,) = ng.features(_grid(st, 0.05), 0.15, doors).passages
+    assert p.width == pytest.approx(1.55, abs=0.01)
+    st[50:65, 61:70] = ng.OCCUPIED  # the blob, attached to the lower jamb
+    st[50:56, 61:63] = ng.FREE
+    st[44, 64] = st[42, 58] = st[46, 60] = ng.OCCUPIED  # specks
+    f = ng.features(_grid(st, 0.05), 0.15, doors)
+    assert sorted(round(r.area_m2) for r in f.regions) == [13, 14]
+    (q,) = f.passages
+    assert set(q.regions) == {0, 1} and q.kind == "opening"
+    assert 0.7 <= q.width <= 0.9 and 2.95 <= q.centre[0] <= 3.25 and 1.75 <= q.centre[1] <= 3.25
+
+
+def test_specks_are_isolated_small_occupied_pieces() -> None:
+    st = np.full((30, 30), ng.FREE, np.uint8)
+    st[5, 5] = ng.OCCUPIED  # a speck
+    st[10:12, 10:12] = ng.OCCUPIED  # a speck of four cells
+    st[20:28, 20:28] = ng.OCCUPIED  # too large
+    st[0, 15] = ng.OCCUPIED  # on the grid's edge
+    st[15, 3] = ng.OCCUPIED  # beside an unknown cell
+    st[15, 2] = ng.UNKNOWN
+    sp = ng._specks(st, 0.05)
+    assert sp[5, 5] and sp[10:12, 10:12].all()
+    assert not sp[20:28, 20:28].any() and not sp[0, 15] and not sp[15, 3]
+    assert sp.sum() == 5
+
+
+def test_a_chord_separates_only_when_it_cuts_the_free_space_locally() -> None:
+    st = _doorway()
+    free = st == ng.FREE
+    none = np.zeros(st.shape, np.uint8)
+    across = (30.0, np.array([60.0, 35.0]), np.array([60.0, 65.0]), None, None)
+    assert ng._separates(free, none, across, 0.05) is True
+    beside = (30.0, np.array([59.0, 35.0]), np.array([59.0, 65.0]), None, None)
+    drawn = none.copy()
+    ng._draw(drawn, across[1], across[2])
+    assert ng._separates(free, drawn, beside, 0.05) is None  # the rooms were apart already
+    other = st.copy()
+    other[75:85, 59:61] = ng.FREE  # a second gap 1.5 m away: one region still
+    assert ng._separates(other == ng.FREE, none, across, 0.05) is False
+    along = (10.0, np.array([58.0, 10.0]), np.array([58.0, 20.0]), None, None)
+    assert ng._separates(free, none, along, 0.05) is False  # no region on the wall's side
+    # chords that cut nothing alone, together: kept unless crossing a cut one, beside one,
+    # within a pocket or repeating an earlier one
+    gap2 = (10.0, np.array([60.0, 75.0]), np.array([60.0, 85.0]), None, None)
+    assert len(ng._together(other == ng.FREE, [], [across, gap2, across], 0.05)) == 2
+    cross = (10.0, np.array([55.0, 50.0]), np.array([65.0, 50.0]), None, None)
+    assert ng._together(free, [across], [cross, beside], 0.05) == []
+    pocket = st.copy()
+    pocket[6:20, 6:22] = ng.OCCUPIED
+    pocket[12:14, 11:17] = ng.FREE  # a hole inside a block
+    inner = (1.0, np.array([14.5, 12.0]), np.array([14.5, 14.0]), None, None)
+    assert ng._together(pocket == ng.FREE, [], [inner], 0.05) == []
+
+
+def test_a_door_whose_chords_cut_nothing_alone_keeps_the_rules_pick() -> None:
+    """Two gaps 1.5 m apart in the wall between two rooms, a door object at one: no chord cuts the
+    free space alone, so the door's own pick and the other gap's chord are judged together, as
+    before: two passages, two regions."""
+    st = _doorway()
+    st[75:85, 59:61] = ng.FREE
+    f = ng.features(_grid(st, 0.05), 0.15, [(3.0, 2.5)])
+    assert len(f.regions) == 2 and len(f.passages) == 2

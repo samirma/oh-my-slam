@@ -2530,6 +2530,25 @@ server.
   the chord for 0.4 m, no free cell on the line, ≥ 50 % occupied (beside the line included) — and
   ≤ 2 m long; the shortest one per gap (2.5 m let furniture gaps through: 11 → 18 passages on
   the house bench, doors unchanged).
+* **A chord must cut the free space** (`navgrid._separates`; bug fix, no API change). Each
+  chord (plain, after narrowing, or a door's) is cut together with the chords kept before it;
+  when its two sides — the commonest region label 1–3 cells off its midpoint each side, parts
+  under 0.25 m² not counting, as `features` votes — still connect within 3 m of its midpoint
+  (`SEPARATE_M`), it is not kept and suppresses no other chord of the gap; when they were apart
+  already (a chord beside a kept one) it is dropped. 3 m holds the detour around an obstacle
+  beside a gap (within a door's width, 2 m, of it) and is less than a room, so a doorway is not
+  judged through the room's other doorways before they are cut; chords that cut only together
+  (two doorways nearer than 3 m) still go to the global test, unless they cross a kept chord or
+  leave no region on either side (`_together`). A door object takes the best-ranked chord that
+  cuts, else the shortest of a door's width or walled that cuts, else its old pick for the global
+  test. **Specks** (`navgrid._specks`): 8-connected occupied pieces under 0.05 m² (as
+  `DROP_MIN_M2`) with only free cells around them count as free in the chord search — no chord
+  ends on one, none is wall evidence — and stay obstacles for the regions. On rev9_ax_a the
+  1.5 m opening at (0.6, −2.9) that vanished at v54 (a blob grown on its west jamb plus specks:
+  the 0.47–0.52 m chords left free channels beside them) stays a passage: v54 0.91 m between
+  25.9 and 20.8 m² instead of one 53.9 m² region; v55–v58 0.30 m, where the grid now shows
+  the blob across most of the opening. Passages that flickered for the same reason now persist
+  (rev9_ax_a (−0.42, −7.2) from v41, rev9_x3_a (−3.65, −7.67) from v17).
 * **Door objects' passages.** For each door-labelled object of the version that no chord passes
   within 0.6 m of: through the free cells within 1 m of it, every 10°, the free chords 0.55–2.5 m
   wide (a 2 m double door) across the gap (their midpoint at least 0.4 of their length from any obstacle) that lie in

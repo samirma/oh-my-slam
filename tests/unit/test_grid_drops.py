@@ -397,8 +397,8 @@ def test_a_drop_bounds_regions_but_is_no_jamb() -> None:
     st = np.zeros((140, 140), np.uint8)
     st[20:120, 20:120] = ng.OCCUPIED
     st[50:90, 60:82] = ng.FREE
-    walls = ng.features(_grid(st, 0.05, floor=1))
-    assert len(walls.passages) == 1 and len(walls.regions) == 2
+    walls = ng.features(_grid(st, 0.05, floor=1))  # chords across it, as along a corridor
+    assert walls.passages and len(walls.regions) == len(walls.passages) + 1
     lay = _grid(st, 0.05, floor=1)
     lay.floor_observed[st == ng.OCCUPIED] = ng.FLOOR_DROP
     drops = ng.features(lay)

@@ -1295,7 +1295,10 @@ seen there.
   `area_m2`, `polygon_m`, and `coverage_share`, the observed share of its floor, counting
   unknown cells enclosed by its boundary as unobserved.
 * `passages[]` — narrowings between two regions, or between a region and a never-observed far
-  side, that a robot can drive through. Each has:
+  side, that a robot can drive through. A chord counts as a passage only when it cuts the free
+  space: a chord with free space connecting its two sides beside it (around an isolated speck or
+  a blob grown on a jamb) neither is a passage nor hides another chord of the same gap that
+  does cut it. Each has:
   * `jambs_m`, the two end points of the free gap at floor level;
   * `centre_m`, the midpoint of the free gap between the jambs. It is not the midpoint of the
     door frame, nor of the open leaves' free ends;
