@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from oh_my_slam.mapping.anchored import TOO_CLOSE_INLIERS, TOO_CLOSE_M, Placement
+from oh_my_slam.mapping.anchored import TOO_CLOSE_INLIERS, TOO_CLOSE_M, Placement, PriorScale
 
 
 def residual_stats(res: list[tuple[float, float]]) -> dict[str, Any] | None:
@@ -72,19 +72,35 @@ def displacement_quality(moved: list[tuple[float | None, float]]) -> dict[str, f
 
 
 def drift_correction(moved: list[tuple[float, float]], odo_scale: float,
-                     rule: dict[str, Any] | None = None) -> dict[str, Any] | None:
+                     rule: dict[str, Any] | None = None, restarted: str | None = None
+                     ) -> dict[str, Any] | None:
     """``quality.drift_correction`` (map.md §4, oms/2.5): the largest translation and rotation
     over the job's frames with a drifting prior between the prior as sent and as placed (one
     (m, deg) pair per frame: ``moved``) and the estimate's odometry scale; the one-view rule's
     ``held`` and ``agreeing_frames`` (oms/2.13, ``rule``; none held without it: the older
-    mapper); None without such a frame."""
+    mapper); ``restarted`` (oms/2.18, map.md §1 "Odometry epochs"): ``signalled`` or
+    ``detected`` when the job restarted the estimate, else None; None without such a frame."""
     if not moved:
         return None
     rule = rule or {}
     return {"translation_m": round(max(m for m, _ in moved), 4),
             "rotation_deg": round(max(d for _, d in moved), 3),
             "odo_scale": round(odo_scale, 5), "held": bool(rule.get("held", False)),
-            "agreeing_frames": list(rule.get("agreeing_frames", []))}
+            "agreeing_frames": list(rule.get("agreeing_frames", [])), "restarted": restarted}
+
+
+def prior_scale(ps: PriorScale | None) -> dict[str, Any]:
+    """``quality.prior_scale`` (map.md §4, oms/2.18) of a map's prior scale (``PriorScale``;
+    None: the older mapper, which applies none)."""
+    if ps is None:
+        return {"value": 1.0, "sigma": None, "applied": False, "evidence_count": 0}
+    return {"value": round(ps.value, 5), "sigma": None if ps.sigma is None
+            else round(ps.sigma, 5), "applied": ps.applied, "evidence_count": ps.count}
+
+
+def replaced(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``quality.replaced`` (map.md §4, oms/2.18) of the engine's re-placements."""
+    return [{k: e[k] for k in ("name", "displacement_m")} for e in entries]
 
 
 def reregistered(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.17. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
+  "description": "Schema version oms/2.18. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -221,6 +221,11 @@
           "type": "number",
           "minimum": 0,
           "description": "oms/2.4. Optional 1-sigma uncertainty of the prior's pitch and roll, known from gravity, independent of sigma_rot_deg. When given, pitch and roll are weighted by it and yaw by sigma_rot_deg, on every engine, wherever the prior's rotation is used (conflict bound, refinement, drift estimate)."
+        },
+        "odometry_epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "oms/2.18 (map.md section 1, Odometry epochs). The client's odometry epoch: it increments it whenever it re-anchors the odometry its drifting priors come from (a reset, a relocalisation that jumps the odometry frame). A drifting prior of a newer epoch restarts the drift estimate; baselines of the prior scale, odometry-scale evidence and keyframe-scale pairs never straddle two epochs; a metric prior is scaled only in the origin's epoch. Default 0."
         }
       },
       "if": {
@@ -808,6 +813,18 @@
             "type": "string"
           },
           "description": "oms/2.13. The views (this job's frames and earlier jobs' held ones) that agreed on the largest correction the one-view rule tested, that frame included, sorted by name; empty when no frame's correction exceeded its prior's sigma."
+        },
+        "restarted": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "signalled",
+            "detected",
+            null
+          ],
+          "description": "oms/2.18 (map.md section 1, Odometry epochs): signalled when the job's drifting priors named a newer odometry_epoch and the drift estimate restarted for it; detected when the job's frames showed an unsignalled re-anchor (most of them near their priors as sent and beyond the conflict bound of their priors as placed) and the estimate restarted instead of fitting a change; null otherwise. Absent on the older mapper."
         }
       }
     },
@@ -1207,6 +1224,62 @@
               "minimum": 1
             }
           }
+        },
+        "prior_scale": {
+          "type": "object",
+          "required": [
+            "value",
+            "sigma",
+            "applied",
+            "evidence_count"
+          ],
+          "additionalProperties": false,
+          "description": "oms/2.18. The map's one prior scale after the job (map.md section 1, Prior scale): the odometry's error in counting travel, map metres per metre of the priors' travel, shared by metric and drifting priors, measured on depth-image baselines (a registered frame against its main reference, both priors of one trust). While applied, a metric prior is placed with its horizontal position scaled about the origin's prior centre and a drifting prior through the drift estimate, whose odo_scale it is. On a dry run, what the job would leave; the older mapper reports value 1, sigma null, applied false, evidence_count 0.",
+          "properties": {
+            "value": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "The scale in force when applied, else the latest estimate; 1 without an estimate."
+            },
+            "sigma": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "description": "Its relative sigma (ln scale); null without an estimate."
+            },
+            "applied": {
+              "type": "boolean",
+              "description": "Whether the priors are placed with it."
+            },
+            "evidence_count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The baselines recorded (prior distance at least the README minimum)."
+            }
+          }
+        },
+        "replaced": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "displacement_m"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "displacement_m": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          },
+          "description": "oms/2.18. One entry per keyframe the job re-placed under a changed prior scale (map.md section 1, Prior scale, Re-placement), stored or the job's own, in canonical order: how far its position moved. A stored keyframe's movement here is excluded from previous_residuals and gauge_shift. Empty when none; a dry run predicts it."
         }
       }
     },
@@ -2822,6 +2895,16 @@
             }
           },
           "description": "oms/2.17. Present only when the frame sent depth: what its depth did (api.md section 6, Query depth). Absent for a frame without depth, whose answer is as before."
+        },
+        "prior_residual_placed_m": {
+          "type": "number",
+          "minimum": 0,
+          "description": "oms/2.18. Present only for a located frame sent with a prior: the located pose against that prior as placed in the map, as an update places it (through the map's prior scale, a drifting prior through its drift estimate; api.md section 6, Prior). Equals prior_residual_* when nothing places the prior otherwise."
+        },
+        "prior_residual_placed_deg": {
+          "type": "number",
+          "minimum": 0,
+          "description": "oms/2.18. Present only for a located frame sent with a prior: the located pose against that prior as placed in the map, as an update places it (through the map's prior scale, a drifting prior through its drift estimate; api.md section 6, Prior). Equals prior_residual_* when nothing places the prior otherwise."
         }
       }
     },

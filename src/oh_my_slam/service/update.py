@@ -82,6 +82,7 @@ from oh_my_slam.mapping.quality import (
     displacement_quality,
     drift_correction,
     gate,
+    prior_scale,
     residual_stats,
     scale_check,
 )
@@ -1425,6 +1426,8 @@ class Updater:
             "prior_disagreement_deg": anchored.prior_disagreement_deg if anchored else 0.0,
             # the mapper ties kept frames to no image: nothing re-registers them (map.md §2)
             "reregistered": [],
+            # nor does it apply a prior scale (map.md §1 "Prior scale", oms/2.18)
+            "prior_scale": prior_scale(None), "replaced": [],
             "height_inconsistent": [fr.work.name for fr in registered if fr.height_off],
             "floor_inconsistent": [fr.work.name for fr in registered if fr.floor_off],
             "rotation_pairs": list(rotation_pairs or []),

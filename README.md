@@ -1247,7 +1247,9 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   or rejected count nowhere; null when no frame counts. A metric prior of 2 cm / 1° whose image
   pose lies 0.12 m / 5° off (monocular depth) registers and commits with the small committed
   against prior displacement (`tests/unit/test_match_graph.py`).
-* **Gauge shift and residuals of the anchored engine.** Stored keyframes never move, so
+* **Gauge shift and residuals of the anchored engine.** Stored keyframes move only when a job
+  re-registers them or (oms/2.18) re-places them under a changed prior scale, both reported apart
+  (`reregistered`, `replaced`) and left out of the two fields below; otherwise they never move, so
   `gauge_shift` is the median movement of the previous version's frames between that version and
   the poses this one would commit (0 when none moved), and `previous_residuals` is over those
   frames only (`count` = the previous version's frames, kept-at-prior ones included, map.md §1): a
@@ -1900,6 +1902,120 @@ Client advice: link each frame `from` the frame captured just before (stored or 
 send a turn's translation sigma honestly (a stepping body slips: it is what limits a turn's
 baseline); take turn-in-place views `standing`, after the step settles; read the dry run's
 `body_link.sigma_m / baseline_m` (≤ 0.20 for a scale pair) before sending a look.
+
+### Prior scale, re-placement and odometry epochs (oms/2.18)
+
+map.md §1 "Prior scale", "Odometry epochs", §2 "Reference sigma"; `anchored.prior_scale_estimate`,
+`PriorScale`, `AnchoredMap.estimate_prior_scale`, `_replace`, `_composed`, `_new_epoch`,
+`_reanchor`.
+
+* **Why.** A wheeled sim robot's odometry over-counted its travel by about 10 % and sent it as
+  `metric` (σ 0.03 m) and as `drifting` priors. Since af919ea an unspecified `prior_bias` rescaled
+  the `metric` priors only, from the job in which it switched on: the drifting priors (the drift
+  estimate's own odometry scale never took it) and the keyframes fused before stayed where the
+  unscaled priors put them, regions 0.1-0.9 m off with tight sigmas, correct registrations
+  0.4-0.9 m "off" their sent priors, and residual reports that measured kept frames against the
+  scaled prior and registered ones against the sent one.
+* **One scale, both trusts.** `prior_bias` is gone. The baselines are now taken against every
+  reference of a points fit that holds at least `MIN_INLIERS` of its matches, carries a sensor
+  depth image and a prior of the frame's trust and odometry epoch, the image baseline refitted on
+  that reference's own points (`refine_pose` with the reference's scale fixed): a pose on several
+  references mixes their placements, which priors pulled. On the synthetic 10 % over-count
+  (`test_metric_priors_with_a_scale_bias`) the mixed baseline gave 0.934 against 0.909; the
+  per-reference one 0.904. Monocular references give none (a keyframe's own scale spreads by up
+  to 2 × about k, oms/2.14); `metric` priors on monocular-at-camera-height references gave
+  `prior_bias` evidence before and give none now. Each baseline records the frame's prior
+  position, so the estimate can count frames.
+* **Constants.** `PRIOR_SCALE_MIN` 5 agreeing baselines, more than half, from at least
+  `DRIFT_AGREE_MIN` 3 frames; `PRIOR_SCALE_SPAN_M` 0.5 m (the confirmed keyframes' priors of one
+  trust; the former `BIAS_SPAN_M`); agreement 3 × max(1.4826 MAD, `PRIOR_SCALE_NOISE_REL` 0.02)
+  in ln ratio; σ = max(MAD, 0.02) / √n; significant beyond 2 × hypot(σ,
+  `SENSOR_SCALE_SIGMA_REL` 0.03); a change only beyond 2 σ; `REPLACE_MIN_M` 0.01 m;
+  `SCALE_EVIDENCE_MIN_M` 0.1 m and `MAX_EVIDENCE` 500 as before. Decided at the job's end
+  (`end_job`, after the pose-duplicate pass), never within a job: a job's frames are all placed
+  with the scale in force at its start.
+* **Placement.** `metric`: x, y scaled about `origin_c` (the origin's prior centre), z, rotation
+  and sigmas as sent, only for priors of the origin's odometry epoch. `drifting`: through the
+  drift estimate, whose `odo_scale` is the prior scale while one is applied (`Drift.confirm`'s
+  `fixed`); the identity estimate places a drifting prior as a metric one. Keyframe-scale pairs
+  (oms/2.14) multiply a metric pair's translation by the scale in force.
+* **Re-placement, not a refit.** A joint refit of every keyframe would move keyframes for reasons
+  other than the scale (the image chain's own inconsistencies) and could not be bounded. The
+  re-placement is the first-order response of each committed fusion to its prior's change: every
+  keyframe stores `placed` {lever, scale, share, ref, drift} when its pose is set (`add`,
+  `set_pose`: re-registration, retries, seeds, linked kept frames); Δ = a λ (s − s₀) + (1 − a)
+  Δ_ref in the order of the references (a cycle ends at the keyframe already on the path). A
+  rotation-only fit's centre is its prior's (a = 1). The drift estimate's reference moves with
+  the keyframe whose prior is its `ref_prior`; when a stored keyframe that gave content moves, the
+  cloud is fused again from the stored grids (float16, as saved) and images (`_refuse`). Object
+  records are not moved: later views move them (latest wins). Keyframes stored before oms/2.18 have
+  no record and never move.
+* **Residuals.** A registered frame's `prior_residual_*` were against the prior as sent for a
+  metric prior (`ref = prior_T`) and against the scaled one for a kept frame; now every status is
+  against the prior as placed (`ref = T0`), and `prior_residual_sent_*` against the prior as sent.
+* **Reference sigma.** `_composed`: hypot(σ_fused, (1 − a) σ_refs), σ_refs the root of the
+  inlier-weighted mean of the references' committed variances; skipped when every reference is in
+  a seeded component (the seed floor already composes it). `Placement.own_sigmas` keep the frame's
+  own; the height gate, the floor check and `refine_scale` use them (also on re-registration:
+  `Keyframe.own_sp`), so the monocular maps' gates are unchanged. The rev9_x3_b trace (
+  k69 at σ 0.186 on 41 inliers at 4.8 m, its children 0.04-0.05) is this. Down-weighting far
+  lifted depth was not done: the 0.186 was honest.
+* **Odometry epochs.** `Prior.odometry_epoch` (default 0). A job whose drifting priors name a newer
+  epoch restarts the drift estimate (`_new_epoch`); priors of another epoch than the estimate's are
+  placed as sent. The prior scale is pooled across epochs (each baseline is within one epoch; the
+  error is the wheels'). Unsignalled re-anchor (`_reanchor`): at least `DRIFT_MIN_SUPPORT` 3 of the
+  job's supporting frames, more than half, within the conflict bound of their priors as sent and
+  beyond it as placed: the fit returns the identity as an accepted change (the job is registered
+  again under it) and `drift_correction.restarted` is `detected`.
+* **Not done.** The region-level suspect test (design item v): a region misplaced by a scale error
+  is re-placed instead; the false depth rejections of rev9_x3_b's arc are oms/2.19's (range- and
+  rotation-aware margins). Demoting metric priors to drifting (item iii): unnecessary with one
+  scale.
+* **Locate places its prior** (api.md §6 "Prior placement"; `nav.placer`, `AnchoredMap.priors_only`,
+  `place_prior`). Locate took a drifting prior as sent with its sent sigma; on rev9_x3_c, whose
+  drift estimate had absorbed about 0.5 m of the client's raw odometry, correct locates showed
+  0.44-0.48 m prior residuals and one (σ 0.10 m sent) was rejected `prior_conflict`. The located
+  version's mapper map (its `state.json`: drift estimate, prior scale, origin; read once per
+  version, the newest `PLACERS_KEPT` 16 kept) now places it as an update does, with the
+  drift-grown sigma; `prior_residual_placed_*` report the placed residual.
+* **Locate log.** The `locate summary` line also says `depth` (whether the frame sent a depth
+  part), `depth_check` when present, `rivals` and `rivals_outside_prior` (log only).
+
+* **Replays** (stored keyframes through `AnchoredMap.update`, one job per committed version for
+  the RGB-D maps, one keyframe per job for the monocular ones, each job judged by the depth
+  limit as the service does; 777f678 against oms/2.18):
+
+  | map | jobs | statuses changed | depth-rejected frames / whole jobs | prior scale | notes |
+  | --- | --- | --- | --- | --- | --- |
+  | rev9_x3_a | 33 | 15 | 0 / 1 → 1 / 1 | 0.920 from job 3 (7 → 21 baselines), 9 re-placed | below |
+  | rev9_x3_b | 27 | 5 (kept → registered) | 0 / 0 → 0 / 0 | 0.913 job 3, 0.932 job 6, 0.924 job 7 | no re-anchor detected |
+  | rev8_wheeled2_depth | 5 | 0 | 0 / 0 | 0.894 at job 5, 10 re-placed | poses of job 1-4 keyframes moved |
+  | rev8_wheeled_depth | 5 | 4 | job 5 rejected whole (30 failing pairs) → 4 rejected, 5 committed (23) | 0.919 at job 4, 8 re-placed | |
+  | smoke_9ca6a86_base | 1 | 0 | 0 / 0 | not applied (one job) | |
+  | e305, e205, j3, j5, j6 | 22, 21, 25, 40, 39 | 0 | (monocular: none) | no evidence | 10/22, 2/21, 13/25, 33/40, 23/39 both; poses and k identical; sigmas grow (median 2.7 × on j5, 2.0 × on j6, the drifting chains' references) |
+
+  rev9_x3_a, keyframe positions against "the priors scaled about the origin" (an analysis model
+  only): the depth baselines say 0.92 on every RGB-D map of this robot; a model at 0.905 fits the
+  trace's batch-time positions better at the end of the run. Against 0.92: the 06:11-06:13
+  cluster (15 keyframes) 0.156 → 0.010 m median (max 0.212 → 0.031), metric fused after 06:14
+  0.126 → 0.011, metric kept 0.083 → 0.002, drifting fused 0.661 → 0.092 (4 of 16 above 0.1);
+  drifting kept 0.477 → 0.244 (20 above 0.1). The drifting kept frames are placed by a drift
+  estimate fitted 3-4 m away on a few turn-in-place views with a few degrees of yaw error
+  (drift-grown σ 0.2-0.4, honest); 2.18 does not change that fit. The job 2.17 rejected whole
+  (06:20:48, two frames, 3 failing pairs) keeps its frames at their priors (loose image poses);
+  the job 06:24:27 (two frames) committed in 2.17 and is rejected whole now: its frames
+  contradict 06:19:33_0000/0001, a drifting region still about 0.1-0.3 m off (the drift fit
+  above), against which the newcomers registered at their placed metric priors no longer agree.
+  rev9_x3_b: about 23 kept frames still sit at a 0.41 m correction (σ 0.63): the archived priors
+  carry no `odometry_epoch`, and those jobs' frames have no image pose, so the unsignalled test
+  has nothing to judge; a client sending the epoch restarts the estimate there.
+* **Locate on rev9_x3_c** (leave-one-out locates of its 51 drifting keyframes against version 19,
+  each with its own sent prior at σ 0.10 m, `locate218.py`): the frames since the drift estimate's
+  current reference (08:24:54-08:26:19, 12 of them) were 11 `prior_conflict` with the prior as
+  sent and are all located with it placed (placed residuals 0.001-0.18 m, as-sent 0.45-0.53 m),
+  the logged 08:26:36 rejection. Frames placed under the earlier estimates (08:17-08:20) now
+  conflict: their sent priors are older odometry states that the current estimate does not
+  describe, which a client never sends to a locate (a locate sends its current odometry).
 
 ### Objects, surfaces and relations (O8)
 

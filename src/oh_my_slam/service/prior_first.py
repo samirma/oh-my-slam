@@ -53,6 +53,8 @@ from oh_my_slam.mapping.quality import (
     displacements,
     drift_correction,
     gate,
+    prior_scale,
+    replaced,
     reregistered,
     residual_stats,
     scale_check,
@@ -606,7 +608,8 @@ def job_drift_correction(am: AnchoredMap | None, frames: list[_Frame]) -> dict[s
     if not priors:
         return None
     moved, odo = am.drift_moves(priors) if am is not None else ([(0.0, 0.0)] * len(priors), 1.0)
-    return drift_correction(moved, odo, None if am is None else am.drift_rule())
+    return drift_correction(moved, odo, None if am is None else am.drift_rule(),
+                            None if am is None else am.reanchored)
 
 
 def prior_frames_rejected(frames: list[_Frame], status: dict[int, str]) -> bool:
@@ -831,6 +834,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
     # each moved from the previous version: the gauge shift and ``previous_residuals``
     by_id = {k.id: k for k in am.keyframes} if am is not None else {}
     again_ids = {e["keyframe"] for e in am.reregistered} if am is not None else set()
+    # re-placed under a changed prior scale (map.md §1, oms/2.18): in ``replaced`` only
+    moved_ids = {e["keyframe"] for e in am.replaced} if am is not None else set()
     rows, shifts = [], []
     for r in prev["frames"] if prev else []:
         k = by_id.get(r.get("internal") or "")
@@ -852,7 +857,9 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             # marked suspect by this job's depth consistency (map.md §4, oms/2.16): part of
             # the version it commits
             row = {**row, "depth_suspect": {"version": version, **k.suspect}}
-        shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
+        # (a re-placed keyframe's movement is in ``replaced`` only)
+        shifts += [] if k is not None and k.id in moved_ids else [
+            pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"]))]
         rows.append(row)
     for fr, pl in kept:
         assert pl.T is not None
@@ -907,6 +914,8 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         **displacement_quality(moved),
         "prior_disagreement_deg": 0.0 if am is None else am.prior_disagreement_deg,
         "reregistered": [] if am is None else reregistered(am.reregistered),
+        "prior_scale": prior_scale(None if am is None else am.pscale),
+        "replaced": [] if am is None else replaced(am.replaced),
         "height_inconsistent": [] if am is None else list(am.height_inconsistent),
         "floor_inconsistent": [] if am is None else list(am.floor_inconsistent),
         "rotation_pairs": rotation_pairs,

@@ -216,8 +216,13 @@ DRIFT_ROT_DEG_PER_M = 2.0  # ... and this much per metre of it in rotation
 ODO_SCALE_MIN_TRAVEL_M = 0.2
 ODO_SCALE_RANGE = (0.5, 2.0)
 PRIOR_SPAN_M = 0.3  # metric priors fix the scale once their centres span this
-BIAS_SPAN_M = 0.5  # metric priors' own scale bias is judged once they span this
-BIAS_EVIDENCE_MIN = 5
+# map.md §1 "Prior scale" (oms/2.18): the priors' one scale, judged once a trust's priors span
+# this, on at least this many agreeing depth-image baselines (more than half of them), the
+# agreement 3 x max(their robust spread, a baseline's own noise) in ln scale
+PRIOR_SCALE_SPAN_M = 0.5
+PRIOR_SCALE_MIN = 5
+PRIOR_SCALE_NOISE_REL = 0.02
+REPLACE_MIN_M = 0.01  # a re-placement's correction below this is not applied
 EVIDENCE_SCALE_SIGMA = 1.0  # reference scales left free when a metric prior measures them
 FIXED_SCALE_SIGMA = 1e-6  # ... and held when one reference's depth measures an image baseline
 SCALE_EVIDENCE_MIN_M = 0.1  # a PnP baseline shorter than this tells little about the scale
@@ -1595,6 +1600,13 @@ class Keyframe:
     # .depth_resolve``): {"contradicted_by": [{name, agree_ratio_keyframe, agree_ratio_frame}]};
     # no reference and never paired again, its pose and content kept (``reference``)
     suspect: dict[str, Any] | None = None
+    # oms/2.18 (map.md §1 "Prior scale", Re-placement): how its committed position rests on its
+    # prior, {"lever": [x, y, z], "scale": the scale its prior was placed with, "share": the
+    # prior's share of its position, "ref": its main reference's id or None}; None for a
+    # keyframe stored before oms/2.18 (never re-placed). And, while a job runs, its own
+    # position sigma before its references' were composed in (``Placement.own_sigmas``)
+    placed: dict[str, Any] | None = None
+    own_sp: float | None = None
 
     def reference(self) -> bool:
         """Whether it is a registration reference (map.md §2): image-confirmed (``usable``) and
@@ -1663,7 +1675,8 @@ class Keyframe:
                 "conflict": self.conflict, "stereo_scale": self.stereo_scale,
                 "stereo_sigma": self.stereo_sigma, "stereo_pairs": self.stereo_pairs,
                 "stereo_judged": self.stereo_judged, "body": self.body,
-                "stereo_links": self.stereo_links, "suspect": self.suspect}
+                "stereo_links": self.stereo_links, "suspect": self.suspect,
+                "placed": self.placed}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1685,7 +1698,7 @@ class Keyframe:
                         stereo_pairs=d.get("stereo_pairs"),
                         stereo_judged=bool(d.get("stereo_judged", False)),
                         body=d.get("body"), stereo_links=d.get("stereo_links"),
-                        suspect=d.get("suspect"))
+                        suspect=d.get("suspect"), placed=d.get("placed"))
 
     @property
     def centre(self) -> Array:
@@ -1823,13 +1836,16 @@ class Drift:
     # the views the one-view rule held in earlier jobs (map.md §1 "No correction from one view",
     # oms/2.13), the newest ``DRIFT_PENDING_MAX``: a later correction they agree on is allowed
     pending: list[DriftView] = field(default_factory=list)
+    # the odometry epoch its drifting priors belong to (map.md §1 "Odometry epochs", oms/2.18):
+    # a frame of another epoch restarts it
+    epoch: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {"ref_T": None if self.ref_T is None else self.ref_T.tolist(),
                 "ref_prior": None if self.ref_prior is None else self.ref_prior.tolist(),
                 "odo_scale": self.odo_scale, "evidence": self.evidence,
                 "fit_sigma": list(self.fit_sigma), "support": self.support,
-                "pending": [v.to_json() for v in self.pending]}
+                "pending": [v.to_json() for v in self.pending], "epoch": self.epoch}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Drift:
@@ -1839,6 +1855,7 @@ class Drift:
                     tuple(d.get("fit_sigma", (0.0, 0.0))),  # type: ignore[arg-type]
                     [list(c) for c in d.get("support", [])])
         out.pending = [DriftView.from_json(v) for v in d.get("pending", [])]
+        out.epoch = int(d.get("epoch", 0))
         return out
 
     def predict(self, P: Array, sigma_pos: float, sigma_rot: float,
@@ -1862,11 +1879,12 @@ class Drift:
             T[:3, :3] = level_toward(T[:3, :3], P[:3, :3], sr ** 2 / (sr ** 2 + sigma_tilt ** 2))
         return T, sp, sr
 
-    def confirm(self, T: Array, P: Array) -> None:
+    def confirm(self, T: Array, P: Array, fixed: float | None = None) -> None:
         """A drifting frame the images placed at ``T``: the new reference, odometry scale
         evidence against the previous one, and a supporting frame. Its reference pose is then
         the job's weighted fit (``AnchoredMap._close_drift``: never the last committed pose
-        alone, map.md §1 "Drift estimate", oms/2.5)."""
+        alone, map.md §1 "Drift estimate", oms/2.5). A ``fixed`` odometry scale (the prior
+        scale in force, map.md §1 "Prior scale", oms/2.18) replaces the evidence's."""
         if self.ref_T is not None and self.ref_prior is not None:
             odo = float(np.linalg.norm(P[:3, 3] - self.ref_prior[:3, 3]))
             moved = float(np.linalg.norm(T[:3, 3] - self.ref_T[:3, 3]))
@@ -1876,6 +1894,8 @@ class Drift:
                 map_m = np.array([e[1] for e in self.evidence])
                 s = float((odo_m * map_m).sum() / (odo_m ** 2).sum())
                 self.odo_scale = float(np.clip(s, *ODO_SCALE_RANGE))
+        if fixed is not None:
+            self.odo_scale = fixed
         self.ref_T, self.ref_prior = T.copy(), P.copy()
         c = P[:3, 3].tolist()
         if c not in self.support:  # no count bound (SI-19): each supporting frame once
@@ -1907,6 +1927,80 @@ def drift_grown(sigma_pos: float, sigma_rot: float, P: Array, fit_sigma: tuple[f
             default=0.0)
     return (math.hypot(sigma_pos, fit_sigma[0], DRIFT_POS_REL * d),
             math.hypot(sigma_rot, fit_sigma[1], DRIFT_ROT_DEG_PER_M * d))
+
+
+def prior_epoch(prior: dict[str, Any] | None) -> int:
+    """A prior's odometry epoch (map.md §1 "Odometry epochs", oms/2.18): 0 when not sent."""
+    return 0 if prior is None else int(prior.get("odometry_epoch") or 0)
+
+
+def prior_scale_estimate(evidence: list[list[float]], span: float
+                         ) -> tuple[float, float] | None:
+    """The prior scale's estimate (map.md §1 "Prior scale", oms/2.18) on the depth-image
+    baselines ``evidence`` ([prior m, image m, ...]) when the priors span ``span``: with r = ln
+    (image / prior), the baselines within 3 × max(1.4826 MAD, ``PRIOR_SCALE_NOISE_REL``) of the
+    median agree; with at least ``PRIOR_SCALE_MIN`` agreeing, more than half, from at least
+    ``DRIFT_AGREE_MIN`` frames (an entry's frame: its prior position, entries [3:5]; an entry
+    without one counts as its own frame), and a span of at least ``PRIOR_SCALE_SPAN_M``, the
+    agreeing baselines' least-squares ratio and its relative sigma (their robust spread,
+    floored at the noise, over the root of their count); else None."""
+    ev = [e for e in evidence if e[0] >= SCALE_EVIDENCE_MIN_M and e[1] > 1e-6]
+    if span < PRIOR_SCALE_SPAN_M or len(ev) < PRIOR_SCALE_MIN:
+        return None
+    b_p = np.array([e[0] for e in ev])
+    b_i = np.array([e[1] for e in ev])
+    r = np.log(b_i / b_p)
+    med = float(np.median(r))
+    tol = K_SIGMA * max(1.4826 * float(np.median(np.abs(r - med))), PRIOR_SCALE_NOISE_REL)
+    keep = np.abs(r - med) <= tol
+    n = int(keep.sum())
+    frames = {tuple(round(x, 3) for x in e[2:4]) if len(e) >= 4 else ("own", i)
+              for i, (e, k) in enumerate(zip(ev, keep, strict=True)) if k}
+    if n < PRIOR_SCALE_MIN or 2 * n <= len(ev) or len(frames) < DRIFT_AGREE_MIN:
+        return None
+    s = float((b_p[keep] * b_i[keep]).sum() / (b_p[keep] ** 2).sum())
+    rk = r[keep]
+    spread = 1.4826 * float(np.median(np.abs(rk - np.median(rk))))
+    return float(np.clip(s, *SCALE_RANGE)), max(spread, PRIOR_SCALE_NOISE_REL) / math.sqrt(n)
+
+
+@dataclass
+class PriorScale:
+    """The map's one prior scale (map.md §1 "Prior scale", oms/2.18): ``value`` the scale in
+    force when ``applied``, else the latest estimate (1 without one), ``sigma`` its relative
+    sigma (None without an estimate), ``count`` the baselines recorded."""
+
+    value: float = 1.0
+    sigma: float | None = None
+    applied: bool = False
+    count: int = 0
+
+    @property
+    def in_force(self) -> float:
+        return self.value if self.applied else 1.0
+
+    def to_json(self) -> dict[str, Any]:
+        return {"value": self.value, "sigma": self.sigma, "applied": self.applied,
+                "count": self.count}
+
+    @staticmethod
+    def from_json(d: dict[str, Any] | None) -> PriorScale:
+        if d is None:
+            return PriorScale()
+        return PriorScale(float(d["value"]), d["sigma"], bool(d["applied"]), int(d["count"]))
+
+    def decide(self, est: tuple[float, float] | None) -> PriorScale:
+        """The scale after an estimate ``est`` (value, sigma): the significant estimate (|ln s|
+        beyond 2 × hypot(its sigma, ``SENSOR_SCALE_SIGMA_REL``)), else 1, in force once it
+        would move the one in force by more than 2 × its sigma in ln scale; without an estimate
+        the one in force stays."""
+        if est is None:
+            return PriorScale(self.value, self.sigma, self.applied, self.count)
+        s, sig = est
+        target = s if abs(math.log(s)) > 2.0 * math.hypot(sig, SENSOR_SCALE_SIGMA_REL) else 1.0
+        cur = self.in_force
+        now = target if abs(math.log(target / cur)) > 2.0 * sig else cur
+        return PriorScale(now if now != 1.0 else s, sig, now != 1.0, self.count)
 
 
 @dataclass
@@ -2174,6 +2268,24 @@ class Placement:
     # with reason depth_inconsistent (oms/2.16, map.md §4): the frames it contradicts or whose
     # rejection its registration rested on (``depth_inconsistent_with``)
     depth_with: tuple[str, ...] = ()
+    # oms/2.18 (map.md §1 "Prior scale", Re-placement; §2 "Reference sigma"): the prior's share
+    # of its committed position and rotation (1 at its prior, 0 without one), the reference
+    # holding most of its inliers (a linked pose's partner), and its own sigmas before its
+    # references' were composed in (the gates comparing it with its own measurements)
+    prior_share: tuple[float, float] = (0.0, 0.0)
+    main_ref: str | None = None
+    own_sigmas: tuple[float, float] | None = None
+
+    def own_sigma_pos(self) -> float | None:
+        """Its own position sigma (``own_sigmas``), else its committed one."""
+        return self.sigma_pos_m if self.own_sigmas is None else self.own_sigmas[0]
+
+
+def prior_share(sp: float, s_img: float) -> float:
+    """A prior's weight in a fusion with an image pose: 1 / σ_prior² over 1 / σ_prior² + 1 /
+    σ_image² (map.md §1 "Prior scale", Re-placement)."""
+    wp, wi = 1.0 / max(sp, 1e-9) ** 2, 1.0 / max(s_img, 1e-9) ** 2
+    return wp / (wp + wi)
 
 
 def _lifted(corr: _Corr, cands: list[Keyframe]) -> tuple[Array, Array]:
@@ -2286,7 +2398,8 @@ def _kept(f: FrameIn, T0: Array, sp0: float, sr0: float, reason: str, n: int,
     """A frame kept at its prior as placed (api.md §4): ``T0`` with the prior's sigmas (as
     given, a drifting prior's grown by the drift: ``AnchoredMap.kept_at``), residual 0."""
     return Placement(f.name, "kept_at_prior", reason, T0.copy(), round(sp0, 4), round(sr0, 3), n,
-                     "prior", (0.0, 0.0), scene_m=scene_m, detail=detail, has_prior=True)
+                     "prior", (0.0, 0.0), scene_m=scene_m, detail=detail, has_prior=True,
+                     prior_share=(1.0, 1.0))
 
 
 def _displacement(T: Array, image_T: Array, rot_only: bool) -> tuple[float, float]:
@@ -2551,7 +2664,7 @@ def _refined_drift(trial: Drift, obs: list[_DriftObs]) -> Drift:
     U, _, Vt = np.linalg.svd(np.einsum("i,ijk->jk", np.asarray(wr), np.asarray(Rs)))
     R = U @ np.diag([1.0, 1.0, float(np.linalg.det(U @ Vt))]) @ Vt
     c = np.average(np.asarray(cs), axis=0, weights=np.asarray(wp))
-    return Drift(pose(R, c), trial.ref_prior.copy(), trial.odo_scale)
+    return Drift(pose(R, c), trial.ref_prior.copy(), trial.odo_scale, epoch=trial.epoch)
 
 
 def _drift_sigma(obs: list[_DriftObs]) -> tuple[float, float]:
@@ -2733,8 +2846,16 @@ class AnchoredMap:
         self.cloud = Cloud()
         self.created_with: str | None = None  # the trust of the origin's prior
         self.origin_c: Array | None = None  # the origin's prior centre (metric bias pivot)
-        # baselines of metric priors against independently scaled image ones: [prior, image]
+        # the prior scale's depth-image baselines (map.md §1 "Prior scale", oms/2.18): [prior
+        # m, image m], each of one trust and one odometry epoch; the scale they decided, the
+        # origin prior's odometry epoch (the metric scale's), the last job's re-placed keyframes
+        # ({"name", "keyframe", "displacement_m"}) and whether it restarted the drift estimate
+        # for a new odometry epoch ("signalled") or an unsignalled re-anchor ("detected")
         self.bias: list[list[float]] = []
+        self.pscale = PriorScale()
+        self.origin_epoch = 0
+        self.replaced: list[dict[str, Any]] = []
+        self.reanchored: str | None = None
         self.up_check_deg: float | None = None
         # the last update's largest disagreement of the images' relative rotation with the
         # priors' between overlapping frames (``_against_priors``)
@@ -2851,6 +2972,30 @@ class AnchoredMap:
     # -- persistence ---------------------------------------------------------------------------
 
     @staticmethod
+    def priors_only(root: Path) -> AnchoredMap | None:
+        """What places a prior in a stored map (``place_prior``: locate, api.md §6, oms/2.18):
+        its drift estimate, prior scale and origin, without its keyframes or cloud; None
+        without an anchored map there."""
+        p = root / STATE_JSON
+        if not p.exists():
+            return None
+        d = json.loads(p.read_text())
+        if d.get("engine") != ENGINE:
+            return None
+        m = AnchoredMap(root)
+        m.drift = Drift.from_json(d["drift"])
+        m.pscale = PriorScale.from_json(d.get("prior_scale"))
+        m.origin_c = None if d["origin_c"] is None else np.asarray(d["origin_c"], np.float64)
+        m.origin_epoch = int(d.get("origin_epoch", 0))
+        return m
+
+    def place_prior(self, p: dict[str, Any]) -> tuple[Array, float, float] | None:
+        """A request ``Prior`` as placed and its sigmas (``_predict``): a drifting one through
+        the drift estimate with its drift-grown sigmas, either trust under the prior scale."""
+        return self._predict(FrameIn("", "", np.zeros((1, 1, 3), np.uint8),
+                                     Intrinsics(1.0, 1.0, 0.0, 0.0, 1, 1), p))
+
+    @staticmethod
     def load(root: Path) -> AnchoredMap:
         m = AnchoredMap(root)
         d = json.loads((root / STATE_JSON).read_text())
@@ -2861,6 +3006,8 @@ class AnchoredMap:
         m.created_with = d["created_with"]
         m.origin_c = None if d["origin_c"] is None else np.asarray(d["origin_c"], np.float64)
         m.bias = [list(e) for e in d["bias"]]
+        m.pscale = PriorScale.from_json(d.get("prior_scale"))
+        m.origin_epoch = int(d.get("origin_epoch", 0))
         m.origin_height_m = d.get("origin_height_m")
         m.floor_prev = d.get("floor_z_m")
         m.cloud = Cloud.load(root / CLOUD_NPZ)
@@ -2890,7 +3037,8 @@ class AnchoredMap:
             "scale": self.scale.to_json(), "drift": self.drift.to_json(),
             "next_id": self.next_id, "created_with": self.created_with,
             "origin_c": None if self.origin_c is None else self.origin_c.tolist(),
-            "bias": self.bias, "origin_height_m": self.origin_height_m, "floor_z_m": floor})
+            "bias": self.bias, "origin_height_m": self.origin_height_m, "floor_z_m": floor,
+            "prior_scale": self.pscale.to_json(), "origin_epoch": self.origin_epoch})
         if self._pair_cache is not None:
             ids = {k.id for k in self.keyframes}
             atomic_write_json(self.root / PAIRS_JSON, {
@@ -2967,7 +3115,7 @@ class AnchoredMap:
         (positions are theirs), else depth images, else the depth scale's source (camera
         heights or the monocular model)."""
         span = self.prior_span()
-        if span >= PRIOR_SPAN_M and self.prior_bias() == 1.0:
+        if span >= PRIOR_SPAN_M and not self.pscale.applied:
             # the metric priors' residuals against the committed positions of the confirmed
             # keyframes (their RMS), at least their stated sigma over the root of their count
             ms = [k for k in self.confirmed() if k.prior is not None
@@ -2996,7 +3144,7 @@ class AnchoredMap:
     def _links_allowed(self) -> bool:
         """Whether link-measured scales may enter k (oms/2.15): never on a map whose scale
         comes from metric priors or depth images (``scale_summary``)."""
-        return not (self.prior_span() >= PRIOR_SPAN_M and self.prior_bias() == 1.0) \
+        return not (self.prior_span() >= PRIOR_SPAN_M and not self.pscale.applied) \
             and not any(k.depth_kind == "sensor" for k in self.confirmed())
 
     def begin_job(self) -> None:
@@ -3078,18 +3226,53 @@ class AnchoredMap:
     # -- registration --------------------------------------------------------------------------
 
     def _predict(self, f: FrameIn) -> tuple[Array, float, float] | None:
+        """A frame's prior as placed (map.md §1 "Prior scale", "Drift estimate"): a ``metric``
+        prior under the prior scale in force (``scaled``), a ``drifting`` one through the drift
+        estimate (whose odometry scale the prior scale is while one is in force), as a metric
+        one without an estimate; a ``drifting`` prior of another odometry epoch than the
+        estimate's as sent (oms/2.18)."""
         p = f.prior
         if p is None or p["trust"] not in ("metric", "drifting"):
             return None
         P = np.asarray(p["T_map_cam"], np.float64)
         sp, sr = _prior_sigmas(p)
-        if p["trust"] == "metric":
-            s_b = self.prior_bias()
-            if s_b != 1.0 and self.origin_c is not None:
-                P = P.copy()
-                P[:3, 3] = self.origin_c + s_b * (P[:3, 3] - self.origin_c)
-            return P, sp, sr
-        return self.drift.predict(P, sp, sr, _tilt_sigma(p))
+        if p["trust"] == "drifting" and self.drift.ref_T is not None:
+            if prior_epoch(p) != self.drift.epoch:
+                return P.copy(), sp, sr
+            return self.drift.predict(P, sp, sr, _tilt_sigma(p))
+        return self.scaled(P, prior_epoch(p)), sp, sr
+
+    def scaled(self, P: Array, epoch: int) -> Array:
+        """A prior placed under the prior scale in force (map.md §1 "Prior scale"): its
+        horizontal position scaled about the origin's prior centre, its prior of the origin's
+        odometry epoch only; as sent otherwise."""
+        s = self.pscale.in_force
+        if s == 1.0 or self.origin_c is None or epoch != self.origin_epoch:
+            return P.copy()
+        out = P.copy()
+        out[:2, 3] = self.origin_c[:2] + s * (P[:2, 3] - self.origin_c[:2])
+        return out
+
+    def lever(self, prior: dict[str, Any]) -> tuple[Array, float]:
+        """A prior's lever and the scale it is placed with (map.md §1 "Prior scale",
+        Re-placement): the offset the scale multiplies in its placement (a metric prior's
+        horizontal offset from the origin's prior centre; a drifting prior's odometry offset
+        from the drift estimate's reference, turned into the map frame) and that scale. A
+        keyframe's prior (``Keyframe.prior``)."""
+        P = np.asarray(prior["T"], np.float64)
+        epoch = prior_epoch(prior)
+        d = self.drift
+        if prior["trust"] == "drifting" and d.ref_T is not None:
+            if epoch != d.epoch:
+                return np.zeros(3), 1.0
+            assert d.ref_prior is not None
+            D = np.linalg.inv(d.ref_prior) @ P
+            return d.ref_T[:3, :3] @ D[:3, 3], d.odo_scale
+        if self.origin_c is None or epoch != self.origin_epoch:
+            return np.zeros(3), 1.0
+        lv = P[:3, 3] - self.origin_c
+        lv[2] = 0.0
+        return lv, self.pscale.in_force
 
     def drift_moves(self, priors: list[dict[str, Any]]) -> tuple[list[tuple[float, float]],
                                                                   float]:
@@ -3103,31 +3286,35 @@ class AnchoredMap:
         for p in priors:
             P = np.asarray(p["T_map_cam"], np.float64)
             sp, sr = _prior_sigmas(p)
+            if est.ref_T is None or prior_epoch(p) != est.epoch:
+                # the identity (or another odometry epoch's prior): placed as a metric prior,
+                # under the prior scale in force (map.md §1 "Prior scale", oms/2.18)
+                out.append(pose_residual(P, self.scaled(P, prior_epoch(p))))
+                continue
             out.append(pose_residual(P, est.predict(P, sp, sr, _tilt_sigma(p))[0]))
-        return out, est.odo_scale if est.ref_T is not None else 1.0
+        return out, est.odo_scale if est.ref_T is not None else self.pscale.in_force
 
     def drift_rule(self) -> dict[str, Any]:
         """The one-view rule's report of the last job (map.md §1 "No correction from one view",
         oms/2.13): ``held`` and ``agreeing_frames`` of ``quality.drift_correction``."""
         return {"held": self._rule[0], "agreeing_frames": list(self._rule[1])}
 
-    def prior_bias(self) -> float:
-        """The metric priors' own scale bias, measured against image baselines whose scale the
-        priors did not set (depth images, camera heights): the least-squares ratio of image to
-        prior baselines once the priors span ``BIAS_SPAN_M`` with ``BIAS_EVIDENCE_MIN``
-        baselines, applied only when it differs from 1 by more than twice its uncertainty and
-        the image scale's (else 1: a metric prior is taken as metric)."""
-        ev = [e for e in self.bias if e[0] >= SCALE_EVIDENCE_MIN_M]
-        if len(ev) < BIAS_EVIDENCE_MIN or self.prior_span() < BIAS_SPAN_M:
-            return 1.0
-        b_p = np.array([e[0] for e in ev])
-        b_i = np.array([e[1] for e in ev])
-        s_b = float((b_p * b_i).sum() / (b_p ** 2).sum())
-        r = np.log(np.maximum(b_i, 1e-9) / (s_b * b_p))
-        sigma = 1.4826 * float(np.median(np.abs(r - np.median(r)))) / math.sqrt(len(ev))
-        vis = SENSOR_SCALE_SIGMA_REL if any(k.depth_kind == "sensor" for k in self.confirmed()) \
-            else max(self.scale.sigma_rel, MIN_SCALE_SIGMA_REL)
-        return s_b if abs(s_b - 1.0) > 2.0 * math.hypot(sigma, vis) else 1.0
+    def estimate_prior_scale(self) -> bool:
+        """The prior scale at a job's end (map.md §1 "Prior scale"): estimated on the map's
+        depth-image baselines (``prior_scale_estimate``) and decided (``PriorScale.decide``);
+        while one is in force the drift estimate's odometry scale is it. Returns whether the
+        scale in force changed."""
+        span = max(self.prior_span(), self.prior_span("drifting"))
+        before = self.pscale.in_force
+        self.pscale = self.pscale.decide(prior_scale_estimate(self.bias, span))
+        self.pscale.count = sum(e[0] >= SCALE_EVIDENCE_MIN_M for e in self.bias)
+        if self.pscale.applied:
+            self.drift.odo_scale = self.pscale.value
+        return self.pscale.in_force != before
+
+    def fixed_odo(self) -> float | None:
+        """The drift estimate's odometry scale while a prior scale is in force, else None."""
+        return self.pscale.value if self.pscale.applied else None
 
     def _candidates(self, f: FrameIn, T0: Array | None, descriptor: Any) -> list[Keyframe]:
         usable = [k for k in self.keyframes if k.reference()]
@@ -3627,7 +3814,7 @@ class AnchoredMap:
             # displacement counts the rotation only when that pose is unconstrained in
             # translation (map.md §1)
             T, fsp, fsr, ht = self.with_height(f, s.T, s.cov, rp, rr)
-            return Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), n,
+            return self._composed(Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), n,
                              method, lifted=_lifted(corr, cands),  # type: ignore[arg-type]
                              align_T=s.T,
                              map_residual=_displacement(T, s.T, method == "rotation"),
@@ -3635,10 +3822,11 @@ class AnchoredMap:
                              refs=_ref_ids(cands, sub[3][s.inliers]),
                              inlier_share=ref_share(sub[0][s.inliers], sub[3][s.inliers], f.K),
                              unconstrained=method != "rotation" and self._unconstrained(
-                                 f, feats, s, sub[3], cands), inlier_floor_share=floor_share, rival=rival)
+                                 f, feats, s, sub[3], cands), inlier_floor_share=floor_share,
+                             rival=rival), cands, sub[3][s.inliers])
         assert f.prior is not None
-        prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
-        ref = T0 if f.prior["trust"] == "drifting" else prior_T
+        # the prior as placed, which its residuals are against for every status (api.md §4)
+        ref = T0
 
         if f.unconfirmed is not None:
             # its image failed a check: the prior holds it, and depth agreement alone never
@@ -3696,6 +3884,28 @@ class AnchoredMap:
         pl.measurable = measurable_pose(sub[0][s.inliers], sub[3][s.inliers], f.K)
         pl.refs = _ref_ids(cands, sub[3][s.inliers])
         pl.inlier_floor_share, pl.rival = floor_share, rival
+        return self._composed(pl, cands, sub[3][s.inliers])
+
+    def _composed(self, pl: Placement, cands: list[Keyframe], ref_of: NDArray[np.intp]
+                  ) -> Placement:
+        """A registered image pose with its references' own sigmas composed in (map.md §2
+        "Reference sigma", oms/2.18): hypot(its sigma, (1 − the prior's share) × the root of its
+        references' inlier-weighted mean variance), position and rotation; its own kept
+        (``Placement.own_sigmas``). A pose whose references all lie in a seeded component is
+        left to the seed floor (``_seed_floor``). Its main reference is set."""
+        n = np.bincount(ref_of, minlength=len(cands)).astype(np.float64)
+        used = [j for j in range(len(cands)) if n[j] > 0]
+        pl.main_ref = cands[int(np.argmax(n))].id
+        if all(cands[j].seed is not None and cands[j].seed_sigma is not None for j in used):
+            return pl
+        w = n / n.sum()
+        vp = float(sum(w[j] * cands[j].sigma_pos_m ** 2 for j in used))
+        vr = float(sum(w[j] * cands[j].sigma_rot_deg ** 2 for j in used))
+        assert pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
+        pl.own_sigmas = (pl.sigma_pos_m, pl.sigma_rot_deg)
+        ap, ar = pl.prior_share
+        pl.sigma_pos_m = round(math.hypot(pl.sigma_pos_m, (1.0 - ap) * math.sqrt(vp)), 4)
+        pl.sigma_rot_deg = round(math.hypot(pl.sigma_rot_deg, (1.0 - ar) * math.sqrt(vr)), 3)
         return pl
 
     def _image_conflict(self, f: FrameIn, img: Any, cands: list[Keyframe], T0: Array,
@@ -3854,7 +4064,7 @@ class AnchoredMap:
             return Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), ln.n,
                              "linked", align_T=T_L, map_residual=_displacement(T, T_L, False),
                              image_sigmas=(spL, srL) if ht else None, height_term=ht, refs=refs,
-                             measurable=ln.measurable)
+                             measurable=ln.measurable, main_ref=ln.ref)
         assert f.prior is not None
         T0, sp0, sr0 = pred
         dp, dr = pose_residual(T_L, T0)
@@ -3864,8 +4074,7 @@ class AnchoredMap:
         if f.unconfirmed is not None:
             return self.kept_at(f, f.unconfirmed, 0, pred=pred,
                                 detail=CONFLICT_DETAIL if conflict else None)
-        prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
-        ref = T0 if f.prior["trust"] == "drifting" else prior_T
+        ref = T0
         if srL > CONFIRM_SIGMA_ROT_DEG or spL > max(CONFIRM_SIGMA_POS_M, 2.0 * sp0):
             return self.kept_at(f, "no_overlap", ln.n, detail="loose_image_pose", pred=pred)
         if conflict:
@@ -3893,7 +4102,9 @@ class AnchoredMap:
                          pose_residual(T, ref), align_T=T_L,
                          map_residual=_displacement(T, T_L, False), prior_ref=ref,
                          image_sigmas=(spL, srL), has_prior=True, height_term=hz is not None,
-                         refs=refs, measurable=ln.measurable)
+                         refs=refs, measurable=ln.measurable,
+                         prior_share=(prior_share(sp0, spL), prior_share(sr0, srL)),
+                         main_ref=ln.ref)
 
     @staticmethod
     def _finish_link(pl: Placement, ln: _Link) -> Placement:
@@ -3906,6 +4117,7 @@ class AnchoredMap:
             T, sp, sr = got
             pl.T, pl.sigma_pos_m, pl.sigma_rot_deg = T.copy(), round(sp, 4), round(sr, 3)
             pl.prior_residual = (0.0, 0.0)
+            pl.prior_share, pl.main_ref, pl.prior_ref = (0.0, 0.0), ln.ref, T.copy()
             row["state"], row["reason"] = "used", None
         pl.link = row
         return pl
@@ -4238,24 +4450,34 @@ class AnchoredMap:
                        pose_residual(T, ref),
                        lifted=_lifted(corr, cands), align_T=s.T,  # type: ignore[arg-type]
                        map_residual=_displacement(T, s.T, rot_only), prior_ref=ref,
-                       image_sigmas=(rp, rr), has_prior=True, height_term=hz is not None)
+                       image_sigmas=(rp, rr), has_prior=True, height_term=hz is not None,
+                       # a rotation-only pose's centre is the prior's (map.md §1, Re-placement)
+                       prior_share=(1.0 if rot_only else prior_share(sp0, spi),
+                                    prior_share(sr0, sri)))
         if method == "pnp":
             # the reference keyframe (the most matches) as it is now: the placement may be
             # reused later in the job (``_place_cached``), when that keyframe may have moved
             j = int(np.bincount(corr.kf).argmax())
             k = cands[j]
+            # every reference of its inliers, for the prior scale's baselines (oms/2.18)
+            others = tuple((int(i), cands[i].centre.copy(), copy.deepcopy(cands[i].prior),
+                            cands[i].depth_kind if cands[i].lifts() else "none")
+                           for i in np.unique(sub[3][s.inliers]))
             ev = functools.partial(self._scale_evidence, s,
                                    np.asarray(f.prior["T_map_cam"], np.float64),
                                    f.prior["trust"], j, (k.centre.copy(), copy.deepcopy(k.prior),
                                                          k.depth_kind if k.lifts() else "none"),
-                                   (sub, refs, f.K, _prior_sigmas(f.prior)), self.scale.k)
+                                   (sub, refs, f.K, _prior_sigmas(f.prior)), self.scale.k,
+                                   prior_epoch(f.prior), others)
             pl.evidence = lambda: self._record_evidence(ev())
         return pl
 
     def _scale_evidence(self, s: Solve, prior_T: Array, trust: str, j: int,
                         ref: tuple[Array, dict[str, Any] | None, str],
                         fit: tuple[Any, Refs, Intrinsics, tuple[float, float]],
-                        k: float) -> list[tuple[str, list[float]]]:
+                        k: float, epoch: int = 0,
+                        others: tuple[tuple[int, Array, dict[str, Any] | None, str], ...] = ()
+                        ) -> list[tuple[str, list[float]]]:
         """An image-only centre against its prior, both relative to the reference keyframe
         (the one with the most matches, candidate ``j``: its centre, prior and depth kind at
         placement, ``ref``). For a monocular reference, in its raw depth units: a
@@ -4273,9 +4495,25 @@ class AnchoredMap:
         ref_p = np.asarray(prior["T"])[:3, 3] if prior is not None \
             and prior["trust"] == "metric" else centre
         b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref_p))
-        anchored = kind == "sensor" or (kind == "mono" and self.scale.source == "camera_height")
-        if trust == "metric" and anchored:
-            out.append(("bias", [b_prior, b_img]))
+        # the prior scale's baselines (map.md §1 "Prior scale", oms/2.18): each depth-image
+        # reference with a prior of the frame's trust and odometry epoch, its prior as sent;
+        # the image baseline on that reference's own points alone (a pose on several
+        # references mixes their placements, which priors pulled); the frame's prior position
+        # tells its baselines apart from other frames'
+        for i, c_i, p_i, kind_i in others:
+            if kind_i != "sensor" or p_i is None or p_i["trust"] != trust \
+                    or prior_epoch(p_i) != epoch:
+                continue
+            sub, refs, K, _ = fit
+            mine = sub[3] == i
+            if int(mine.sum()) < MIN_INLIERS:
+                continue
+            one = Refs(refs.c[[i]], np.full(1, FIXED_SCALE_SIGMA), refs.median[[i]])
+            si, _ = refine_pose(s.R, s.c, sub[0][mine], sub[1][mine], sub[2][mine],
+                                np.zeros(int(mine.sum()), np.intp), one, K)
+            out.append(("bias", [float(np.linalg.norm(prior_T[:3, 3] - np.asarray(
+                p_i["T"])[:3, 3])), float(np.linalg.norm(si.c - c_i)),
+                *[float(x) for x in prior_T[:2, 3]]]))
         if kind != "mono":
             return out
         b_img /= k
@@ -4287,7 +4525,7 @@ class AnchoredMap:
             _, sc = refine_pose(s.R, s.c, *sub, free, K, prior=(prior_T, sp, sr))
             b_img = b_prior / float(sc[j]) / k
             out.append(("priors", [b_prior, b_img]))
-        elif prior is not None and prior["trust"] == "drifting":
+        elif prior is not None and prior["trust"] == "drifting" and prior_epoch(prior) == epoch:
             # the image baseline on that reference's own depth alone, at its scale (oms/2.5:
             # since a drifting prior is weighed by its sigma, the references sit near their
             # priors, not where their depths' scale puts them, and a pose on several references
@@ -4323,6 +4561,25 @@ class AnchoredMap:
 
     # -- adding keyframes ----------------------------------------------------------------------
 
+    def set_pose(self, kf: Keyframe, pl: Placement) -> None:
+        """A keyframe placed again (re-registered, retried, a seed placed by its images, kept
+        at a linked pose): its pose and sigmas, its own sigma and placement record."""
+        assert pl.T is not None and pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
+        kf.T, kf.sigma_pos_m, kf.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
+        self.record_placement(kf, pl)
+
+    def record_placement(self, kf: Keyframe, pl: Placement) -> None:
+        """How a keyframe's committed position rests on its prior (``Keyframe.placed``,
+        map.md §1 "Prior scale", Re-placement): its prior's lever and placement scale
+        (``lever``; none without a prior), the prior's share and its main reference."""
+        kf.own_sp = pl.own_sigma_pos()
+        lv, sc = (np.zeros(3), 1.0) if kf.prior is None else self.lever(kf.prior)
+        drift = kf.prior is not None and kf.prior["trust"] == "drifting" \
+            and self.drift.ref_T is not None
+        kf.placed = {"lever": [float(x) for x in lv], "scale": float(sc),
+                     "share": float(pl.prior_share[0]), "ref": pl.main_ref,
+                     "drift": bool(drift)}
+
     def _keyframe_depth(self, f: FrameIn) -> tuple[NDArray[np.float32], Intrinsics, str, Any]:
         """The depth grid (metres as fused), its intrinsics, its kind and the descriptor."""
         if f.depth is not None and np.count_nonzero(f.depth > 0) > 0:
@@ -4344,7 +4601,7 @@ class AnchoredMap:
         """``height_consistent`` with the height and its sigma given."""
         if pl.height_term and pl.align_T is not None and pl.image_sigmas is not None:
             return self.height_gate(height_m, height_sigma_m, pl.align_T, pl.image_sigmas[0])
-        return self.height_gate(height_m, height_sigma_m, pl.T, pl.sigma_pos_m)
+        return self.height_gate(height_m, height_sigma_m, pl.T, pl.own_sigma_pos())
 
     def height_gate(self, height_m: float | None, height_sigma_m: float | None,
                     T: Array | None, sigma_pos_m: float | None) -> bool:
@@ -4416,7 +4673,7 @@ class AnchoredMap:
         cur = self._depth_factor(kf)
         raw = (kf.grid_scale or kf.k_used) * cur if kf.depth_kind == "mono" else 1.0
         chk = self.floor_check(kf.depth_kind, kf.height_m, kf.height_sigma_m, kf.T,
-                               kf.sigma_pos_m, ref.depth, kf.K_grid, raw)
+                               kf.own_sp or kf.sigma_pos_m, ref.depth, kf.K_grid, raw)
         kf.floor_ok, kf.floor_unjudged = chk.ok, not chk.judged
         if kf.depth_kind == "mono":
             kf.grid_scale = kf.grid_scale or kf.k_used
@@ -4494,11 +4751,13 @@ class AnchoredMap:
                      "sigma_rot_deg": _prior_sigmas(f.prior)[1]}
             if _tilt_sigma(f.prior) is not None:
                 prior["sigma_tilt_deg"] = _tilt_sigma(f.prior)
+            if prior_epoch(f.prior):  # oms/2.18 (map.md §1 "Odometry epochs")
+                prior["odometry_epoch"] = prior_epoch(f.prior)
         ignore = on_grid(f.ignore, depth.shape)
         depth = self._ignored_off(f, depth)
         raw = (self.scale.k if raw_scale is None else raw_scale) if kind == "mono" else 1.0
-        chk = self.floor_check(kind, f.height_m, f.height_sigma_m, pl.T, pl.sigma_pos_m, depth,
-                               K_grid, raw)
+        chk = self.floor_check(kind, f.height_m, f.height_sigma_m, pl.T, pl.own_sigma_pos() or 0.0,
+                               depth, K_grid, raw)
         # its own depth scale (map.md §2) is its content's only: its cloud, grid evidence and
         # objects (``floor_factor``); its stored grid and keypoint depths stay at k
         content = depth if chk.scale is None else (depth * chk.factor).astype(np.float32)
@@ -4509,6 +4768,7 @@ class AnchoredMap:
                       float(np.median(valid)) if valid.size else None, pl.method or "prior",
                       pl.inliers, reason=pl.reason if pl.status == "kept_at_prior" else None,
                       conflict=pl.status == "kept_at_prior" and pl.detail == CONFLICT_DETAIL)
+        self.record_placement(kf, pl)
         kf.feats = feats
         kf.kdepth = sample_depth(depth, K_grid, f.K, feats.kps) if len(feats.kps) \
             else np.zeros(0, np.float32)
@@ -4631,6 +4891,9 @@ class AnchoredMap:
         t0 = time.perf_counter()
         new = not self.keyframes
         self.begin_job()
+        if self._close_base is None:  # a new job (not a held job's other engine)
+            self.reanchored = None
+        self._new_epoch(frames)
         self.set_bodies(frames)
         prep = self._prepared(frames, static)
         snap = self._snapshot()
@@ -4653,6 +4916,19 @@ class AnchoredMap:
         self.timings = {"register": round(total - fuse_s, 3), "fuse": round(fuse_s, 3),
                         "total": round(total, 3)}
         return pls
+
+    def _new_epoch(self, frames: list[FrameIn]) -> None:
+        """A job whose ``drifting`` priors name a newer odometry epoch than the drift
+        estimate's restarts it (map.md §1 "Odometry epochs", oms/2.18): the identity of that
+        epoch, its odometry scale the prior scale in force (else 1), no support, evidence or
+        held views."""
+        eps = [prior_epoch(f.prior) for f in frames
+               if f.prior is not None and f.prior["trust"] == "drifting"]
+        if eps and max(eps) > self.drift.epoch:
+            log.info("odometry epoch %d (was %d): the drift estimate restarts", max(eps),
+                     self.drift.epoch)
+            self.drift = Drift(odo_scale=self.fixed_odo() or 1.0, epoch=max(eps))
+            self.reanchored = "signalled"
 
     def _register_drift(self, frames: list[FrameIn], prep: list[_Prep], snap: dict[str, Any],
                         progress: Callable[[str], None]) -> tuple[dict[int, Placement], Drift]:
@@ -4698,12 +4974,18 @@ class AnchoredMap:
         Returns the duplicates' placements by frame name and the seconds of the fusion."""
         t = time.perf_counter()
         dups, gone = self._drop_duplicates(self._job_duplicates())
+        pending, self._defer = self._defer or [], None
+        # the prior scale, decided once the job's statuses are final, and the keyframes that
+        # rest on their priors re-placed when it changed (map.md §1 "Prior scale", oms/2.18)
+        self.replaced = []
+        if self.estimate_prior_scale():
+            self.replaced = self._replace([pl for pl in pls if pl.name not in dups],
+                                          {kf.id for kf, *_ in pending})
         judged = self._measure_scales()
         # the link-measured scales as a vote for k (map.md §1 "Scale", item 3, oms/2.15)
         self.scale.links = [[float(k.stereo_scale), float(k.stereo_sigma)]
                             for k in self.confirmed() if k.depth_kind == "mono"
                             and k.link_measured() and k.stereo_scale and k.stereo_sigma]
-        pending, self._defer = self._defer or [], None
         for kf, image, ignore, depth, K_grid in pending:
             if kf.id not in gone and kf.contributes():
                 got = self.content_grid(kf) if kf.id in judged else depth
@@ -4721,6 +5003,93 @@ class AnchoredMap:
         self._evidence_from, self._rereg_by, self._rereg_state = set(), {}, {}
         self._mine, self._job_used, self.reran, self._retried_drifting = [], None, set(), False
         return dups, time.perf_counter() - t
+
+    def _replace(self, pls: list[Placement], pending: set[str]) -> list[dict[str, Any]]:
+        """The re-placement under a changed prior scale (map.md §1 "Prior scale",
+        Re-placement): each keyframe with a placement record moves by Δ = a × λ × (s − s₀) +
+        (1 − a) × Δ_ref (its prior's share a, lever λ, placement scale s₀, its main reference's
+        correction), in the order of the references; a correction below ``REPLACE_MIN_M`` is not
+        applied. The job's placements ``pls`` take their keyframes' new poses and their residuals
+        against their priors as placed now; the drift estimate's reference moves with the
+        keyframe that defines it; the cloud is fused again when a stored keyframe that gave
+        content moved (the job's own, ``pending``, are fused afterwards). Returns
+        ``quality.replaced``'s entries, in canonical order."""
+        by = {k.id: k for k in self.keyframes}
+        memo: dict[str, Array] = {}
+        prior_move: dict[str, Array] = {}
+
+        def now(k: Keyframe) -> float:
+            assert k.placed is not None
+            if k.placed.get("drift"):
+                return self.drift.odo_scale
+            return self.pscale.in_force
+
+        def delta(k: Keyframe, seen: frozenset[str]) -> Array:
+            if k.id in memo:
+                return memo[k.id]
+            out = np.zeros(3)
+            if k.placed is not None and k.id not in seen:
+                a = float(k.placed["share"])
+                own = np.asarray(k.placed["lever"], np.float64) * (now(k) - k.placed["scale"])
+                prior_move[k.id] = own
+                ref = by.get(k.placed.get("ref") or "")
+                up = np.zeros(3) if ref is None else delta(ref, seen | {k.id})
+                out = a * own + (1.0 - a) * up
+            memo[k.id] = out
+            return out
+
+        moved: list[tuple[Keyframe, float]] = []
+        for k in self.keyframes:
+            d = delta(k, frozenset())
+            if float(np.linalg.norm(d)) >= REPLACE_MIN_M:
+                moved.append((k, float(np.linalg.norm(d))))
+        for k in self.keyframes:
+            if k.placed is not None:
+                k.placed["scale"] = now(k)
+        for k, _ in moved:
+            k.T = k.T.copy()
+            k.T[:3, 3] += memo[k.id]
+        ids = {k.id for k, _ in moved}
+        for pl in pls:
+            kp = by.get(pl.keyframe or "")
+            if kp is None or kp.id not in prior_move:
+                continue
+            if kp.id in ids:
+                pl.T = kp.T.copy()
+            if pl.prior_ref is not None and pl.status == "registered":
+                pl.prior_ref = pl.prior_ref.copy()
+                pl.prior_ref[:3, 3] += prior_move[kp.id]
+                assert pl.T is not None
+                pl.prior_residual = pose_residual(pl.T, pl.prior_ref)
+        dr = self.drift
+        if dr.ref_T is not None and dr.ref_prior is not None:
+            for k, _ in moved:
+                if k.prior is not None and k.prior["trust"] == "drifting" \
+                        and np.allclose(np.asarray(k.prior["T"]), dr.ref_prior):
+                    dr.ref_T = dr.ref_T.copy()
+                    dr.ref_T[:3, 3] += memo[k.id]
+                    break
+        if any(k.id not in pending and k.contributes() for k, _ in moved):
+            self._refuse(pending)
+        log.info("prior scale %.4f in force: %d keyframes re-placed", self.pscale.in_force,
+                 len(moved))
+        return [{"name": k.name, "keyframe": k.id, "displacement_m": round(m, 4)}
+                for k, m in sorted(moved, key=lambda e: natural_key(e[0].name))]
+
+    def _refuse(self, pending: set[str]) -> None:
+        """The cloud fused again from the stored keyframes that give content, at their poses
+        now, from their stored images and depth grids as fused (a re-placement, map.md §1
+        "Prior scale"); the job's own (``pending``) are fused by ``end_job``."""
+        self.cloud = Cloud()
+        for k in self.keyframes:
+            path = self.image_path(k.id)
+            grid = self.root / KF_DIR / f"{k.id}.depth.npy"
+            if k.id in pending or not k.contributes() or path is None or not grid.exists() \
+                    or k.K_grid is None:
+                continue
+            rgb = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+            depth = np.load(grid).astype(np.float32) * (k.floor_factor or 1.0)
+            self._fuse(rgb, self.ignore_of(k.id), k, depth.astype(np.float32), k.K_grid)
 
     def _measure_scales(self) -> set[str]:
         """Each image-confirmed monocular keyframe's own depth scale by motion stereo (map.md §1
@@ -4807,7 +5176,8 @@ class AnchoredMap:
                                 link.sigma_rot_deg, True))
                 continue
             if a.prior is None or b.prior is None or not self._near(a, b) \
-                    or b.prior["trust"] != a.prior["trust"]:
+                    or b.prior["trust"] != a.prior["trust"] \
+                    or prior_epoch(a.prior) != prior_epoch(b.prior):
                 continue
             Pa = np.asarray(a.prior["T"], np.float64)
             Pb = np.asarray(b.prior["T"], np.float64)
@@ -4817,6 +5187,9 @@ class AnchoredMap:
             T = np.linalg.inv(Pa) @ Pb
             if a.prior["trust"] == "drifting":
                 T[:3, 3] *= self.drift.odo_scale
+            else:  # oms/2.18: the prior scale in force, in the origin's odometry epoch
+                T[:3, 3] *= self.pscale.in_force \
+                    if prior_epoch(a.prior) == self.origin_epoch else 1.0
             tl = float(np.linalg.norm(T[:3, 3]))
             sa, sb = float(a.prior["sigma_pos_m"]), float(b.prior["sigma_pos_m"])
             st = math.hypot(math.hypot(DRIFT_POS_REL, odo) * tl, KEYFRAME_BASELINE_SIGMA_MIN_M,
@@ -5147,7 +5520,8 @@ class AnchoredMap:
                         dict(self._rereg_state)),
                 "stored": [(k, k.T.copy(), k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method,
                             k.inliers, k.rgb, k.reason, k.height_ok, k.seed, k.seed_sigma,
-                            (k.floor_ok, k.grid_scale, k.floor_factor, k.floor_unjudged))
+                            (k.floor_ok, k.grid_scale, k.floor_factor, k.floor_unjudged),
+                            copy.deepcopy(k.placed), k.own_sp)
                            for k in self.keyframes]}
 
     def _restore(self, snap: dict[str, Any]) -> None:
@@ -5163,7 +5537,9 @@ class AnchoredMap:
         ev, by, st = snap["job"]
         self._evidence_from, self._rereg_by, self._rereg_state = set(ev), copy.deepcopy(by), \
             dict(st)
-        for k, T, sp, sr, state, method, n, rgb, reason, h_ok, seed, seed_s, fl in snap["stored"]:
+        for k, T, sp, sr, state, method, n, rgb, reason, h_ok, seed, seed_s, fl, placed, own \
+                in snap["stored"]:
+            k.placed, k.own_sp = copy.deepcopy(placed), own
             k.T, k.sigma_pos_m, k.sigma_rot_deg, k.state, k.method = T.copy(), sp, sr, state, method
             k.inliers, k.rgb, k.reason, k.height_ok = n, rgb, reason, h_ok
             k.seed, k.seed_sigma = seed, seed_s
@@ -5199,7 +5575,7 @@ class AnchoredMap:
                 if a is not None:
                     depth = (depth * a).astype(np.float32)
                     raw *= a
-            depth, raw = self.refine_scale(f, pl.T, pl.sigma_pos_m or 0.0, depth, Kg, raw, a)
+            depth, raw = self.refine_scale(f, pl.T, pl.own_sigma_pos() or 0.0, depth, Kg, raw, a)
         kf = self.add(f, pr.feats, pl, depth, Kg, kind, desc, raw)
         progress(f"{f.name}: {pl.status} ({pl.method}, {pl.inliers} inliers)")
         self._keep_s += time.perf_counter() - t
@@ -5292,7 +5668,7 @@ class AnchoredMap:
             k = self.keyframe(pl.keyframe or "")  # every kept frame is stored (``_keep``)
             assert k is not None and pl.T is not None and pl.sigma_pos_m is not None \
                 and pl.sigma_rot_deg is not None
-            k.T, k.sigma_pos_m, k.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
+            self.set_pose(k, pl)
 
     def _origin_of(self, frames: list[FrameIn], prep: list[_Prep], pending: list[int],
                    out: dict[int, Placement], progress: Callable[[str], None]) -> None:
@@ -5368,7 +5744,7 @@ class AnchoredMap:
             self._evidence(f, pl)
         assert pl.T is not None and pl.sigma_pos_m is not None and pl.sigma_rot_deg is not None
         floor = self._seed_floor(pl)
-        kf.T, kf.sigma_pos_m, kf.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
+        self.set_pose(kf, pl)
         kf.method, kf.inliers = pl.method or "pnp", pl.inliers
         if floor is None:  # its pose rests on confirmed keyframes outside: the component links
             for k in self.keyframes:
@@ -5390,7 +5766,8 @@ class AnchoredMap:
         kept = self.kept_at(f, "no_overlap", 0)
         assert kept.T is not None
         return Placement(f.name, "registered", None, kept.T, kept.sigma_pos_m,
-                         kept.sigma_rot_deg, 0, "prior", (0.0, 0.0), has_prior=True)
+                         kept.sigma_rot_deg, 0, "prior", (0.0, 0.0), has_prior=True,
+                         prior_share=(1.0, 1.0))
 
     def _rounds(self, frames: list[FrameIn], prep: list[_Prep], pending: list[int],
                 out: dict[int, Placement], results: dict[int, Placement],
@@ -5509,6 +5886,11 @@ class AnchoredMap:
         if not every:
             self._held, self._rule = [], (False, [], [])
             return None, {}
+        if self._reanchor(every, able, used):
+            # an unsignalled re-anchor (map.md §1 "Odometry epochs"): restart, no change fitted
+            self._held, self._rule = [], (False, [], [])
+            self.reanchored = "detected"
+            return Drift(odo_scale=used.odo_scale, epoch=used.epoch), {}
         # no correction from one view (map.md §1, oms/2.13): a frame moving its prior beyond the
         # prior's own sigma without enough independent views agreeing is held out of the fit
         held = self._one_view_rule(every, used)
@@ -5516,6 +5898,27 @@ class AnchoredMap:
         obs = [o for o in every if o.index not in held]
         got_fit, outliers = self._fit_obs(obs, able, used)
         return got_fit, {**outliers, **held_out}
+
+    @staticmethod
+    def _reanchor(obs: list[_DriftObs], able: set[int], used: Drift) -> bool:
+        """Whether the job shows an unsignalled re-anchor of the odometry (map.md §1
+        "Odometry epochs", oms/2.18): under a drift estimate, at least ``DRIFT_MIN_SUPPORT`` of
+        its frames that can support an estimate, and more than half of them, have points-fit
+        image poses within the conflict bound of their priors as sent and beyond it of their
+        priors as placed."""
+        if used.ref_T is None:
+            return False
+        sup = [o for o in obs if o.index in able and not o.rotation_only
+               and o.pl.method not in ("origin", "prior")]
+        hits = 0
+        for o in sup:
+            T0, sp, sr = used.predict(o.P, *o.sigma_prior, o.sigma_tilt)
+            sent = pose_residual(o.T, o.P)
+            placed = pose_residual(o.T, T0)
+            if not sigmas.conflicts(*sent, o.sigma_prior, o.sigma_image) \
+                    and sigmas.conflicts(*placed, (sp, sr), o.sigma_image):
+                hits += 1
+        return hits >= DRIFT_MIN_SUPPORT and 2 * hits > len(sup)
 
     def _one_view_rule(self, obs: list[_DriftObs], used: Drift) -> set[int]:
         """The frames the one-view rule holds (map.md §1 "No correction from one view",
@@ -5561,7 +5964,7 @@ class AnchoredMap:
         base = _drift_inliers(used, obs)
         best, best_in = None, base
         for o in sorted(obs, key=lambda o: o.name):
-            trial = Drift(o.T, o.P, used.odo_scale)
+            trial = Drift(o.T, o.P, used.odo_scale, epoch=used.epoch)
             got = _drift_inliers(trial, obs)
             if len(got) > len(best_in):
                 best, best_in = trial, got
@@ -5609,7 +6012,7 @@ class AnchoredMap:
             P = np.asarray(f.prior["T_map_cam"], np.float64)
             pl = out[i]
             if pl.status == "registered" and pl.T is not None and pl.method != "linked":
-                self.drift.confirm(pl.T, P)
+                self.drift.confirm(pl.T, P, self.fixed_odo())
         obs = [o for o in self._drift_evidence(frames, out) if o.pl.status == "registered"]
         if obs:
             self.drift.ref_T = _refined_drift(self.drift, obs).ref_T
@@ -5636,12 +6039,13 @@ class AnchoredMap:
             if self.created_with is None:
                 self.created_with = p["trust"]
                 self.origin_c = P[:3, 3].copy()
+                self.origin_epoch = prior_epoch(p)
             if f.unconfirmed is not None or close:
                 return self.kept_at(f, f.unconfirmed or "too_close", 0,
                                     scene if f.unconfirmed is None else None)
             return Placement(f.name, "registered", None, P, sp,
                              sigmas.axes_rms(sr, _tilt_sigma(p)), 0, "origin", (0.0, 0.0),
-                             has_prior=True)
+                             has_prior=True, prior_share=(1.0, 1.0))
         if close:  # an origin has no inliers: too close, it cannot be registered
             return Placement(f.name, "rejected", "too_close", scene_m=scene)
         h = f.height_m if f.height_m is not None and f.height_m > 0 else None
@@ -5711,7 +6115,7 @@ class AnchoredMap:
             # objects
             had, had_objects = kf.contributes(), kf.detects()
             dp, dr = pose_residual(kf.T, pl.T)
-            kf.T, kf.sigma_pos_m, kf.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
+            self.set_pose(kf, pl)
             kf.state, kf.method, kf.inliers = "fused", pl.method or "pnp", pl.inliers
             kf.rgb, kf.reason = rgb, None
             kf.seed, kf.seed_sigma = seed or (None, None)
@@ -5792,7 +6196,7 @@ class AnchoredMap:
         assert pl.T is not None and pl.sigma_pos_m is not None \
             and pl.sigma_rot_deg is not None
         seed = self._seed_floor(pl)  # through a seeded component: its floor
-        kf.T, kf.sigma_pos_m, kf.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
+        self.set_pose(kf, pl)
         kf.state, kf.method, kf.inliers = "fused", pl.method or "pnp", pl.inliers
         kf.reason = None
         kf.seed, kf.seed_sigma = seed or (None, None)

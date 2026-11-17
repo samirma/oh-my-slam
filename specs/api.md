@@ -90,7 +90,12 @@ error code `invalid_request` (§9).
     0.05 m / 2°, `drifting` 0.20 m / 5°. Clients should always send sigmas. A prior may also
     give `sigma_tilt_deg` (oms/2.4), the 1-σ uncertainty of its pitch and roll, known from
     gravity, independent of `sigma_rot_deg`; when given, pitch and roll are weighted by it and
-    yaw by `sigma_rot_deg` (map.md §1);
+    yaw by `sigma_rot_deg` (map.md §1). Since oms/2.18 it may give `odometry_epoch`, an
+    integer (default 0) the client increments whenever it re-anchors the odometry its priors
+    come from (a reset, a relocalisation that jumps its odometry frame): a newer epoch restarts
+    the drift estimate, and no odometry baseline straddles two epochs (map.md §1, Odometry
+    epochs). A client that re-anchors should send it: an unsignalled re-anchor is detected only
+    once most of a job's frames show it;
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
   * an optional `depth`, a part name: a 16-bit single-channel PNG of the colour image's size,
     pixel-aligned with it (registered depth); a value times the camera's `depth_scale_m` (default
@@ -147,8 +152,8 @@ error code `invalid_request` (§9).
   | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's; since oms/2.14 also for a frame judged about its measured scale (`stereo_scale.judged`). Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
   | `body_link` | Optional (oms/2.15). Present when the frame sent `body.motion`: what became of its link to its `from` frame, `{from, state, reason, baseline_m, sigma_m, rotation_deg, rotation_residual_deg}` (Body links, below). |
   | `stereo_scale` | Optional (oms/2.14). Present when the frame is an image-confirmed monocular keyframe with a `metric` or `drifting` prior, or since oms/2.15 a used body link path to a neighbour (map.md §1, Keyframe depth scale; `link_neighbours` names those neighbours), whose own depth scale was measured by motion stereo at the job's end (map.md §1, Keyframe depth scale): `{scale, sigma_rel, neighbours, judged}`, `scale` the factor from its raw depth to map metres (comparable to `depth_scale`), `sigma_rel` its relative sigma, `neighbours` the names of the keyframes whose pairs gave it, `judged` whether it decided the floor check (map.md §2: the frame's own floor-check scale lay beyond the monocular bound about k but within it about this scale, so the frame has `depth_scale` and its content instead of `detail` `floor_not_judged`). Absent when nothing was measured: no neighbour within the pair limits (a turning look before the robot's first straight move; a move shorter than its translation sigma allows, map.md §1), pairs that disagree, or a depth image. It never changes the frame's registration or pose. |
-  | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
-  | `prior_residual_sent_m`, `prior_residual_sent_deg` | Optional (oms/2.13). The residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior **as sent**, before any drift estimate placed it; null without a prior or a pose. With `prior_residual_*` (against the prior as placed) and `quality.drift_correction`, a client separates what the drift estimate moved from what the images moved. |
+  | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (since oms/2.18 through the prior scale for both trusts, and a `drifting` prior through the drift estimate, map.md §1 Prior scale), for every status with a pose: registered, provisional and kept frames alike; null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
+  | `prior_residual_sent_m`, `prior_residual_sent_deg` | Optional (oms/2.13). The residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior **as sent**, before any prior scale or drift estimate placed it, for every status with a pose (a kept frame's included: its distance from what it sent); null without a prior or a pose. With `prior_residual_*` (against the prior as placed) and `quality.drift_correction`, a client separates what the drift estimate moved from what the images moved. |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the frame's image pose's inliers that are floor points (map.md §2, Texture-aliasing guards): near 1 when the pose rests on the floor's texture. Null when the frame has no points fit (no image pose, a rotation-only fit, the older mapper) or the map has no floor. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
@@ -156,8 +161,9 @@ error code `invalid_request` (§9).
   | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2); the keyframe stays a registration reference for image matching and pose; its depth lifts later frames' points fits for their pose only (oms/2.13), never their alignment, depth confirmation or scale evidence, and nothing in locate (map.md §2, §6 below))). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
-  `reason` says why. Its prior residuals are 0, measured against the prior as placed (for a
-  `drifting` prior, after mapping through the drift estimate). It is stored, but locate never
+  `reason` says why. Its prior residuals are 0, measured against the prior as placed (through
+  the prior scale, map.md §1, and for a `drifting` prior through the drift estimate); its
+  `prior_residual_sent_*` are its distance from the prior as sent. It is stored, but locate never
   uses it as a reference (§6), nor does registration of new frames: a `kept_at_prior` frame of
   an earlier version, or a frame that ends the job kept, is never a registration reference
   (map.md §2, match graph). Occupancy, heights, the
@@ -215,7 +221,9 @@ error code `invalid_request` (§9).
   * A client tells the kept frames that carried content by their `reason` `too_close` with a
     null `detail` (every kept frame carries a reason: the schema requires one for
     `kept_at_prior`); `too_close` with `conflict_unsupported` carried none.
-  * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
+  * With a `metric` prior, its pose is the prior as placed (the prior itself while no prior
+    scale is in force; under one, its horizontal position scaled about the origin, map.md §1
+    Prior scale) and its sigmas are the prior's.
   * With a used body link to a confirmed frame (oms/2.15, Body links below), its pose is the
     linked pose with the composed sigmas, whatever its prior (map.md §1, Body links).
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
@@ -303,7 +311,9 @@ error code `invalid_request` (§9).
 
   **Pose sigmas** (`sigma_pos_m`, `sigma_rot_deg`, here and in [`Frames`]) include the
   image-registration noise, calibrated so that the containment targets
-  (`update.sigma_containment`, evaluation.md) are met. They are 3-D RMS (§6), and mean the same
+  (`update.sigma_containment`, evaluation.md) are met. Since oms/2.18 a registered frame's
+  sigmas also carry its references' own (map.md §2, Reference sigma): a frame resting on a
+  loosely placed keyframe reports that looseness. They are 3-D RMS (§6), and mean the same
   for every engine.
 
   **Drift correction** (oms/2.5). `quality.drift_correction` reports what the drift estimate did
@@ -313,8 +323,24 @@ error code `invalid_request` (§9).
   images; `prior_residual_sent_*` (oms/2.13) gives that distance directly. Null when the job has
   no `drifting` prior. It carries (oms/2.13) `held`, whether the one-view rule (map.md §1, No
   correction from one view) held a frame of the job, and `agreeing_frames`, the views that agreed
-  on the largest correction it tested; it is in every update response that carries a quality
+  on the largest correction it tested, and (oms/2.18) `restarted`: `signalled` when the job's
+  priors named a newer `odometry_epoch`, `detected` when its frames showed an unsignalled
+  re-anchor, null otherwise (map.md §1, Odometry epochs); it is in every update response that carries a quality
   report: the job's, and the dry run's predicted one.
+
+  **Prior scale** (oms/2.18). `quality.prior_scale` `{value, sigma, applied, evidence_count}`
+  reports the map's one scale for its priors (map.md §1, Prior scale): the odometry's error in
+  counting travel, measured on depth-image baselines and shared by `metric` and `drifting`
+  priors. While `applied`, every prior is placed with it (a `metric` prior's horizontal
+  position scaled about the origin, a `drifting` prior through the drift estimate, whose
+  `odo_scale` it then is), and `prior_residual_*` are measured from that placement while
+  `prior_residual_sent_*` keep the distance from what was sent: a client whose odometry
+  over-counts by 10 % sees `value` about 0.91 and small placed residuals, instead of residuals
+  growing with the distance from the start. `quality.replaced[]`, `{name, displacement_m}`,
+  lists the keyframes a change of the applied scale moved (map.md §1, Re-placement): the region
+  placed before the scale was known, now where the images and the scaled priors agree. A
+  stored keyframe's re-placement is not in `previous_residuals` or `gauge_shift`. Both are in
+  every update response that carries a quality report, the dry run's predicted one included.
 
   **Scale check** (oms/2.8). `quality.scale_check` compares the camera heights the client sent
   with what the frames' own depth measures: `{median_ratio, spread, frames}`, over the job's
@@ -604,6 +630,7 @@ The versions read, revert and `--keep-versions` are O2.
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
   | `height_consistent` | With a camera-height scale (see below): whether the located camera height agrees with the expected one within 3 sigma; null otherwise. |
   | `prior_residual_m`, `prior_residual_deg` | Optional (oms/2.13). The located pose against the frame's prior as sent; null without a prior or a pose. |
+  | `prior_residual_placed_m`, `prior_residual_placed_deg` | Optional (oms/2.18). Present for a located frame sent with a prior: the located pose against the prior as placed (Prior placement, below). |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the located pose's inliers that are floor points (Floor points, below); null for a turn fit, without a pose or without a map floor. |
   | `depth_check` | Optional (oms/2.17). Present only when the frame sent `depth`: `{pose, refused}` (Query depth, below). `pose` is `confirmed` or `untested` for the reported pose, null without a pose; `refused` counts the distinct hypotheses the depth refused, those within the rival tolerance (0.10 m and 5°) of each other counting once. Absent for a frame without depth. |
 
@@ -658,6 +685,18 @@ The versions read, revert and `--keep-versions` are O2.
     | without depth | 0.15 m / 2.1° | 0.15 m / 2.1° | 0.15 m / 2.1° |
 
     Locate uses the `none` column.
+* **Prior placement** (oms/2.18). A locate frame's prior is placed in the map exactly as an
+  update places it (map.md §1, Prior scale, Drift estimate, Odometry epochs), by the located
+  version's mapper map: a `metric` prior under the map's prior scale, a `drifting` prior through
+  the map's drift estimate (its odometry scale, its epoch: a prior of another epoch as sent)
+  with the drift-grown sigma of map.md §1. That placed prior and its sigmas are what the
+  conflict bound (§4: for a `drifting` prior σ_prior is the drift-grown sigma), the rivals'
+  `outside_prior`, `consistent_with_prior` and the hypotheses' prior choice use. Before
+  oms/2.18 locate took a drifting prior as sent with its sent sigma: a map whose drift estimate
+  had absorbed the client's odometry error rejected correct locates `prior_conflict`.
+  `prior_residual_*` stay against the prior as sent; `prior_residual_placed_*` are against the
+  prior as placed. A version without an anchored mapper map (the older mapper) uses priors as
+  sent.
 * **Query depth** (oms/2.17). A frame that sends `depth` (§3) has every pose hypothesis tested
   against its references' sensor depth images, with registration's depth confirmation (map.md
   §1, Measurable pair and Depth agreement: `SENSOR_DEPTH_TOL`, `MIN_AGREEING`,

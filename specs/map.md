@@ -153,7 +153,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   previous version and the pose that would be committed; `scale_ratio` 1. It is about 0 when
   no stored keyframe moved. Stored `kept_at_prior` keyframes are stored keyframes: their
   movement counts here and in `previous_residuals`, except the movement of their confirmation
-  when a job re-registers them (§2), which is reported only in `quality.reregistered`.
+  when a job re-registers them (§2), which is reported only in `quality.reregistered`, and
+  (oms/2.18) the movement of a re-placement under a changed prior scale (Prior scale, below),
+  reported only in `quality.replaced`. A re-placement keeps the map frame: it is no gauge
+  change and no rebuild.
 * **Residuals against the previous version.** `quality.previous_residuals` covers the earlier
   keyframes only: its `count` is at most the previous version's keyframe count. A stored
   keyframe that moves beyond tolerance shows in `previous_residuals.max_m` / `max_deg` and is
@@ -161,8 +164,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **New-frame displacement.** How far the service moves the update's new frames from what was
   sent is in `quality.max_displacement_m` and `max_displacement_deg` (§4), not in
   `gauge_shift`. A client setting `max_displacement_*` asks exactly that.
-  * A frame with a prior: its committed pose against the prior as sent (a `drifting` prior as
-    placed through the drift estimate).
+  * A frame with a prior: its committed pose against the prior as placed (oms/2.18: through
+    the prior scale, Prior scale below, and a `drifting` prior through the drift estimate);
+    the prior as sent when nothing places it otherwise.
   * A frame without a prior: its committed pose against its image-only pose (the pose its
     images alone give against the map). Such a frame whose image-only pose is unconstrained in
     translation (two-view parallax, above, below 1 px against every reference it registers to)
@@ -258,11 +262,110 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     no count bound, and resets to the new fit's inliers whenever the estimate changes. The
     no-count-bound rule applies only to the supporting frames: odometry-scale evidence stays
     capped by a constant recorded in `README.md`.
+* **Prior scale** (oms/2.18). A robot's odometry may count its travel with a scale error (a
+  wheel radius a few per cent off): every prior it sends, `metric` and `drifting` alike, then
+  carries that error, growing with the distance travelled from where the odometry started. The
+  map keeps **one prior scale** *s* for its priors, map metres per metre of the priors' travel,
+  shared by both trusts, as it keeps one drift estimate: a map's priors come from one client
+  and its odometry. It is estimated, applied and reported as follows; it holds on every engine
+  but the older mapper, which applies none (`quality.prior_scale.applied` false).
+  * **Evidence.** A frame registered by a points fit (not a rotation-only, linked or other
+    engine's placement) gives one baseline per reference that holds at least the registration
+    minimum of its inliers and carries a sensor depth image and a prior of the same trust and
+    odometry epoch as the frame's: the distance between the two priors as sent, and the
+    distance between the reference's committed centre and the frame's centre fitted on that
+    reference's own points alone (a pose on several references mixes their placements, which
+    priors pulled). The image baseline is the
+    reference depth image's metres, which the priors did not set. A monocular reference gives none: its
+    keyframe's own depth scale spreads about k by up to 2 × (Keyframe depth scale, below), more
+    than the error to be measured. Baselines whose prior distance is shorter than
+    `SCALE_EVIDENCE_MIN_M` (`README.md`, 0.1 m) tell nothing and are left out. A baseline is
+    recorded only when its frame's job keeps it registered, the newest `MAX_EVIDENCE`
+    (`README.md`, 500) kept with the map.
+  * **Estimate.** With r = ln(image baseline / prior baseline) per baseline, the baselines
+    agree that lie within 3 × max(1.4826 × MAD(r), `PRIOR_SCALE_NOISE_REL`) of the median of
+    r (`README.md`). An estimate exists only when at least `PRIOR_SCALE_MIN` (`README.md`, 5)
+    baselines agree, more than half of them, from at least `DRIFT_AGREE_MIN` (3) frames, and the priors of the map's image-confirmed
+    keyframes span at least `PRIOR_SCALE_SPAN_M` (`README.md`, 0.5 m) in one trust: never from
+    one sample, never from one place. Its value is the least-squares ratio of the agreeing
+    image baselines on their prior baselines (long baselines weigh most), its relative sigma
+    their 1.4826 × MAD in r over the root of their count, floored at
+    `PRIOR_SCALE_NOISE_REL` over the same root.
+  * **Applied.** The estimate is significant when |ln s| exceeds 2 × hypot(its sigma, a depth
+    image's own scale sigma, `SENSOR_SCALE_SIGMA_REL` in `README.md`). The scale in force is
+    the significant estimate, else 1; it changes only when it would move by more than 2 × the
+    estimate's sigma in ln scale, so small fluctuations of the evidence never move the map.
+    It is decided at each job's end, once the job's statuses are final (after the
+    pose-duplicate pass), never within a job: every frame of a job is placed with the scale in
+    force at its start, so the outcome does not depend on frame order, and a job's own
+    baselines take effect from its commit on, as supporting frames do (Drift estimate).
+  * **The prior as placed.** Under a scale *s* in force, a `metric` prior as placed is the
+    prior with its horizontal position (x, y) scaled by *s* about the origin's prior centre;
+    its height, rotation and sigmas stay as sent. The map frame stays the priors' frame, fixed
+    by the first update and never re-gauged: its origin and axes do not move, only distances
+    from the origin do. A `drifting` prior is placed through the drift estimate, whose odometry
+    scale is *s* while a scale is in force (`quality.drift_correction.odo_scale`): its own
+    odometry-scale evidence is then not used. Without a drift estimate (the identity) a
+    `drifting` prior is placed as a `metric` one. The prior as placed is what every use of the
+    prior takes: the conflict bound and looseness tests, the fusion, the drift estimate's
+    supporting frames, a kept frame's pose, `prior_residual_*` (api.md §4) and
+    `max_displacement_*`.
+  * **Trust.** A `metric` prior keeps its trust under a scale in force: its sigmas weigh it,
+    its frame is the map's. Only the scale source changes (Scale, item 1). Demoting a chain's
+    `metric` priors to `drifting` while the images contradict them is not done: the prior scale
+    explains a consistent odometry error with one number, and a prior that the images still
+    contradict beyond its placed bound is a prior conflict, as before.
+  * **Re-placement.** When the scale in force changes, a keyframe whose committed position
+    rests on its prior moves with its prior as placed: its correction is Δ = a × λ × (*s* −
+    *s*₀) + (1 − a) × Δ_ref, where *s*₀ is the scale its prior was placed with, λ the prior's
+    lever (the offset that the scale multiplies: a `metric` prior's horizontal offset from the
+    origin's prior centre, a `drifting` prior's odometry offset from the drift estimate's
+    reference, turned into the map frame), a the prior's share of the committed position (its
+    weight in the fusion, 1 / σ_prior² over 1 / σ_prior² + 1 / σ_image²: 1 for a frame kept or
+    seeded at its prior, 0 without a prior) and Δ_ref the correction of its main reference (a
+    stored or linked frame's partner), 0 without one. It is the first-order response of each
+    committed fusion to its prior's change, every image constraint kept: a frame registered on
+    a moved keyframe moves with it as far as its image weighed. Positions only: the scale turns
+    nothing. The corrections are computed once per change, in the order of the references,
+    deterministically; one below `REPLACE_MIN_M` (`README.md`, 0.01 m) is not applied. The
+    drift estimate's reference moves with the keyframe that defines it, and the cloud is fused
+    again from the keyframes at their new poses. Versions are immutable: the re-placement is
+    part of the version the job commits. The job lists every moved keyframe, stored or its own,
+    in `quality.replaced` (§4); a stored keyframe's movement is excluded from
+    `previous_residuals` and `gauge_shift`. A job's own frames report their re-placed poses
+    with their residuals against their priors as placed under the new scale. A keyframe stored
+    before oms/2.18 carries no placement record: it never moves, and its reference corrections
+    end there.
+  * **Report.** `quality.prior_scale` (§4).
+* **Odometry epochs** (oms/2.18). A client may re-anchor its odometry (a reset, a
+  relocalisation): its priors then jump, and odometry differences across the jump mean
+  nothing. A prior's `odometry_epoch` (api.md §3, default 0) names the odometry it comes from.
+  * A job whose `drifting` priors name a newer epoch than the drift estimate's restarts the
+    estimate: the identity of the newest epoch (priors as sent, with their sigmas), its
+    odometry scale the prior scale in force (else 1), no support, no odometry-scale evidence,
+    no held views; the job's fit may then make a first estimate under the usual support rule.
+    A `drifting` prior of another epoch than the estimate's is placed as sent.
+  * No baseline straddles two epochs: the prior scale's baselines, the drift estimate's
+    odometry-scale evidence (restarted with it) and the keyframe depth scale's prior pairs take
+    two priors of one epoch only. The prior scale itself is pooled over epochs: each baseline
+    is a ratio within one epoch, and the error it measures is the odometry's way of counting
+    travel, which a re-anchor does not change. A `metric` prior is scaled only in the origin
+    prior's epoch (the scale's pivot is where that odometry started); in another epoch it is
+    placed as sent.
+  * **Unsignalled re-anchor.** Under a drift estimate, when at least `DRIFT_MIN_SUPPORT` (3)
+    of a job's frames that can support an estimate (Drift estimate), and more than half of
+    them, have points-fit image poses within the conflict bound of their priors as sent and
+    beyond it of their priors as placed, the odometry was re-anchored without a signal: the
+    estimate restarts as for a new epoch (its epoch number unchanged) instead of fitting a
+    change, and the job is registered again under it.
+  * `quality.drift_correction.restarted` reports `signalled` or `detected` (§4).
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without
   such rotation keeps all its features.
 * **Scale.** The scale comes from the first available of:
-  1. `metric` priors (`scale_source: priors`);
+  1. `metric` priors (`scale_source: priors`), while no prior scale is applied (Prior scale,
+     above, oms/2.18): once one is, the priors did not give the map's scale, the images
+     corrected it, and the source is the next available one;
   2. depth images (`depth`);
   3. body-link baselines (`baseline`, oms/2.15): the link-measured scales (Keyframe depth
      scale, below: a measurement whose agreeing pairs are all body-link pairs) of the map's
@@ -324,7 +427,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     between them, which that order bounds and their distance does not), whose priors' optical
     axes lie at most `KEYFRAME_PAIR_MAX_DEG` (60°) apart. The relative pose is the two priors' as
     sent; a `drifting` pair's translation is taken in map metres (times the drift estimate's
-    odometry scale, §4 `drift_correction.odo_scale`). Its translation sigma σ_t is, for a
+    odometry scale, §4 `drift_correction.odo_scale`), and since oms/2.18 a `metric` pair's
+    times the prior scale in force (Prior scale, above). Its translation sigma σ_t is, for a
     `drifting` pair, hypot(hypot(`DRIFT_POS_REL`, σ_odo) × |t|, `KEYFRAME_BASELINE_SIGMA_MIN_M`
     (0.03 m), sqrt(|σ_a² − σ_b²|)): the drift both priors share since the client's last fix
     cancels; the odometry's error over the move (the drift-grown rate of this section) and its
@@ -650,6 +754,24 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        floor has no floor points, and this guard does not apply.
     The input status's `inlier_floor_share` (api.md §4) is the share of the committed image
     pose's inliers that are floor points (null without a points fit or without a map floor).
+  * **Reference sigma** (oms/2.18). An image pose is measured relative to its references, so
+    their own error is part of its error in the map frame: a pose resting on a reference of
+    σ 0.4 m does not claim 0.02 m. A registered frame's committed and reported sigmas are
+    hypot(σ_fused, (1 − a) × σ_refs), position and rotation separately: σ_fused the fusion's
+    (image, prior and sent height), σ_refs the root of the inlier-weighted mean of its
+    references' committed variances, a the prior's share of the fused pose (Prior scale,
+    Re-placement, in §1; 0 without a prior). A pose whose references all lie in a seeded
+    component takes the seed floor instead (Match graph, step 2), which composes the same
+    error; a linked pose composes its partner's already (§1, Body links). The composed sigmas
+    are the committed ones: the frame's reported `sigma_*`, a later frame's reference sigma, the
+    depth-consistency margin (§4), `low_confidence_share`. The frame's own sigmas (the image
+    pose's calibrated ones and their fusion with the prior) stay what weighs the frame against
+    its own measurements: the prior checks and looseness tests, the fusion weights, the drift
+    estimate, the height gate and the floor check. The references' error is common to the
+    region the frame registers against, and the image measures the frame's place within it:
+    weighing the frame toward its prior by that common error would break the region's local
+    consistency, and a prior conflict judged on it would excuse an aliased fit on a loose
+    region.
   * **Re-registration.** A stored `kept_at_prior` frame is eligible when a new registered frame of
     the job covers at least 10 % of its image (the overlap of §1, with the kept frame as the
     reference) and matches it with at least the registration minimum of inliers (the `README.md`
@@ -881,7 +1003,8 @@ becomes a job with a `job_id`. A job goes through these states:
     estimate's correction at the job's frames, from the prior as sent to the prior as placed (§1,
     Drift estimate): the largest translation and the largest rotation, over the job's frames
     with a `drifting` prior, between a frame's prior as sent and as placed, and the estimate's
-    odometry scale (map metres per odometry metre, 1 without scale evidence). The estimate is
+    odometry scale (map metres per odometry metre, 1 without scale evidence; since oms/2.18 the
+    prior scale while one is in force, §1 Prior scale). The estimate is
     the one the job's frames were placed with, after any change the job accepted. On a dry run,
     the estimate it would place them with. Null when no frame of the job has a `drifting`
     prior; the identity estimate gives `{0, 0, 1}`. It tells a client how much of a frame's
@@ -890,7 +1013,9 @@ becomes a job with a `job_id`. A job goes through these states:
     view) held at least one of the job's frames, and `agreeing_frames`, the names of the views
     (this job's frames and earlier jobs' held ones) that agreed on the largest correction the
     rule tested, that frame included, sorted; empty when no frame's correction exceeded its
-    prior's sigma (the older mapper: `held` false, `agreeing_frames` empty);
+    prior's sigma (the older mapper: `held` false, `agreeing_frames` empty); and (oms/2.18)
+    `restarted`, `signalled` or `detected` when the job restarted the estimate (§1, Odometry
+    epochs), else null;
   * `rotation_pairs`: every measurable pair (§1) the rotation check evaluated, on dry runs as
     on jobs, each `{a, b, inliers, overlap, measured_deg, committed_deg, difference_deg}`: the
     frame names in canonical order, the pair's epipolar inliers, its 8 × 8 overlap, the
@@ -923,6 +1048,16 @@ becomes a job with a `job_id`. A job goes through these states:
     frame this job's images confirmed (§2): how far confirmation moved the frame from its
     prior-placed pose. Empty when there are none; a dry run predicts it. This movement is not
     in `previous_residuals` or `gauge_shift`;
+  * `prior_scale` (oms/2.18): `{value, sigma, applied, evidence_count}`, the map's prior scale
+    after the job (§1, Prior scale): `value` the scale in force when `applied`, else the latest
+    estimate, 1 without one; `sigma` its relative sigma, null without an estimate; `applied`
+    whether the priors are placed with it; `evidence_count` the baselines recorded (at least
+    the minimum prior distance). On a dry run, what the job would leave; on the older mapper
+    `{1, null, false, 0}`;
+  * `replaced` (oms/2.18): one `{name, displacement_m}` per keyframe the job re-placed under a
+    changed prior scale (§1, Prior scale, Re-placement), stored or the job's own, in canonical
+    order: how far its position moved. Empty when none; a dry run predicts it. A stored
+    keyframe's movement here is not in `previous_residuals` or `gauge_shift`;
   * the anchor residuals (median and max, in m and deg, against metric priors and, over earlier
     keyframes only, against the previous version);
   * `rejected_share`: inputs rejected over inputs sent;
@@ -977,7 +1112,15 @@ becomes a job with a `job_id`. A job goes through these states:
       relative pose (§1, Depth agreement). A point is a contradiction only when the other view
       would see through it by more than the depth tolerance of the depth confirmation (a
       constant in `README.md`) plus three times the two frames' combined committed position
-      sigma.
+      sigma (since oms/2.18 with their references' sigma composed in, §2 Reference sigma).
+    * A prior scale that changes at the job's end (§1, Prior scale) re-places keyframes after
+      the resolution's rounds (below): the rounds pair the poses of the registration fixed
+      point, and the final check of the committed poses (Whole-update rejection) pairs the
+      re-placed ones. A frame registered on a re-placed keyframe moves with it, so their pair
+      keeps its relative pose. A region-level suspect test (several stored keyframes sharing one
+      rigid offset that the new frames' failing pairs explain) is not specified in oms/2.18: a
+      region misplaced by a prior scale error is re-placed instead, from the job whose end
+      changes the scale on.
     * A pair fails under the depth confirmation's minimum count and agreement threshold (§1,
       Measurable pair), in either direction: at least that minimum of points agree or
       contradict, and fewer than that threshold of them agree.

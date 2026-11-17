@@ -723,8 +723,9 @@ def test_a_disagreeing_monocular_depth_is_kept_as_it_is(tmp_path: Path,
 
 
 def test_metric_priors_with_a_scale_bias(tmp_path: Path) -> None:
-    """Metric priors over-counting 10 % against depth images: the bias is measured and the
-    later predictions corrected (and a sensor map reports depth, not the biased priors)."""
+    """Metric priors over-counting 10 % against depth images (oms/2.18, map.md §1 "Prior
+    scale"): the scale is decided at the job's end, the job's keyframes re-placed, and the next
+    job's priors placed with it (a sensor map reports depth, not the biased priors)."""
     m = new_map(tmp_path)
     o = np.array([-1.5, 0.0])
 
@@ -735,11 +736,15 @@ def test_metric_priors_with_a_scale_bias(tmp_path: Path) -> None:
 
     truth = [base_pose(5 * (k % 3), -1.5 + 0.2 * k, 0.05 * (k % 2)) for k in range(12)]
     m.update([frame("w0", truth[0], p=biased(truth[0]))])
-    pls = m.update([frame(f"w{k}", truth[k], p=biased(truth[k])) for k in range(1, 12)])
+    pls = m.update([frame(f"w{k}", truth[k], p=biased(truth[k])) for k in range(1, 7)])
     assert all(p.status == "registered" for p in pls)
-    assert m.prior_bias() == pytest.approx(1 / 1.10, rel=0.03)
+    assert m.pscale.applied and m.pscale.value == pytest.approx(1 / 1.10, rel=0.02)
+    assert m.replaced and all(err(p.T, truth[k])[0] < 0.04 for k, p in enumerate(pls, 1))
+    pls = m.update([frame(f"w{k}", truth[k], p=biased(truth[k])) for k in range(7, 12)])
+    assert all(p.status == "registered" for p in pls) and m.replaced == []
     assert m.scale_summary()[0] == "depth"
-    assert err(pls[-1].T, truth[-1])[0] < 0.08
+    assert err(pls[-1].T, truth[-1])[0] < 0.03
+    assert m.drift_moves([]) == ([], m.pscale.value)  # the identity: the prior scale
 
 
 def test_floor_candidates_and_the_vote() -> None:

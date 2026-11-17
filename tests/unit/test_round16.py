@@ -480,7 +480,7 @@ def test_drift_correction_values() -> None:
     assert drift_correction([], 1.0) is None
     assert drift_correction([(0.1, 2.0), (0.3, 1.0)], 1.02) == {
         "translation_m": 0.3, "rotation_deg": 2.0, "odo_scale": 1.02, "held": False,
-        "agreeing_frames": []}
+        "agreeing_frames": [], "restarted": None}
     m = AnchoredMap(Path("unused"))
     P = base_pose(0)
     moved, odo = m.drift_moves([prior(P, "drifting")])
@@ -501,7 +501,7 @@ def test_drift_correction_values() -> None:
           type("F", (), {"work": Work(None)})()]
     assert mapper_drift_correction(fr, None) == {  # type: ignore[arg-type]
         "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0, "held": False,
-        "agreeing_frames": []}
+        "agreeing_frames": [], "restarted": None}
     sim = anchor.Sim3(1.25, np.eye(3), np.array([0.1, 0.0, 0.0]))
     got = mapper_drift_correction(fr, sim)  # type: ignore[arg-type]
     assert got is not None and got["odo_scale"] == 0.8 and got["translation_m"] > 0
@@ -548,7 +548,7 @@ def test_jobs_and_dry_runs_report_the_drift_correction(client: Client) -> None: 
     fr, files = _drifting(client, [base_pose(0)], "n")
     assert dry(client, "n", fr, files, cameras={"cam": CAM})["quality"]["drift_correction"] == {
         "translation_m": 0.0, "rotation_deg": 0.0, "odo_scale": 1.0, "held": False,
-        "agreeing_frames": []}
+        "agreeing_frames": [], "restarted": None}
 
 
 def test_a_gated_job_reports_the_poses_it_would_commit(client: Client) -> None:  # noqa: F811

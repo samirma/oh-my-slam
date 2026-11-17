@@ -22,6 +22,7 @@ from numpy.typing import NDArray
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.log import get_logger, log_context
 from oh_my_slam.mapping import anchor, checks, navgrid, relocalize, sigmas
+from oh_my_slam.mapping.anchored import AnchoredMap
 from oh_my_slam.service.cameras import (
     Camera,
     decode_mask,
@@ -352,8 +353,11 @@ def locate_frames(store: Store, name: str, req: dict[str, Any], parts: dict[str,
     return out
 
 
-def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
-           ) -> tuple[relocalize.Query, checks.Measures]:
+PLACERS_KEPT = 16  # versions whose prior placement locate keeps read (``placer``)
+
+
+def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False,
+           placer: AnchoredMap | None = None) -> tuple[relocalize.Query, checks.Measures]:
     import cv2
 
     cam = fr.camera
@@ -371,6 +375,13 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
         q.prior = np.asarray(p["T_map_cam"], np.float64)
         # its own sigmas, else its trust's defaults (api.md §3)
         q.prior_sigma_pos_m, q.prior_sigma_rot_deg = anchor.prior_sigmas(p)
+        got = None if placer is None else placer.place_prior(p)
+        if got is not None:
+            # as an update places it (api.md §6, oms/2.18): through the map's prior scale, a
+            # drifting one through its drift estimate with the drift-grown sigmas
+            q.prior = got[0]
+            if p["trust"] == "drifting":
+                q.prior_sigma_pos_m, q.prior_sigma_rot_deg = got[1], got[2]
         q.prior_sigma_tilt_deg = sigmas.tilt_sigma(p, anchor.MIN_SIGMA_ROT_DEG)
     # z_expected (api.md §6): the floor plus the frame's height above it, else its camera's
     # registered one; height_sigma the frame's own when it carries one, else the answer's
@@ -402,35 +413,69 @@ def locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
 def locate_summary(fr: LocateFrame, res: dict[str, Any]) -> dict[str, Any]:
     """A locate answer's line in the service log: the frame's name, status and reason, its
     sigmas, and its residual against the prior sent (m, deg; null without a prior or a pose), so
-    a client measures the located sigmas' containment against its own truth."""
+    a client measures the located sigmas' containment against its own truth; whether it sent a
+    depth part and its ``depth_check`` (pose, refused) when present, and its rivals: how many,
+    and how many lie outside the prior's conflict bound (oms/2.18: log only)."""
     p = fr.prior
     dm, dd = prior_residual(fr, res["T_map_cam"])
-    return {"name": fr.name, "status": res["status"], "reason": res["reason"],
-            "sigma_pos_m": res["sigma_pos_m"], "sigma_rot_deg": res["sigma_rot_deg"],
-            "prior": None if p is None else p.get("trust"),
-            "prior_residual_m": dm, "prior_residual_deg": dd}
+    rivals = res.get("rivals") or []
+    out = {"name": fr.name, "status": res["status"], "reason": res["reason"],
+           "sigma_pos_m": res["sigma_pos_m"], "sigma_rot_deg": res["sigma_rot_deg"],
+           "prior": None if p is None else p.get("trust"),
+           "prior_residual_m": dm, "prior_residual_deg": dd,
+           "depth": fr.depth is not None, "rivals": len(rivals),
+           "rivals_outside_prior": sum(bool(r.get("outside_prior")) for r in rivals)}
+    if "depth_check" in res:
+        out["depth_check"] = dict(res["depth_check"])
+    return out
 
 
-def prior_residual(fr: LocateFrame, T: Any) -> tuple[float | None, float | None]:
+def prior_residual(fr: LocateFrame, T: Any, placed: Any = None
+                   ) -> tuple[float | None, float | None]:
     """A located pose ``T`` against the frame's prior as sent (m, deg; api.md §6
-    ``prior_residual_*``, oms/2.13); nulls without a prior or a pose."""
+    ``prior_residual_*``, oms/2.13), or against ``placed``, the prior as placed (oms/2.18);
+    nulls without a prior or a pose."""
     p = fr.prior
     if p is None or "T_map_cam" not in p or T is None:
         return None, None
-    A, B = np.asarray(T, np.float64), np.asarray(p["T_map_cam"], np.float64)
+    A = np.asarray(T, np.float64)
+    B = np.asarray(p["T_map_cam"] if placed is None else placed, np.float64)
     c = (float(np.trace(A[:3, :3].T @ B[:3, :3])) - 1.0) / 2.0
     return (round(float(np.linalg.norm(A[:3, 3] - B[:3, 3])), 4),
             round(math.degrees(math.acos(max(-1.0, min(1.0, c)))), 3))
+
+
+_PLACERS: dict[tuple[str, int], AnchoredMap | None] = {}
+_PLACERS_LOCK = threading.Lock()
+
+
+def placer(derived: Derived, dv: DerivedVersion) -> AnchoredMap | None:
+    """What places a locate frame's prior in a version (api.md §6, oms/2.18): its mapper
+    map's drift estimate and prior scale (``AnchoredMap.priors_only``), read once per version;
+    None for a version without an anchored mapper map (priors used as sent)."""
+    key = (str(derived.store.dir(dv.name)), dv.version)
+    with _PLACERS_LOCK:
+        if key not in _PLACERS:
+            try:
+                path = derived.store.mapper_for(dv.name, dv.version)
+            except ApiError:
+                path = None
+            _PLACERS[key] = None if path is None else AnchoredMap.priors_only(path)
+            while len(_PLACERS) > PLACERS_KEPT:
+                del _PLACERS[next(iter(_PLACERS))]
+        return _PLACERS[key]
 
 
 def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
             ) -> list[dict[str, Any]]:
     """``locate``'s answers."""
     index = derived.index(dv)
+    place = placer(derived, dv)
     out = []
     for fr in frames:
         # with a camera-height scale, the camera height sent is the map's expected one there
-        q, measures = _query(fr, dv.floor_z, dv.record["scale_source"] == "camera_height")
+        q, measures = _query(fr, dv.floor_z, dv.record["scale_source"] == "camera_height",
+                             place)
         res: dict[str, Any] = {"name": fr.name, "status": "rejected", "reason": None,
                                "T_map_cam": None, "sigma_pos_m": None, "sigma_rot_deg": None,
                                "inlier_ratio": None, "ambiguity": None, "rivals": [],
@@ -463,6 +508,9 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                         "inlier_floor_share": o.floor_share})
             res["prior_residual_m"], res["prior_residual_deg"] = prior_residual(
                 fr, res["T_map_cam"])
+            if q.prior is not None:  # oms/2.18: against the prior as placed
+                res["prior_residual_placed_m"], res["prior_residual_placed_deg"] = \
+                    prior_residual(fr, res["T_map_cam"], q.prior)
         elif o.reason is not None:  # prior_conflict, depth_inconsistent
             res["reason"] = o.reason
         else:  # enough keypoints, no pose: no overlap with the map

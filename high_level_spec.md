@@ -315,6 +315,33 @@ hypothesis is neither reported nor a rival; every hypothesis refused is the new 
 unchanged. New optional field: the locate result's `depth_check` `{pose, refused}`, present only
 when the frame sent depth; a frame without depth is answered as before.
 
+**oms/2.18** is additive: one **prior scale** per map (map.md §1, Prior scale), the odometry's
+error in counting travel, shared by `metric` and `drifting` priors (one client, one odometry).
+It is measured on depth-image baselines (a registered frame and its main reference, both priors
+of one trust: image distance over prior distance), robustly and never from one sample, decided
+at each job's end and applied only when significant; under it a `metric` prior is placed with
+its horizontal position scaled about the origin (the map frame is not re-gauged) and a
+`drifting` prior through the drift estimate, whose odometry scale it is. Before oms/2.18 an
+unspecified bias rescaled `metric` priors only. When the applied scale changes, the keyframes
+whose positions rest on their priors are re-placed by the first-order response of their fusion
+(their references' corrections carried through the image constraints), the cloud fused again,
+in the version the job commits. `prior_residual_*` are against the prior as placed for every
+status, `prior_residual_sent_*` against the prior as sent. A registered frame's committed sigmas
+compose its references' own (map.md §2, Reference sigma); the prior checks, fusion weights and
+gates comparing the frame with its own measurements keep the frame's own sigmas. New optional
+quality fields: `prior_scale {value, sigma, applied, evidence_count}` and `replaced[]
+{name, displacement_m}`. A `metric` prior keeps its trust under an applied scale (no demotion);
+the scale source is then not `priors`. Odometry epochs (map.md §1): a prior may carry
+`odometry_epoch`, which the client increments when it re-anchors its odometry; a newer epoch
+restarts the drift estimate (`quality.drift_correction.restarted` `signalled`), no odometry
+baseline straddles two epochs, and an unsignalled re-anchor (most of a job's supporting frames
+near their priors as sent and beyond the bound of their priors as placed) restarts it too
+(`detected`) instead of fitting a change. A region-level suspect test of depth consistency is
+not part of oms/2.18 (false depth rejections are oms/2.19's). Locate places a frame's prior as an
+update does (api.md §6, Prior placement): through the located version's prior scale and drift
+estimate, a drifting prior with its drift-grown sigma, in the conflict bound and the rivals'
+`outside_prior`; new optional `prior_residual_placed_*` beside the as-sent `prior_residual_*`.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,
