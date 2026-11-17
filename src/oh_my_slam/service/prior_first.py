@@ -395,7 +395,7 @@ def _frame_in(fr: _Frame, mono: Future[Mono] | None) -> FrameIn:
         fr.cam.height_above_floor_m, fr.cam.height_sigma_m)
     return FrameIn(f.name, f.camera_id, fr.rgb, fr.cam.canonical(), prior, fr.depth_m, fr.ignore,
                    height, sigma, fr.measures.features, None if mono is None else _waiter(mono, fr.ignore),
-                   check_close=fr.deferred, unconfirmed=fr.unconfirmed)
+                   check_close=fr.deferred, unconfirmed=fr.unconfirmed, body=f.body)
 
 
 def _depth_kind(am: AnchoredMap | None, pl: Placement) -> str:
@@ -466,8 +466,12 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     """The ``InputStatus`` of a frame: rejected by the checks (``pl`` None) or as placed; a
     monocular keyframe's own depth scale from the floor check (``depth_scale``, map.md §2)."""
     if pl is None:  # rejected by the checks
-        return input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
-                         fr.scene_m, fr.duplicate_of)
+        row = input_row(fr.work.name, "rejected", fr.reason, 0, None, None, None, None,
+                        fr.scene_m, fr.duplicate_of)
+        link = body_link(fr, None, am)
+        if link is not None:
+            row["body_link"] = link
+        return row
     res = pl.prior_residual if fr.work.trust in ("metric", "drifting") else None
     k = None if am is None or pl.keyframe is None \
         or pl.status not in ("registered", "provisional") else am.keyframe(pl.keyframe)
@@ -481,7 +485,30 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     got = stereo_scale(k)
     if got is not None:
         row["stereo_scale"] = got
+    link = body_link(fr, pl, am)
+    if link is not None:
+        row["body_link"] = link
     return row
+
+
+def body_link(fr: _Frame, pl: Placement | None, am: AnchoredMap | None) -> dict[str, Any] | None:
+    """A frame's ``body_link`` (api.md §4, oms/2.15): its placement's when the mapper placed it,
+    else (a frame the checks rejected) its link before matching (``AnchoredMap.link_report``:
+    reason ``no_match`` once the link is usable); without a prior-first map ``engine``; None
+    without ``body.motion``."""
+    b = fr.work.body
+    if b is None or b.motion is None:
+        return None
+    if pl is not None and pl.link is not None:
+        return dict(pl.link)
+    if am is not None:
+        got = am.link_report(b)[0]
+        assert got is not None
+        return got
+    # no prior-first map (the older mapper's dry run): no links (map.md §1 "Every engine")
+    return {"from": b.motion.source_name, "state": "unused", "reason": "engine",
+            "baseline_m": None, "sigma_m": None, "rotation_deg": None,
+            "rotation_residual_deg": None}
 
 
 def stereo_scale(k: Keyframe | None) -> dict[str, Any] | None:
@@ -491,8 +518,11 @@ def stereo_scale(k: Keyframe | None) -> dict[str, Any] | None:
     without a measurement."""
     if k is None or k.stereo_scale is None or k.stereo_sigma is None:
         return None
-    return {"scale": round(k.stereo_scale, 5), "sigma_rel": round(k.stereo_sigma, 5),
-            "neighbours": list(k.stereo_pairs or []), "judged": k.stereo_judged}
+    out = {"scale": round(k.stereo_scale, 5), "sigma_rel": round(k.stereo_sigma, 5),
+           "neighbours": list(k.stereo_pairs or []), "judged": k.stereo_judged}
+    if k.stereo_links:  # oms/2.15: the pairs whose baseline was a body link path
+        out["link_neighbours"] = list(k.stereo_links)
+    return out
 
 
 def sent_residual(T: Any, prior: dict[str, Any] | None, trust: str | None

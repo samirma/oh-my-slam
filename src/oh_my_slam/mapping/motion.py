@@ -99,6 +99,7 @@ class Pair:
     rotation_change_deg: float | None = None
     points: int = 0
     sigma_t_rel: float = math.inf
+    inliers: int = 0  # the refined pose's inliers (oms/2.15: a linked edge's count)
     ra: Array = field(default_factory=lambda: np.zeros((0, 3)))
     tri: Triangulated | None = None
 
@@ -215,13 +216,15 @@ def pair(index: int, ref: Features, other: Features, K: Intrinsics, o: Other) ->
     T[:3, :3], T[:3, 3] = best.R, best.t
     change = rot_deg(best.R @ R0.T)
     out = Pair(index, "used", T, math.degrees(best.sigma_rot_rad), change)
+    out.inliers = int(best.inliers.sum())
     ra_in = ra[best.inliers]
+    out.ra = ra_in  # the inliers' rays in the reference (their overlap, oms/2.15)
     tri = triangulate(ra_in, rb[best.inliers], best.R, best.t, float(K.fx), best.sigma_rot_rad)
     out.points = int(np.count_nonzero(tri.sigma < BASELINE_POINT_SIGMA_MAX))
     if change > POSE_K_SIGMA * o.sigma_rot_deg:
         out.status = "pose_inconsistent"  # its points are counted, never pooled
         return out
-    out.ra, out.tri = ra_in, tri
+    out.tri = tri
     out.sigma_t_rel = o.sigma_pos_m / float(np.linalg.norm(t0))
     if out.sigma_t_rel > BASELINE_SIGMA_REL_MAX:
         out.status = "baseline_short"

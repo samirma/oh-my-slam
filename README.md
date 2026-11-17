@@ -1647,10 +1647,13 @@ Capture advice (from the rule and the replays):
 
 ### Body links: a metric relative prior from the camera mount (oms/2.15)
 
-Status: **specified, not implemented** (phase 1, spec commit). api.md §4 "Body links", map.md §1
-"Body links" and "Keyframe depth scale" (body-link pairs), §1 "Scale" item 3, §2 "Match graph"
-(linked edge, linked pose); schema `FrameBody`, `BodyMount`, `BodyMotion`, `MountSource`,
-`MotionSource`, `BodyLink`, `Camera.body_mount`, `StereoScale.link_neighbours`.
+api.md §4 "Body links", map.md §1 "Body links" and "Keyframe depth scale" (body-link pairs), §1
+"Scale" item 3, §2 "Match graph" (linked edge, linked pose); schema `FrameBody`, `BodyMount`,
+`BodyMotion`, `MountSource`, `MotionSource`, `BodyLink`, `Camera.body_mount`,
+`StereoScale.link_neighbours`. Code: `mapping.body` (records, floors, paths, the camera relative
+pose and its sigmas), `AnchoredMap.set_bodies`, `link_report`, `_linked`, `_place_linked`,
+`_finish_link`, `_scale_neighbours` (link pairs first), `ScaleState.link_votes`, `_links_allowed`;
+validation `service.app.check_bodies`; reports `service.prior_first.body_link`.
 
 Why. A monocular robot turning in place has no prior baseline (oms/2.14 replays: e305's look had
 prior steps of 4-16 cm across 17-109° turns with client fixes between them, so 0 of 13 keyframes
@@ -1688,14 +1691,31 @@ Decisions:
   3 sigma (a false match set must also fool the IMU). It needs no lifted depth, so a turning view
   is placed without the sliding points fit; a points fit beyond 3 sigma of the linked pose is no
   placement.
-* **Scale.** A link path is a body-link pair of the keyframe depth scale (preferred over prior
-  pairs, same 0.20 relative limit and pair rules). A measurement on link pairs only is scale
-  evidence (it does not depend on k or the drift estimate): `LINK_SCALE_MIN` such keyframes,
-  more than half agreeing, set k ahead of camera heights, and the map's scale (`baseline`) when
-  there are no metric priors or depth images. Lifting a keyframe at its own measured scale stays
-  refused (oms/2.14).
+* **Only from a confirmed frame; kept frames at the linked pose.** A linked edge needs its
+  `from` frame image-confirmed (`Keyframe.usable`: not kept), and the images' rotation agreeing
+  with the link's (`inconsistent` otherwise). A frame that ends kept with a usable link to a
+  confirmed frame is kept at the linked pose (refined when the images matched, else the link's
+  raw pose) with the composed sigmas; a link is never chained from a kept frame, so errors do not
+  compound.
+* **Scale, cautiously.** A link path is a body-link pair of the keyframe depth scale (preferred
+  over prior pairs, same 0.20 relative limit and pair rules). A measurement on link pairs only is
+  one vote for k (`ScaleState.link_votes`: `LINK_SCALE_MIN` such keyframes, more than half
+  agreeing), pooled with the camera heights by inverse variance, never an override, and never on
+  a map whose scale comes from metric priors or depth images (`_links_allowed`, the first two
+  branches of `scale_summary`). The source is `baseline` only when the link vote weighs more.
+  Lifting a keyframe at its own measured scale stays refused (oms/2.14).
+* **The motion floors are the client's** (its answers, 2026-11-17): a stepping body slides about
+  0.08 m per 90° turned on the spot and 0.02-0.04 m per 30-40° step, so dead reckoning's
+  translation floor is max(0.010 m, 0.001 m/° × |Δψ|); wheel odometry over-reads straight
+  distance by 8-13 %, so its floor is hypot(0.005 m, 0.10 |t|). With those floors a stepping
+  body's turn gives |t| ≈ 0.055 m against σ ≈ 0.04 m: no scale baseline. A head pan or tilt with
+  the body still has no slip: motion source `none` (both sources, identity within 0.001 m and
+  0.1°, both frames standing; floors 0.001 m / 0.1°) gives the lever arm about the pan axis as a
+  baseline with the two mounts as independent readings: a ±30° pan at 0.03 m with a measured
+  mount gives |t| 0.030 m, σ 0.003 m (`tests/unit/test_body_links.py`).
 
-Constants (proposed; phase 2 confirms or changes them by replay and records the evidence here):
+Constants (`mapping.body`; the stamp tolerances confirmed by the client, the floors its own
+figures; they may change with its measurements):
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
@@ -1703,18 +1723,38 @@ Constants (proposed; phase 2 confirms or changes them by replay and records the 
 | `MOUNT_STAMP_STANDING_MAX_S` | 0.5 s | the same for a `standing` frame |
 | mount default σ, `measured` / `commanded` | 0.002 m, 0.5° / 0.010 m, 3° | when the client sends none |
 | mount floor σ, `measured` / `commanded` | 0.001 m, 0.2° / 0.005 m, 1.5° | sent sigmas are raised to it |
-| yaw floor σ: `imu`, `lidar_match` / `odometry` / `dead_reckoning` | 0.5° / 1.0° / 1.0° | per relative motion |
-| translation floor σ: `lidar_match`, `odometry` / `dead_reckoning` / `imu` | 0.005 m / 0.010 m / 0.05 m | per relative motion |
-| tilt default σ | 1° | per axis, when `sigma_tilt_deg` is absent |
+| yaw floor σ: `imu`, `lidar_match` / `odometry`, `dead_reckoning` / `none` | 0.5° / 1.0° / 0.1° | per relative motion |
+| translation floor σ: `lidar_match` / `odometry` | 0.005 m / hypot(0.005 m, 0.10 \|t\|) | per relative motion |
+| translation floor σ: `dead_reckoning` / `imu` / `none` | max(0.010 m, 0.001 m/° × \|Δψ\|) / 0.05 m / 0.001 m | per relative motion |
+| tilt default σ | 1° (`none`: 0.1°) | per axis, when `sigma_tilt_deg` is absent |
+| `none` motion | identity within 0.001 m and 0.1° | else `invalid_request` |
 | same mount reading | 1 mm and 0.1°, same source | mount errors treated as common |
 | `LINK_PATH_MAX` | 4 links | the oms/2.14 order gap |
 | `LINK_SCALE_MIN` | 3 keyframes | link-measured scales that make scale evidence |
 
-Validation plan (phase 2): unit tests of the composition and its sigmas against Monte Carlo
-draws; synthetic turn-in-place pairs (known lever arm, known yaw) through the linked edge and the
-pair scale; replays of e305, e205, j3, j5 and j6 with links synthesised from their stored priors
-only where the captures logged the mount and IMU (otherwise the replays check that nothing
-changes without `body`); a live round when the client sends `body`.
+Validation: the composition and its sigmas against Monte Carlo draws and the client's two cases
+(`tests/unit/test_body_links.py`); synthetic head pans through the linked edge, the linked pose,
+the kept pose and the pair scale (`tests/unit/test_body_links_map.py`); the service's validation
+and reports (`tests/unit/test_service_body.py`). No archived capture logged the mount or the IMU,
+so the replays below check that nothing changes without `body`; live validation comes with the
+client's first runs.
+
+Replays without `body` (one keyframe per job, stored images, depths, masks and sent priors,
+through `AnchoredMap.update`; db59f00 against this commit, M3 Pro, heavy lock):
+
+| Map | Registered (db59f00 / oms/2.15) | Look | Status differences | Max pose difference | Max k difference |
+| --- | --- | --- | --- | --- | --- |
+| e305 | 11/22 / 11/22 | 6/8 | 0 of 22 | 0 | 0 |
+| e205 | 2/21 / 2/21 | 2/8 | 0 of 21 | 0 | 0 |
+| j3 | 10/25 / 10/25 | 8/8 | 0 of 25 | 0 | 0 |
+| j5 | 33/40 / 33/40 | 8/8 | 0 of 40 | 0 | 0 |
+| j6 | 19/39 / 19/39 | 8/8 | 0 of 39 | 0 | 0 |
+
+Statuses, reasons, methods, poses (to 1e-6) and k are identical on all five maps.
+
+Future work (out of scope in oms/2.15): links across cameras of one body (a rig: refused,
+`invalid_request`), and locate with a body link to the last keyframe (relocalising right after a
+turn: locate takes no `body`).
 
 Client advice: link each frame `from` the frame captured just before (stored or in the request);
 send a turn's translation sigma honestly (a stepping body slips: it is what limits a turn's

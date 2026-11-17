@@ -272,16 +272,19 @@ input status's and the dry run frame's `stereo_scale` `{scale, sigma_rel, neighb
 (`T_body_cam`, `measured` or `commanded`, with its joint-reading stamp; a fixed mount as the
 camera's `body_mount`) and the body's motion since an earlier frame it names (`T_from_body` with
 yaw and translation sigmas and their sources `imu`, `odometry`, `lidar_match`,
-`dead_reckoning`), with the image stamp and a `standing` flag (api.md §4, Body links). Composed,
+`dead_reckoning`, or `none` for a head pan with the body still), with the image stamp and a
+`standing` flag (api.md §4, Body links). Composed,
 they are a metric relative camera prior between frames of one body that replaces the priors'
 difference for that pair, never adds to it (map.md §1, Body links). A mount read more than
 0.03 s from its exposure (0.5 s when standing) is stale and its links are unused, never an
 error. A link whose frames match is a linked edge of registration: the images measure the
 relative rotation, the link the metric offset, and a points fit that conflicts with the linked
-pose is no placement (map.md §2, Match graph). A link path is the baseline of the keyframe depth
-scale, so a turning look measures its keyframes' scales, and link-measured scales are scale
-evidence, for the monocular depth scale k and, without `metric` priors or depth images, the map's
-scale (`scale_source` `baseline`; map.md §1, Scale). New optional fields: the camera's
+pose is no placement (map.md §2, Match graph); a frame kept at its prior with a usable link to
+a confirmed frame is kept at the linked pose. A link path is the baseline of the keyframe depth
+scale, so a turning look measures its keyframes' scales, and link-measured scales are a vote for
+the monocular depth scale k pooled with camera heights, never on a map whose scale comes from
+`metric` priors or depth images (`scale_source` `baseline` when they weigh more; map.md §1,
+Scale). New optional fields: the camera's
 `body_mount`, the frame's `body`, the input status's and the dry run frame's `body_link`, and
 `stereo_scale.link_neighbours`. Locate takes no `body`.
 

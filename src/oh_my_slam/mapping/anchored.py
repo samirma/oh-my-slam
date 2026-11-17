@@ -145,6 +145,7 @@ from oh_my_slam.core.geometry import project, unproject_pixels, voxel_keys
 from oh_my_slam.core.images import filled, on_grid
 from oh_my_slam.core.log import get_logger
 from oh_my_slam.core.types import Intrinsics
+from oh_my_slam.mapping import body as bl
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import prior_sigmas
 
@@ -1586,6 +1587,16 @@ class Keyframe:
     # its content is given at its floor-check scale, while its depth serves later frames as an
     # unjudged keyframe's does (``lifts``)
     stereo_judged: bool = False
+    # its body record (oms/2.15, map.md §1 "Body links": ``mapping.body.Body.to_json``) and the
+    # neighbours of its measured scale whose baseline was a body link path
+    body: dict[str, Any] | None = None
+    stereo_links: list[str] | None = None
+
+    def link_measured(self) -> bool:
+        """Whether its measured scale rests on body-link pairs only (map.md §1 "Keyframe depth
+        scale", oms/2.15: scale evidence)."""
+        return bool(self.stereo_pairs) and set(self.stereo_pairs or []) <= set(
+            self.stereo_links or [])
 
     def confident_scale(self) -> float | None:
         """Its measured scale when confident (map.md §1 "Keyframe depth scale", oms/2.14): its
@@ -1642,7 +1653,8 @@ class Keyframe:
                 "floor_factor": self.floor_factor, "floor_unjudged": self.floor_unjudged,
                 "conflict": self.conflict, "stereo_scale": self.stereo_scale,
                 "stereo_sigma": self.stereo_sigma, "stereo_pairs": self.stereo_pairs,
-                "stereo_judged": self.stereo_judged}
+                "stereo_judged": self.stereo_judged, "body": self.body,
+                "stereo_links": self.stereo_links}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1662,7 +1674,8 @@ class Keyframe:
                         conflict=bool(d.get("conflict", False)),
                         stereo_scale=d.get("stereo_scale"), stereo_sigma=d.get("stereo_sigma"),
                         stereo_pairs=d.get("stereo_pairs"),
-                        stereo_judged=bool(d.get("stereo_judged", False)))
+                        stereo_judged=bool(d.get("stereo_judged", False)),
+                        body=d.get("body"), stereo_links=d.get("stereo_links"))
 
     @property
     def centre(self) -> Array:
@@ -1891,7 +1904,7 @@ class ScaleState:
     """The depth scale ``k`` of monocular keyframes and its evidence."""
 
     k: float = 1.0
-    source: str = "monocular"  # of k: "priors", "camera_height", "monocular"
+    source: str = "monocular"  # of k: "priors", "camera_height", "baseline", "monocular"
     sigma_rel: float = MONOCULAR_SIGMA_REL
     # PnP baselines against metric priors: [prior baseline (m), raw image baseline, ...]
     priors: list[list[float]] = field(default_factory=list)
@@ -1903,11 +1916,17 @@ class ScaleState:
     # per registered keyframe, the log of the factor bringing its own depth onto the map's
     # lifted points (``depth_alignment``): the residuals of its depth source, by depth kind
     depth_residuals: dict[str, list[float]] = field(default_factory=dict)
+    # oms/2.15: the link-measured keyframe scales [scale, sigma_rel] (map.md §1 "Scale", item
+    # 3), and whether they may enter k (not on a map whose scale comes from metric priors or
+    # depth images: ``AnchoredMap._links_allowed``)
+    links: list[list[float]] = field(default_factory=list)
+    links_ok: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {"k": self.k, "source": self.source, "sigma_rel": self.sigma_rel,
                 "priors": self.priors, "heights": self.heights, "odometry": self.odometry,
-                "height_yaws": self.height_yaws, "depth_residuals": self.depth_residuals}
+                "height_yaws": self.height_yaws, "depth_residuals": self.depth_residuals,
+                "links": self.links, "links_ok": self.links_ok}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> ScaleState:
@@ -1918,7 +1937,34 @@ class ScaleState:
                           [list(e) for e in d["odometry"]],
                           [float(y) for y in d.get("height_yaws", [])],
                           {k: [float(x) for x in v]
-                           for k, v in d.get("depth_residuals", {}).items()})
+                           for k, v in d.get("depth_residuals", {}).items()},
+                          [list(e) for e in d.get("links", [])], bool(d.get("links_ok", False)))
+
+    def link_votes(self) -> tuple[float, float] | None:
+        """The link-measured keyframe scales as one vote for k (map.md §1 "Scale", item 3,
+        oms/2.15): at least ``LINK_SCALE_MIN`` of them, more than half within
+        ``KEYFRAME_AGREE_K`` of their own sigmas of their lower weighted median in ln scale; their
+        inverse-variance mean in ln scale, its sigma the larger of their weighted spread over the
+        root of their count and the median of their sigmas (a mount's error is common to every
+        baseline of the camera). None otherwise, or while they may not enter k."""
+        from oh_my_slam.mapping.motion import KEYFRAME_AGREE_K
+
+        if not self.links_ok or len(self.links) < bl.LINK_SCALE_MIN:
+            return None
+        ls = np.log(np.array([e[0] for e in self.links], np.float64))
+        sg = np.array([e[1] for e in self.links], np.float64)
+        w = 1.0 / sg ** 2
+        order = np.argsort(ls)
+        cum = np.cumsum(w[order])
+        med = float(ls[order][int(np.searchsorted(cum, 0.5 * cum[-1]))])
+        keep = np.abs(ls - med) <= KEYFRAME_AGREE_K * sg
+        n = int(keep.sum())
+        if 2 * n <= len(ls) or n < bl.LINK_SCALE_MIN:
+            return None
+        lk, sk, wk = ls[keep], sg[keep], w[keep]
+        mean = float((wk * lk).sum() / wk.sum())
+        spread = math.sqrt(float((wk * (lk - mean) ** 2).sum() / wk.sum()))
+        return math.exp(mean), max(spread / math.sqrt(n), float(np.median(sk)))
 
     def residual_spread(self, kind: str) -> float | None:
         """The robust spread (1.4826 MAD) of a depth kind's residuals (``depth_residuals``),
@@ -1985,6 +2031,7 @@ class ScaleState:
         the priors), else metric priors (once their span allows), else drifting priors (their
         relative motion is metric within the odometry's drift: ``DRIFT_POS_REL`` at best,
         reported as ``priors``), else held at 1."""
+        lv = self.link_votes()
         if self.heights:
             lr = self._height_votes()
             rel = np.array([h[0] for h in self.heights])
@@ -1999,6 +2046,18 @@ class ScaleState:
             self.sigma_rel = max(math.sqrt(float(np.median(rel)) ** 2 + mad ** 2 / len(lr)
                                            + self.direction_spread() ** 2),
                                  MIN_SCALE_SIGMA_REL)
+            if lv is not None:
+                # pooled with the link-measured scales by inverse variance (oms/2.15), never an
+                # override; ``baseline`` when the links weigh more
+                wh, wl = 1.0 / self.sigma_rel ** 2, 1.0 / lv[1] ** 2
+                lk = (wh * math.log(self.k) + wl * math.log(lv[0])) / (wh + wl)
+                self.k = float(np.clip(math.exp(lk), *SCALE_RANGE))
+                self.sigma_rel = max(1.0 / math.sqrt(wh + wl), MIN_SCALE_SIGMA_REL)
+                self.source = "baseline" if wl > wh else "camera_height"
+            return
+        if lv is not None:
+            self.k, self.source = float(np.clip(lv[0], *SCALE_RANGE)), "baseline"
+            self.sigma_rel = max(lv[1], MIN_SCALE_SIGMA_REL)
             return
         got = self._baselines(self.priors, prior_span)
         if got is not None:
@@ -2045,6 +2104,8 @@ class FrameIn:
     # map's scale, the grid's intrinsics and its depth kind, for the depth-consistency guard
     # only (map.md §2, oms/2.13: it never confirms the frame)
     own_depth: tuple[NDArray[np.float32], Intrinsics, str] | None = None
+    # its body record (oms/2.15, map.md §1 "Body links": ``mapping.body.Body``), None: none
+    body: bl.Body | None = None
 
 
 @dataclass
@@ -2098,6 +2159,8 @@ class Placement:
     # its image pose's matches hold a second fit of comparable support elsewhere (``_rival_fit``;
     # map.md §1 "No correction from one view", oms/2.13): it then never moves the drift alone
     rival: bool = False
+    # its body link's report (oms/2.15, api.md §4 ``body_link``), None: no ``body.motion``
+    link: dict[str, Any] | None = None
 
 
 def _lifted(corr: _Corr, cands: list[Keyframe]) -> tuple[Array, Array]:
@@ -2261,6 +2324,33 @@ class _Corr:
     X: Array  # world points (NaN rows: no depth)
     d: Array  # world directions from the reference keyframe's centre
     kf: NDArray[np.intp]  # index into the candidate list
+
+
+@dataclass
+class _Link:
+    """A frame's body link as ``AnchoredMap._linked`` found it: its report (api.md §4
+    ``body_link``), the link's raw pose (the ``from`` keyframe's pose composed with the link,
+    and its sigmas; None unless both mounts are fresh and ``from`` is confirmed), the linked
+    pose of a linked edge (refined on the images) with its inliers, whether they meet the
+    measurable-pair threshold, the ``from`` keyframe's id, and whether the images contradict
+    the link."""
+
+    row: dict[str, Any]
+    raw: tuple[Array, float, float] | None = None
+    pose: tuple[Array, float, float] | None = None
+    n: int = 0
+    measurable: bool = False
+    ref: str | None = None
+    inconsistent: bool = False
+    partner: tuple[float, float] = (0.0, 0.0)  # the ``from`` keyframe's sigmas
+
+    def absolute(self) -> tuple[Array, float, float] | None:
+        """The linked pose (else the raw one) with the ``from`` keyframe's sigmas composed in
+        (root sum of squares): a kept frame's pose, and a placement without a prior."""
+        if self.pose is None:
+            return self.raw
+        T, sp, sr = self.pose
+        return T, math.hypot(self.partner[0], sp), math.hypot(self.partner[1], sr)
 
 
 @dataclass
@@ -2705,6 +2795,9 @@ class AnchoredMap:
         self._close_base: Drift | None = None
         self.reran: set[str] = set()
         self._retried_drifting = False
+        # the running job's body records by frame name (oms/2.15, map.md §1 "Body links"): the
+        # stored keyframes' and the job's frames'
+        self._bodies: dict[str, bl.Body] = {}
         # the running job's one-view rule (map.md §1, oms/2.13; ``_one_view_rule``): the views it
         # held (kept by ``_close_drift``), their names (still observations in the next pass) and
         # its report (held, the views agreeing on the largest correction, those consumed)
@@ -2861,6 +2954,12 @@ class AnchoredMap:
             return "depth", DEPTH_SIGMA_REL if spread is None else max(
                 math.hypot(spread, DEPTH_SENSOR_SIGMA_REL), MIN_SCALE_SIGMA_REL)
         return self.scale.source, self.scale.sigma_rel
+
+    def _links_allowed(self) -> bool:
+        """Whether link-measured scales may enter k (oms/2.15): never on a map whose scale
+        comes from metric priors or depth images (``scale_summary``)."""
+        return not (self.prior_span() >= PRIOR_SPAN_M and self.prior_bias() == 1.0) \
+            and not any(k.depth_kind == "sensor" for k in self.confirmed())
 
     def begin_job(self) -> None:
         """A job starts: the keyframes stored now are the earlier versions' (``_job_duplicates``);
@@ -3439,7 +3538,17 @@ class AnchoredMap:
 
     def _place(self, f: FrameIn, feats: Features, cands: list[Keyframe],
                pred: tuple[Array, float, float] | None) -> Placement:
-        """``place``'s placement against ``cands``, from the prediction ``pred``."""
+        """``place``'s placement against ``cands``, from the prediction ``pred``, with the
+        frame's body link (``_linked``, ``_finish_link``; oms/2.15)."""
+        ln = self._linked(f, feats)
+        pl = self._place_images(f, feats, cands, pred, ln)
+        return pl if ln is None else self._finish_link(pl, ln)
+
+    def _place_images(self, f: FrameIn, feats: Features, cands: list[Keyframe],
+                      pred: tuple[Array, float, float] | None, ln: _Link | None) -> Placement:
+        """``_place`` on the images: a linked edge (``ln.pose``) places the frame unless its
+        points fit agrees with the linked pose (map.md §2 step 2): a points fit beyond that
+        bound, or a rotation-only fit, is no placement."""
         T0, sp0, sr0 = (None, 0.0, 0.0) if pred is None else pred
         # an unplaced frame is no_overlap: in updates few_features is only the checks' verdict
         # (api.md §4, held in ``FrameIn.unconfirmed``)
@@ -3454,6 +3563,11 @@ class AnchoredMap:
             if got is not None:
                 img, corr, floor_share = got
                 rival = img[3] == "pnp" and self._rival_fit(f, corr, img[0])
+        if ln is not None and ln.pose is not None and (
+                img is None or img[3] != "pnp" or self._link_conflict(img, ln)):
+            if img is not None:
+                log.info("%s: its %s fit is no placement beside its linked pose", f.name, img[3])
+            return self._place_linked(f, ln, pred)
         if T0 is None:
             # without a prior, the images alone must carry it: more inliers, a fair share
             if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
@@ -3558,6 +3672,191 @@ class AnchoredMap:
         conflict = sigmas.conflicts(dp, dr, (sp0, sr0), ci, position=not rot_only,
                                     tilt=sigmas.tilt_of(s.R, T0[:3, :3], _tilt_sigma(f.prior)))
         return dp, dr, ci, conflict
+
+    # -- body links (oms/2.15: map.md §1 "Body links", §2 "Match graph", linked edge) ---------
+
+    def set_bodies(self, frames: list[FrameIn]) -> None:
+        """The job's body records by frame name: the stored keyframes' (any status), then the
+        job's frames' (map.md §1 "Body links", paths)."""
+        self._bodies = {k.name: bl.Body.from_json(k.body) for k in self.keyframes
+                        if k.body is not None}
+        self._bodies.update({f.name: f.body for f in frames if f.body is not None})
+
+    def _named(self, name: str) -> Keyframe | None:
+        """The keyframe of a frame name (the latest), None without one."""
+        got = [k for k in self.keyframes if k.name == name]
+        return got[-1] if got else None
+
+    def _link_key(self, f: FrameIn) -> tuple[Any, ...]:
+        """What a frame's linked edge reads of its ``from`` frame (``_rounds``,
+        ``_place_cached``): its keyframe's identity, pose and sigmas once it is confirmed."""
+        if f.body is None or f.body.motion is None:
+            return ()
+        k = self._named(f.body.motion.source_name)
+        if k is None or not k.usable():
+            return ()
+        return k.id, k.T.tobytes(), k.sigma_pos_m, k.sigma_rot_deg
+
+    def link_report(self, b: bl.Body | None
+                    ) -> tuple[dict[str, Any] | None, bl.CameraLink | None, Keyframe | None]:
+        """A frame's body link before any matching (api.md §4 ``body_link``): its report (its
+        reason ``no_match`` until a linked edge holds), the link's camera relative pose (both
+        mounts fresh, ``from`` known) and the ``from`` frame's keyframe when it is confirmed;
+        (None, None, None) without ``body.motion``."""
+        if b is None or b.motion is None:
+            return None, None, None
+        frm = b.motion.source_name
+        row: dict[str, Any] = {"from": frm, "state": "unused", "reason": None,
+                               "baseline_m": None, "sigma_m": None, "rotation_deg": None,
+                               "rotation_residual_deg": None}
+        fb, k = self._bodies.get(frm), self._named(frm)
+        if fb is None or fb.mount is None:
+            row["reason"] = "from_unknown" if fb is None and k is None else "from_no_mount"
+            return row, None, None
+        if b.mount is None or not b.mount.fresh:
+            row["reason"] = "stale_mount"
+            return row, None, None
+        if not fb.mount.fresh:
+            row["reason"] = "from_stale_mount"
+            return row, None, None
+        if "none" in (b.motion.yaw_source, b.motion.translation_source) and not fb.standing:
+            row["reason"] = "from_moving"  # a body that did not move: both frames standing
+            return row, None, None
+        link = bl.camera_link(fb.mount, b.mount, bl.compose([bl.Step(b.motion, False)]))
+        row.update(baseline_m=round(link.baseline_m, 5), sigma_m=round(link.sigma_t, 5),
+                   rotation_deg=round(link.rotation_deg, 3))
+        if k is None or not k.usable():
+            row["reason"] = "from_unconfirmed"  # never chained from a kept frame
+            return row, link, None
+        row["reason"] = "no_match"
+        return row, link, k
+
+    def _linked(self, f: FrameIn, feats: Features) -> _Link | None:
+        """A frame's linked edge (map.md §2 "Match graph", step 1): its relative pose to its
+        confirmed ``from`` frame refined on their matches with the link as the prior, its
+        length kept (``mapping.motion.pair``, frame analysis' refinement), holding with at least
+        ``MIN_INLIERS`` inliers and a refined rotation within ``K_SIGMA`` × hypot(the link's
+        rotation sigma, the refinement's) of the link's (else ``inconsistent``); the linked pose
+        is the ``from`` keyframe's pose composed with it. Without matches, the link alone (its
+        raw pose: a kept frame's pose, decision of oms/2.15). None without ``body.motion``."""
+        from oh_my_slam.mapping import motion
+
+        row, link, k = self.link_report(f.body)
+        if row is None:
+            return None
+        out = _Link(row)
+        if link is None or k is None:
+            return out
+        out.raw = (k.T @ link.T, math.hypot(k.sigma_pos_m, link.sigma_t),
+                   math.hypot(k.sigma_rot_deg, link.sigma_rot_deg))
+        self._load_kf(k)
+        if k.feats is None or not len(feats.kps) or not len(k.feats.kps):
+            return out
+        p = motion.pair(0, k.feats, feats, f.K,
+                        motion.Other(np.zeros((0, 0, 3), np.uint8), None, link.T, link.sigma_t,
+                                     link.sigma_rot_deg))
+        if p.T_refined is None or p.inliers < MIN_INLIERS:
+            return out
+        res = rot_deg(p.T_refined[:3, :3] @ link.T[:3, :3].T)
+        post = p.sigma_rot_deg_post or 0.0
+        row["rotation_residual_deg"] = round(res, 3)
+        if res > K_SIGMA * math.hypot(link.sigma_rot_deg, post):
+            row["reason"], out.inconsistent = "inconsistent", True
+            log.info("%s: body link from %s inconsistent with the images (%.2f deg)", f.name,
+                     k.name, res)
+            return out
+        row["state"], row["reason"] = "used", None
+        # its sigmas are relative to its partner, as an image pose's are to its references:
+        # the link's and the refinement's, floored as an image pose's
+        out.pose = (k.T @ p.T_refined, max(link.sigma_t, MIN_SIGMA_POS_M),
+                    max(post, IMAGE_SIGMA_ROT_MIN_DEG))
+        uv = (p.ra @ k.K.K().T)[:, :2]
+        out.n, out.ref, out.partner = p.inliers, k.id, (k.sigma_pos_m, k.sigma_rot_deg)
+        out.measurable = p.inliers >= MEASURABLE_INLIERS \
+            and cell_share(uv, k.K) >= MEASURABLE_OVERLAP
+        return out
+
+    @staticmethod
+    def _link_conflict(img: Any, ln: _Link) -> bool:
+        """Whether a points fit (``img``) lies beyond the conflict bound of the linked pose
+        (map.md §2 step 2: it is then no placement)."""
+        assert ln.pose is not None
+        T, sp, sr = ln.pose
+        dp, dr = pose_residual(img[0].T, T)
+        return sigmas.conflicts(dp, dr, (sp, sr), (img[4], img[5]))
+
+    def _place_linked(self, f: FrameIn, ln: _Link, pred: tuple[Array, float, float] | None
+                      ) -> Placement:
+        """A frame placed by its linked edge (map.md §2 step 2, a linked pose): without a prior
+        registered there (with its sent height); with one, through the prior checks with the
+        linked pose as its hypothesis (loose, conflicting: kept or rejected as an image pose
+        would be), else fused with the prior and the height as ``_register`` fuses an image
+        pose. Never an image-only pose for the drift estimate (method ``linked``)."""
+        assert ln.pose is not None and ln.ref is not None
+        T_L, spL, srL = ln.pose
+        refs = (ln.ref,)
+        if pred is None:
+            got = ln.absolute()
+            assert got is not None
+            T, fsp, fsr, ht = self.with_height(f, T_L, np.zeros((6, 6)), got[1], got[2])
+            return Placement(f.name, "registered", None, T, round(fsp, 4), round(fsr, 3), ln.n,
+                             "linked", align_T=T_L, map_residual=_displacement(T, T_L, False),
+                             image_sigmas=(spL, srL) if ht else None, height_term=ht, refs=refs,
+                             measurable=ln.measurable)
+        assert f.prior is not None
+        T0, sp0, sr0 = pred
+        dp, dr = pose_residual(T_L, T0)
+        st0 = _tilt_sigma(f.prior)
+        conflict = sigmas.conflicts(dp, dr, (sp0, sr0), (spL, srL),
+                                    tilt=sigmas.tilt_of(T_L[:3, :3], T0[:3, :3], st0))
+        if f.unconfirmed is not None:
+            return self.kept_at(f, f.unconfirmed, 0, pred=pred,
+                                detail=CONFLICT_DETAIL if conflict else None)
+        prior_T = np.asarray(f.prior["T_map_cam"], np.float64)
+        ref = T0 if f.prior["trust"] == "drifting" else prior_T
+        if srL > CONFIRM_SIGMA_ROT_DEG or spL > max(CONFIRM_SIGMA_POS_M, 2.0 * sp0):
+            return self.kept_at(f, "no_overlap", ln.n, detail="loose_image_pose", pred=pred)
+        if conflict:
+            if not ln.measurable:
+                kept = self.kept_at(f, "no_overlap", ln.n, detail=CONFLICT_DETAIL, pred=pred)
+                kept.align_T, kept.image_sigmas = T_L, (spL, srL)
+                return kept
+            return Placement(f.name, "rejected", "prior_conflict", None, None, None, ln.n,
+                             "linked", (dp, dr), align_T=T_L, image_sigmas=(spL, srL),
+                             has_prior=True, prior_ref=ref, measurable=True, refs=refs)
+        metric = f.prior["trust"] == "metric"
+        gp, gr = _given_sigmas(f.prior) if metric else (sp0, sr0)
+        gt = None if st0 is None else max(st0, REPORT_MIN_SIGMA_ROT_DEG)
+        C = _scaled_cov(np.zeros((6, 6)), spL, srL, True)
+        R_L, c_L = T_L[:3, :3], T_L[:3, 3]
+        ms = [Measure(np.zeros(6), np.linalg.pinv(C), C),
+              prior_measure(R_L, c_L, T0, sp0, sr0, st0, (gp, gr, gt))]
+        hz = self._height_z(f)
+        if hz is not None:
+            ms.append(height_measure(c_L, *hz))
+        T, fsp, fsr = fuse_measures(R_L, c_L, ms)
+        return Placement(f.name, "registered", None, T,
+                         round(max(fsp, REPORT_MIN_SIGMA_POS_M), 4),
+                         round(max(fsr, REPORT_MIN_SIGMA_ROT_DEG), 3), ln.n, "linked",
+                         pose_residual(T, ref), align_T=T_L,
+                         map_residual=_displacement(T, T_L, False), prior_ref=ref,
+                         image_sigmas=(spL, srL), has_prior=True, height_term=hz is not None,
+                         refs=refs, measurable=ln.measurable)
+
+    @staticmethod
+    def _finish_link(pl: Placement, ln: _Link) -> Placement:
+        """A placement with its link's report; a frame kept at its prior with a usable link to a
+        confirmed frame (not ``inconsistent``) is kept at the linked pose instead, with its
+        composed sigmas (oms/2.15; residual 0 against it)."""
+        row = dict(ln.row)
+        got = ln.absolute()
+        if pl.status == "kept_at_prior" and not ln.inconsistent and got is not None:
+            T, sp, sr = got
+            pl.T, pl.sigma_pos_m, pl.sigma_rot_deg = T.copy(), round(sp, 4), round(sr, 3)
+            pl.prior_residual = (0.0, 0.0)
+            row["state"], row["reason"] = "used", None
+        pl.link = row
+        return pl
 
     def with_height(self, f: FrameIn, T: Array, cov: Array, sp: float, sr: float
                     ) -> tuple[Array, float, float, bool]:
@@ -3922,7 +4221,8 @@ class AnchoredMap:
         ref_p = np.asarray(prior["T"])[:3, 3] if prior is not None \
             and prior["trust"] == "metric" else centre
         b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref_p))
-        anchored = kind == "sensor" or (kind == "mono" and self.scale.source == "camera_height")
+        anchored = kind == "sensor" or (kind == "mono" and self.scale.source in (
+            "camera_height", "baseline"))
         if trust == "metric" and anchored:
             out.append(("bias", [b_prior, b_img]))
         if kind != "mono":
@@ -4164,6 +4464,7 @@ class AnchoredMap:
         kf.descriptor = None if descriptor is None else np.asarray(descriptor, np.float32)
         kf.grid, kf.K_grid, kf.rgb, kf.ignore = depth, K_grid, f.rgb, ignore
         kf.height_m, kf.height_sigma_m = f.height_m, f.height_sigma_m
+        kf.body = None if f.body is None else f.body.to_json()
         if seed is not None:
             kf.seed, kf.seed_sigma = seed
         kf.height_ok = self.height_consistent(f, pl)
@@ -4279,6 +4580,7 @@ class AnchoredMap:
         t0 = time.perf_counter()
         new = not self.keyframes
         self.begin_job()
+        self.set_bodies(frames)
         prep = self._prepared(frames, static)
         snap = self._snapshot()
         self._keep_s = 0.0
@@ -4346,6 +4648,11 @@ class AnchoredMap:
         t = time.perf_counter()
         dups, gone = self._drop_duplicates(self._job_duplicates())
         judged = self._measure_scales()
+        # the link-measured scales as a vote for k (map.md §1 "Scale", item 3, oms/2.15)
+        self.scale.links = [[float(k.stereo_scale), float(k.stereo_sigma)]
+                            for k in self.confirmed() if k.depth_kind == "mono"
+                            and k.link_measured() and k.stereo_scale and k.stereo_sigma]
+        self.scale.links_ok = self._links_allowed()
         pending, self._defer = self._defer or [], None
         for kf, image, ignore, depth, K_grid in pending:
             if kf.id not in gone and kf.contributes():
@@ -4377,12 +4684,14 @@ class AnchoredMap:
         measured scale when that scale is confident (``Keyframe.confident_scale``) and its own
         floor-check scale lies within the monocular scale bound of it (``stereo_judged``).
         Returns the ids it judged."""
-        conf = [k for k in self.confirmed() if k.depth_kind == "mono" and k.prior is not None
-                and k.prior["trust"] in ("metric", "drifting")]
+        conf = [k for k in self.confirmed() if k.depth_kind == "mono" and (
+            (k.prior is not None and k.prior["trust"] in ("metric", "drifting"))
+            or self._linkable(k))]
         fresh = {k.id for k in conf if k.id not in self._stored_ids} | self._rereg_ids()
         judged: set[str] = set()
         for a in sorted(conf, key=lambda k: (natural_key(k.name), k.camera_id)):
-            if a.id not in fresh and not any(b.id in fresh and self._near(a, b) for b in conf):
+            if a.id not in fresh and not any(b.id in fresh and (
+                    self._near(a, b) or self._path(a, b) is not None) for b in conf):
                 continue
             self._measure_scale(a, self._scale_neighbours(a, conf))
             if a.id not in fresh:
@@ -4403,29 +4712,54 @@ class AnchoredMap:
                 log.info("%s: judged about its measured depth scale", a.name)
         return judged
 
+    def _linkable(self, k: Keyframe) -> bool:
+        """Whether a keyframe has a body record with a fresh mount (oms/2.15: it may have
+        body-link pairs)."""
+        b = self._bodies.get(k.name)
+        return b is not None and b.mount is not None and b.mount.fresh
+
+    def _path(self, a: Keyframe, b: Keyframe) -> bl.CameraLink | None:
+        """Keyframe ``b``'s pose in keyframe ``a``'s optical frame through a body link path
+        (map.md §1 "Body links": at most ``LINK_PATH_MAX`` links, both mounts fresh), None
+        without one."""
+        if a.camera_id != b.camera_id:
+            return None
+        return bl.path_link(self._bodies, a.name, b.name)
+
     def _scale_neighbours(self, a: Keyframe, conf: list[Keyframe]
-                          ) -> list[tuple[Keyframe, Array, float, float]]:
-        """A keyframe's neighbours for its depth scale (map.md §1 "Keyframe depth scale"): the
-        other image-confirmed keyframes of its camera with a prior of the same trust whose
-        priors' optical axes lie within ``KEYFRAME_PAIR_MAX_DEG``, each with its pose in the
-        keyframe's optical frame from the two priors as sent (a drifting one's translation in
-        map metres: times the odometry scale) and that relative pose's sigmas: a drifting
-        pair's translation sigma hypot(``DRIFT_POS_REL`` × |t|, ``KEYFRAME_BASELINE_SIGMA_MIN_M``)
-        (the drift both priors share cancels; the odometry's error over the move between them
-        remains), a metric pair's the root sum of squares of both priors' position sigmas; the
-        rotation sigma the root sum of squares of both rotation sigmas. Only pairs whose σ_t /
-        |t| lies within ``KEYFRAME_BASELINE_REL_MAX``, the nearest in viewing direction first
-        (then name), at most ``KEYFRAME_SCALE_PAIRS``."""
+                          ) -> list[tuple[Keyframe, Array, float, float, bool]]:
+        """A keyframe's neighbours for its depth scale (map.md §1 "Keyframe depth scale"):
+        first the body-link pairs (oms/2.15: keyframes of its camera joined to it by a body link
+        path, whatever their priors, their relative pose and sigmas the path's), then the other
+        image-confirmed keyframes of its camera with a prior of the same trust (none joined by a
+        path), each with its pose in the keyframe's optical frame from the two priors as sent (a
+        drifting one's translation in map metres: times the odometry scale) and that relative
+        pose's sigmas: a drifting pair's translation sigma hypot(hypot(``DRIFT_POS_REL``,
+        σ_odo) × |t|, ``KEYFRAME_BASELINE_SIGMA_MIN_M``, sqrt(|σ_a² − σ_b²|)), a metric pair's
+        the root sum of squares of both priors' position sigmas; the rotation sigma the root
+        sum of squares of both rotation sigmas. Only pairs whose optical axes lie within
+        ``KEYFRAME_PAIR_MAX_DEG`` and whose σ_t / |t| lies within ``KEYFRAME_BASELINE_REL_MAX``,
+        link pairs first, each kind the nearest in viewing direction first (then name), at most
+        ``KEYFRAME_SCALE_PAIRS``; the last item tells a link pair."""
         from oh_my_slam.mapping import motion
 
-        assert a.prior is not None
-        Pa = np.asarray(a.prior["T"], np.float64)
         odo = self._odo_sigma_rel()
         out = []
         for b in conf:
-            assert b.prior is not None  # ``conf``: keyframes with a prior
-            if b is a or not self._near(a, b) or b.prior["trust"] != a.prior["trust"]:
+            if b is a:
                 continue
+            link = self._path(a, b)
+            if link is not None:
+                ang = math.degrees(math.acos(max(-1.0, min(1.0, float(link.T[2, 2])))))
+                if ang <= KEYFRAME_PAIR_MAX_DEG \
+                        and link.sigma_t <= motion.KEYFRAME_BASELINE_REL_MAX * link.baseline_m:
+                    out.append((0, ang, natural_key(b.name), b, link.T, link.sigma_t,
+                                link.sigma_rot_deg, True))
+                continue
+            if a.prior is None or b.prior is None or not self._near(a, b) \
+                    or b.prior["trust"] != a.prior["trust"]:
+                continue
+            Pa = np.asarray(a.prior["T"], np.float64)
             Pb = np.asarray(b.prior["T"], np.float64)
             ang = math.degrees(math.acos(max(-1.0, min(1.0, float(Pa[:3, 2] @ Pb[:3, 2])))))
             if ang > KEYFRAME_PAIR_MAX_DEG:
@@ -4441,9 +4775,10 @@ class AnchoredMap:
             if st > motion.KEYFRAME_BASELINE_REL_MAX * tl:
                 continue
             sr = math.hypot(a.prior["sigma_rot_deg"], b.prior["sigma_rot_deg"])
-            out.append((ang, natural_key(b.name), b, T, st, sr))
-        out.sort(key=lambda e: (e[0], e[1]))
-        return [(b, T, st, sr) for _, _, b, T, st, sr in out[:motion.KEYFRAME_SCALE_PAIRS]]
+            out.append((1, ang, natural_key(b.name), b, T, st, sr, False))
+        out.sort(key=lambda e: (e[0], e[1], e[2]))
+        return [(b, T, st, sr, lk) for _, _, _, b, T, st, sr, lk
+                in out[:motion.KEYFRAME_SCALE_PAIRS]]
 
     def _near(self, a: Keyframe, b: Keyframe) -> bool:
         """Whether two keyframes are of one camera and at most ``KEYFRAME_PAIR_MAX_GAP``
@@ -4470,7 +4805,7 @@ class AnchoredMap:
         return 1.4826 * float(np.median(np.abs(r - np.median(r)))) / math.sqrt(len(ev))
 
     def _measure_scale(self, a: Keyframe,
-                       nbrs: list[tuple[Keyframe, Array, float, float]]) -> None:
+                       nbrs: list[tuple[Keyframe, Array, float, float, bool]]) -> None:
         """A keyframe's own depth scale against its neighbours (``_scale_neighbours``):
         ``mapping.motion.pair_scale`` per neighbour on the keyframes' features and its raw depth
         (its grid over ``grid_scale``), combined (``mapping.motion.keyframe_scale``); none (the
@@ -4483,7 +4818,7 @@ class AnchoredMap:
         if a.feats is not None and a.grid is not None and a.K_grid is not None and nbrs:
             raw = (a.grid / (a.grid_scale or a.k_used)).astype(np.float32)
             pairs = []
-            for i, (b, T, st, sr) in enumerate(nbrs):
+            for i, (b, T, st, sr, _) in enumerate(nbrs):
                 self._load_kf(b)
                 if b.feats is None:
                     continue
@@ -4491,10 +4826,11 @@ class AnchoredMap:
                 pairs.append(motion.pair_scale(i, a.feats, b.feats, a.K, o, raw, a.K_grid))
             got = motion.keyframe_scale(pairs, self.scale.k)
         if got is None:
-            a.stereo_scale = a.stereo_sigma = a.stereo_pairs = None
+            a.stereo_scale = a.stereo_sigma = a.stereo_pairs = a.stereo_links = None
             return
         a.stereo_scale, a.stereo_sigma = got.scale, got.sigma_rel
         a.stereo_pairs = [nbrs[i][0].name for i in got.used]
+        a.stereo_links = [nbrs[i][0].name for i in got.used if nbrs[i][4]]
         log.info("%s: depth scale %.3f (k %.3f, sigma %.3f) from %s", a.name, got.scale,
                  self.scale.k, got.sigma_rel, a.stereo_pairs)
 
@@ -4939,16 +5275,20 @@ class AnchoredMap:
                 f, pr = frames[i], prep[i]
                 pred = self._predict(f)
                 cands = self.candidates_for(f, pr.descriptor, pred)
-                ids = tuple(k.id for k in cands)
+                ids = tuple(k.id for k in cands) + self._link_key(f)[:1]
                 if i in results and seen.get(i) == ids:
                     continue  # nothing new to match: as it was
                 seen[i] = ids
                 pl = self._place_cached(i, f, pr, pred, cands)
-                if f.prior is None and pl.status == "registered" and self.standpoint is not None:
+                if f.prior is None and pl.status == "registered" and pl.method != "linked" \
+                        and self.standpoint is not None:
                     pl = self.standpoint(f, pr.feats, pl)
                 # the 300-inlier exemption counts image feature inliers only (api.md §4)
                 if pr.close and pl.inliers < TOO_CLOSE_INLIERS:
                     pl = self._too_close(f, pl, pr.scene)
+                    ln = self._linked(f, pr.feats)
+                    if ln is not None:  # kept: at the linked pose (oms/2.15)
+                        pl = self._finish_link(pl, ln)
                 results[i] = pl
                 if pl.status != "registered":
                     continue
@@ -4976,7 +5316,7 @@ class AnchoredMap:
         key = (i, id(f), id(pr.feats),
                None if pred is None else (pred[0].tobytes(), pred[1], pred[2]),
                tuple(self._kf_state(k) for k in cands),
-               (self.scale.k, self.scale.source, self.scale.sigma_rel))
+               (self.scale.k, self.scale.source, self.scale.sigma_rel), self._link_key(f))
         got = self._placed.get(key)
         if got is None or got[0] is not f:  # (the frame kept with it: its id stays its own)
             got = self._placed[key] = (f, self.place(f, pr.feats, pr.descriptor, cands=cands))
@@ -4991,8 +5331,9 @@ class AnchoredMap:
         obs = []
         for i, f in enumerate(frames):
             pl = out.get(i)
-            if pl is None or f.prior is None or f.prior["trust"] != "drifting":
-                continue
+            if pl is None or f.prior is None or f.prior["trust"] != "drifting" \
+                    or pl.method == "linked":
+                continue  # a linked pose is its partner's plus the link (map.md §1, oms/2.15)
             if pl.status == "registered" and pl.method in ("origin", "prior"):
                 assert pl.T is not None
                 T, sh = pl.T, (MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG)
@@ -5129,7 +5470,7 @@ class AnchoredMap:
                 continue
             P = np.asarray(f.prior["T_map_cam"], np.float64)
             pl = out[i]
-            if pl.status == "registered" and pl.T is not None:
+            if pl.status == "registered" and pl.T is not None and pl.method != "linked":
                 self.drift.confirm(pl.T, P)
         obs = [o for o in self._drift_evidence(frames, out) if o.pl.status == "registered"]
         if obs:
@@ -5428,8 +5769,9 @@ class AnchoredMap:
     def _checked(self, f: FrameIn, pl: Placement,
                  mine: list[tuple[FrameIn, Placement, Features]], feats: Features) -> Placement:
         """``pl``, a registered frame with a prior checked against the update's others
-        (``_against_priors``)."""
-        if pl.status == "registered" and f.prior is not None:
+        (``_against_priors``); a linked pose's rotation is its images' against its ``from`` frame
+        already (oms/2.15)."""
+        if pl.status == "registered" and f.prior is not None and pl.method != "linked":
             self._against_priors(f, pl, mine, feats)
         return pl
 

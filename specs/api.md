@@ -210,6 +210,8 @@ error code `invalid_request` (§9).
     null `detail` (every kept frame carries a reason: the schema requires one for
     `kept_at_prior`); `too_close` with `conflict_unsupported` carried none.
   * With a `metric` prior, its pose is the prior and its sigmas are the prior's.
+  * With a used body link to a confirmed frame (oms/2.15, Body links below), its pose is the
+    linked pose with the composed sigmas, whatever its prior (map.md §1, Body links).
   * With a `drifting` prior, its pose is the prior mapped into the map frame through the
     current drift estimate. Its sigmas are drift-grown: the root sum of squares of the prior's
     sigma (or the 0.20 m / 5° default, §3) and the drift estimate's own sigma at that pose,
@@ -376,8 +378,22 @@ error code `invalid_request` (§9).
     accumulated since any start, and are required: for a turn in place `sigma_pos_m` is the body
     origin's slip over the turn (a stepping robot's feet), never 0. A sent sigma below its floor
     is raised to it: the floors are `README.md` constants per mount source and per motion
-    source (`imu`, `odometry`, `lidar_match`, `dead_reckoning`; `yaw_source` and
-    `translation_source` are named separately). Mount sigmas default by source:
+    source (`imu`, `odometry`, `lidar_match`, `dead_reckoning`, `none`; `yaw_source` and
+    `translation_source` are named separately):
+
+    | Motion source | Yaw floor | Translation floor |
+    | --- | --- | --- |
+    | `imu` | 0.5° | 0.05 m |
+    | `lidar_match` | 0.5° | 0.005 m |
+    | `odometry` | 1.0° | hypot(0.005 m, 0.10 × \|t\|) |
+    | `dead_reckoning` | 1.0° | max(0.010 m, 0.001 m per degree turned) |
+    | `none` | 0.1° | 0.001 m |
+
+    `none` means the body did not move (a head pan or tilt with the body still): both sources
+    `none`, `T_from_body` the identity within 0.001 m and 0.1°, and both frames `standing`, else
+    `invalid_request` (a stored `from` frame not standing: `body_link.reason` `from_moving`). Its
+    baseline is the camera's lever arm about the head's axis, from the two mounts (different
+    readings), with no body slip. Mount sigmas default by source:
 
     | Mount `source` | Default σ (position / rotation) | Floor |
     | --- | --- | --- |
@@ -395,8 +411,10 @@ error code `invalid_request` (§9).
     motion does not depend on its mount. A camera's `body_mount` has no stamp and is always
     fresh. `T_from_body` must hold between the two exposures (the client interpolates its
     odometry and IMU at the image stamps); the service cannot check that.
-  * **`standing`** decides the stamp tolerance only. A walking frame (its head swaying) with a
-    joint reading within 0.03 s of its exposure links like a standing one.
+  * **`standing`** decides the stamp tolerance (and allows source `none`) only. A standing frame
+    may carry `motion`: a stop-and-shoot turn in place sends each view `standing` with its motion
+    since the previous view. A walking frame (its head swaying) with a joint reading within
+    0.03 s of its exposure links like a standing one.
   * **Validation.** Refused with `invalid_request`, `details.field` naming the field (for
     example `frames[3].body.motion.from`), never a frame status:
     * the schema: a missing required field, an unknown source, a negative sigma, `mount`
@@ -407,16 +425,21 @@ error code `invalid_request` (§9).
       without `body`, or a name that is neither in the request, nor stored in the map, nor a
       frame of a queued or running job of the map (as for cameras, §3); the links within one
       request forming a cycle;
+    * a `none` motion that is not the identity within 0.001 m and 0.1°, whose other source is
+      not `none`, or whose frame or `from` frame (in the request or a queued job) is not
+      `standing`;
     * `body` on a locate or `analyse` frame (not in their schema).
 
     At run time a link may still be unusable; that is its `body_link` report, below.
   * **Report.** Every frame that sent `motion` has `inputs[].body_link` ([`BodyLink`]):
     `state` `used` (its linked edge took part in registration, map.md §2, and its paths are
-    baseline candidates for the keyframe scale) or `unused` with `reason`: `from_unknown` (the
+    baseline candidates for the keyframe scale; or it gave the kept frame its pose, map.md §1,
+    Body links, kept frames) or `unused` with `reason`: `from_unknown` (the
     `from` frame is neither in the request nor stored in the base version: rejected, reverted,
     or its job did not commit), `from_unconfirmed` (the `from` frame is not image-confirmed: a
     stored `kept_at_prior` frame, or a job frame that ends unregistered), `from_no_mount` (a stored `from` frame without a mount),
-    `stale_mount`, `from_stale_mount`, `no_match` (fewer epipolar inliers between the two than
+    `stale_mount`, `from_stale_mount`, `from_moving` (a `none` motion from a stored frame that
+    was not standing), `no_match` (fewer epipolar inliers between the two than
     the registration minimum), `inconsistent` (the images' relative rotation disagrees with the
     link's beyond its bound) or `engine` (the older mapper uses no links). `baseline_m`,
     `sigma_m` and `rotation_deg` are the link's camera translation length, its 1-σ and its
@@ -428,18 +451,24 @@ error code `invalid_request` (§9).
     image-confirmed frame by a used link is placed by a **linked edge**, its relative rotation
     measured on their matches with the link as prior and its translation the link's, so a
     turning view lands next to its `from` frame without a points fit lifted at a monocular
-    scale, and a points fit that conflicts with the linked pose is no placement; a link path is
-    the baseline of the keyframe depth scale (map.md §1), so a turning look measures its
-    keyframes' scales; and link-measured scales are evidence for the monocular depth scale k and,
-    without `metric` priors or depth images, the map's scale (`scale_source` `baseline`).
+    scale, and a points fit that conflicts with the linked pose is no placement; a frame kept
+    at its prior with a usable link to a confirmed frame is kept at the linked pose instead; a
+    link path is the baseline of the keyframe depth scale (map.md §1), so a turning look measures
+    its keyframes' scales; and link-measured scales are a vote for the monocular depth scale k,
+    pooled with camera heights by inverse variance, never on a map whose scale comes from
+    `metric` priors or depth images (`scale_source` `baseline` only when the links weigh
+    more).
   * **Planning a usable baseline.** A turn in place by Δψ with the camera at horizontal
     distance r from the body's z axis gives |t| ≈ 2 r sin(Δψ / 2) plus the body's own
     translation, with σ_t ≈ hypot(`sigma_pos_m`, r · σ_yaw, the mount terms of map.md §1) (σ_yaw
     in radians). The pair is a scale baseline when σ_t / |t| ≤ `KEYFRAME_BASELINE_REL_MAX`
     (0.20) and it triangulates 30 points (map.md §1). For example r = 0.08 m and Δψ = 40° give
     |t| = 0.055 m; with σ_yaw 2° and `sigma_pos_m` 0.008 m, σ_t ≈ 0.009 m (0.16): usable; with
-    `sigma_pos_m` 0.02 m, 0.37: not. A dry run reports the frame's `body_link` before it is
-    sent.
+    `sigma_pos_m` 0.02 m, 0.37: not. A stepping body's slip makes turn pairs unusable (the
+    `dead_reckoning` floor is 0.04 m for a 40° turn); a head pan with the body still (`none`)
+    has no slip: a pan of ±30° about an axis 0.03 m behind a camera with a measured mount gives
+    |t| = 0.03 m with σ_t ≈ 0.003 m (0.10). A dry run reports the frame's `body_link` before it
+    is sent.
   * **Other clients.** A depth-image (RGB-D) robot may send `body`: its links place frames
     (linked edges) and its scale stays its sensor's (no keyframe scale is measured on depth
     images). Locate takes no `body` in oms/2.15 (§6). The older mapper accepts it and uses

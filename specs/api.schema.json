@@ -3565,9 +3565,10 @@
         "imu",
         "odometry",
         "lidar_match",
-        "dead_reckoning"
+        "dead_reckoning",
+        "none"
       ],
-      "description": "oms/2.15. The sensor a body motion component comes from: imu (gyro or absolute IMU heading), odometry (wheel or leg encoders), lidar_match (scan matching), dead_reckoning (a gait or command model). Each source has its own sigma floor (README.md); the sigma sent is raised to it."
+      "description": "oms/2.15. The sensor a body motion component comes from: imu (gyro or absolute IMU heading), odometry (wheel or leg encoders), lidar_match (scan matching), dead_reckoning (a gait or command model), none (the body did not move: both sources none, T_from_body the identity within 0.001 m and 0.1 deg, both frames standing, else invalid_request; a head pan or tilt with the body still). Each source has its own sigma floor (README.md); the sigma sent is raised to it: dead_reckoning translation max(0.010 m, 0.001 m per degree turned), odometry hypot(0.005 m, 0.10 |t|), none 0.001 m / 0.1 deg."
     },
     "BodyMount": {
       "type": "object",
@@ -3664,7 +3665,7 @@
         },
         "standing": {
           "type": "boolean",
-          "description": "The body stood still at the image stamp and the mount joints did not move between mount_stamp_s and image_stamp_s (a turn-in-place view taken once the step settled). It decides the stamp tolerance only."
+          "description": "The body stood still at the image stamp and the mount joints did not move between mount_stamp_s and image_stamp_s (a turn-in-place view taken once the step settled). It decides the stamp tolerance only. A standing frame may carry motion (a stop-and-shoot turn in place)."
         },
         "motion": {
           "$ref": "#/$defs/BodyMotion"
@@ -3700,7 +3701,7 @@
             "used",
             "unused"
           ],
-          "description": "used: the link joined this frame to its from frame in registration (a linked edge, map.md section 2), and its path is a baseline candidate for the keyframe scale."
+          "description": "used: the link joined this frame to its from frame in registration (a linked edge, map.md section 2), or gave a kept frame its pose (the linked pose with its composed sigmas, from a confirmed from frame)."
         },
         "reason": {
           "oneOf": [
@@ -3711,6 +3712,7 @@
                 "from_no_mount",
                 "stale_mount",
                 "from_stale_mount",
+                "from_moving",
                 "no_match",
                 "inconsistent",
                 "engine"
@@ -3720,7 +3722,7 @@
               "type": "null"
             }
           ],
-          "description": "Null when used. from_unknown: the from frame is neither in the request nor stored in the base version (rejected, reverted, or its job did not commit). from_unconfirmed: the from frame is not image-confirmed (a stored kept_at_prior frame, or a job frame that ends unregistered). from_no_mount: the stored from frame has no mount. stale_mount / from_stale_mount: this frame's / the from frame's mount stamp lies beyond the tolerance. no_match: fewer epipolar inliers between the two than the registration minimum. inconsistent: the images' relative rotation disagrees with the link's beyond its bound (rotation_residual_deg). engine: the older mapper uses no links."
+          "description": "Null when used. from_unknown: the from frame is neither in the request nor stored in the base version (rejected, reverted, or its job did not commit). from_unconfirmed: the from frame is not image-confirmed (a stored kept_at_prior frame, or a job frame that ends unregistered). from_no_mount: the stored from frame has no mount. stale_mount / from_stale_mount: this frame's / the from frame's mount stamp lies beyond the tolerance. from_moving: a none motion from a stored frame that was not standing. no_match: fewer epipolar inliers between the two than the registration minimum. inconsistent: the images' relative rotation disagrees with the link's beyond its bound (rotation_residual_deg). engine: the older mapper uses no links."
         },
         "baseline_m": {
           "type": [

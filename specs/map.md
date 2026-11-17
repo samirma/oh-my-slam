@@ -263,15 +263,19 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
   3. body-link baselines (`baseline`, oms/2.15): the link-measured scales (Keyframe depth
-     scale, below: a measurement whose agreeing pairs are all body-link pairs) of at least
-     `LINK_SCALE_MIN` (`README.md`, 3) image-confirmed monocular keyframes, more than half of
-     them agreeing by the rule of its Combined bullet. The map's monocular depth scale k (raw
-     monocular depth to map metres) is then their inverse-variance mean in ln scale. As the
-     scale source, its `scale_sigma_rel` is the larger of their weighted spread over the root of
-     their count and the median of their sigmas, since a mount's calibration error is common to
-     every baseline of the camera. The same evidence sets k ahead of camera heights also on a map
-     whose scale source is `metric` priors: a link baseline depends neither on k nor on the drift
-     estimate, unlike an oms/2.14 measurement on prior baselines, which is no scale evidence;
+     scale, below: a measurement whose agreeing pairs are all body-link pairs) of the map's
+     image-confirmed monocular keyframes are one vote for the map's monocular depth scale k (raw
+     monocular depth to map metres) once at least `LINK_SCALE_MIN` (`README.md`, 3) of them
+     agree, more than half by the rule of its Combined bullet: their inverse-variance mean in ln
+     scale, its sigma the larger of their weighted spread over the root of their count and the
+     median of their sigmas (a mount's calibration error is common to every baseline of the
+     camera). The vote is pooled with camera heights (item 4) by inverse variance, never an
+     override: k is the weighted mean in ln scale of the two, its `scale_sigma_rel` one over the
+     root of their summed weights. The scale source is `baseline` only when the link vote weighs
+     more than the camera heights' (alone, without camera heights); else it stays
+     `camera_height`. Link-measured scales never change the scale of a map whose scale comes
+     from `metric` priors or depth images (items 1 and 2): they then enter neither k nor the
+     source;
   4. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
      floor check did not judge (`floor_not_judged`, §2) gives no such evidence from its own
      depth or floor plane: its sent height constrains only its own camera pose, and is never
@@ -353,9 +357,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     odometry scale, which the map's registrations at k measured). Lifting a keyframe at its
     measured scale was replayed and refused (`README.md`, oms/2.14): it cost j5 and j6 laps.
     Since oms/2.15 a measurement whose agreeing pairs are all body-link pairs (a
-    **link-measured scale**) is scale evidence all the same (Scale, above, item 3): its baselines
-    depend neither on k nor on the drift estimate. A measurement with a prior pair among its
-    agreeing pairs stays no evidence. Lifting at a measured scale stays refused.
+    **link-measured scale**) is a vote for k all the same (Scale, above, item 3: pooled with
+    camera heights, never on a map whose scale comes from `metric` priors or depth images): its
+    baselines depend neither on k nor on the drift estimate. A measurement with a prior pair
+    among its agreeing pairs stays no evidence. Lifting at a measured scale stays refused.
   * **Persistence and report.** The scale, its sigma and its neighbours are kept with the
     keyframe in the mapper's store; a keyframe stored before oms/2.14 has none and behaves as
     before. A job's input status reports it as `stereo_scale` (api.md §4), a dry run as its
@@ -368,7 +373,20 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   the frame to its `from` frame.
   * **Mounts.** A mount's sigmas are the sent ones (or its source's defaults) raised to its
     source's floor (`README.md`); it is fresh or stale by its stamps (api.md §4, Timestamps). The
-    motion's sigmas are raised to the floors of their sources the same way.
+    motion's sigmas are raised to the floors of their sources the same way; two floors depend on
+    the motion: `dead_reckoning` translation max(0.010 m, 0.001 m per degree of the motion's yaw)
+    (a stepping body slides as it turns on the spot) and `odometry` translation hypot(0.005 m,
+    0.10 × |t|) (wheel odometry's scale error). A motion with source `none` (the body did not
+    move: a head pan or tilt with the body still) has floors 0.001 m and 0.1° (its tilt default
+    0.1° too); its baseline is the change of the mount alone, the two mounts taken as different
+    readings.
+  * **Kept frames** (oms/2.15). A frame that ends `kept_at_prior` with a usable link to a
+    confirmed `from` frame (both mounts fresh, not `inconsistent`) is kept at the linked pose (the
+    `from` keyframe's pose composed with the link, refined on the images when they matched), with
+    its composed sigmas (the `from` keyframe's and the link's, root sum of squares), in place of
+    its prior as placed; its prior residuals are 0 against that pose, and its `body_link` is
+    `used`. A `from` frame must be confirmed: a link is never chained from a kept frame, so
+    errors do not compound. Otherwise its pose is its prior as placed.
   * **Paths.** Links form trees: each frame has at most one `from`. Two frames of the same
     camera joined through at most `LINK_PATH_MAX` (`README.md`, 4) links have a path, through
     frames of the job and stored frames with a body record, whatever their status, stale mounts
@@ -670,13 +688,17 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        whatever the engine or pass (MapAnything, a retry, re-registration), until the
        component links to a confirmed keyframe.
        **A linked pose** (oms/2.15): a frame with a linked edge to a placed frame has a candidate
-       pose there, the partner's pose composed with the edge's relative pose, its position sigma
-       hypot(the partner's, the link's σ_t), its rotation sigma hypot(the partner's, the
-       refinement's). A points fit of the frame (or a MapAnything placement) farther from that
-       linked pose than 3 × sqrt(σ_fit² + σ_linked²), position or rotation, is not a placement: two
-       measurements, the body's own motion and the images' relative rotation, agree against one fit
-       lifted at a monocular scale (a camera turning in place on a reference whose depth scale is
-       off slides along its view). A points fit within that bound is fused with the linked pose.
+       pose there, the partner's pose composed with the edge's relative pose. Its sigmas are
+       relative to the partner, as an image pose's are to its references: the link's σ_t and the
+       refinement's rotation sigma, floored as an image pose's; they are its hypothesis sigmas in
+       the prior checks and its weight against the prior. Without a prior it reports them with
+       the partner's own composed in (root sum of squares). A points fit of the frame farther from that linked pose than 3 ×
+       sqrt(σ_fit² + σ_linked²), position or rotation, is not a placement, and neither is a
+       rotation-only fit: two measurements, the body's own motion and the images' relative
+       rotation, agree against one fit lifted at a monocular scale (a camera turning in place on a
+       reference whose depth scale is off slides along its view). A points fit within that bound
+       stands, the linked edge having confirmed it. MapAnything placements are not tested against
+       a linked pose (documented limit, as for the guards: they are no points fit).
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests, api.md
        §4) apply frame by frame to the component's fitted poses, a linked pose with its own
        sigmas (above) as the frame's hypothesis. A frame that fails a looseness test

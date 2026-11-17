@@ -77,6 +77,7 @@ from oh_my_slam.service.prior_first import (
     _canonical,
     _frame_in,
     _has_depth,
+    body_link,
     frame_class,
     job_drift_correction,
     none_engine,
@@ -163,6 +164,9 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
                 or row["predicted_status"] == "rejected" else stereo_scale(am.keyframe(pl.keyframe))
             if ss is not None:
                 row["stereo_scale"] = ss
+            link = body_link(fr, pl, am)  # oms/2.15
+            if link is not None:
+                row["body_link"] = link
             if row["predicted_status"] != "rejected":
                 kept.append((row["predicted_status"], pl))
                 if pl is not None and pl.T is not None and fr.work.trust == "metric":

@@ -130,6 +130,8 @@ class FrameWork:
     # rejected before any check (api.md §4): ``duplicate`` (a name already in the request) or
     # ``unusable_image`` (an image that does not decode or is not its camera's size)
     reject: str | None = None
+    # its body record (oms/2.15, api.md §4 "Body links": ``mapping.body.Body``), None: none
+    body: Any = None
 
     @property
     def trust(self) -> str:
@@ -1385,12 +1387,18 @@ class Updater:
         ok = fr.reason is None and fr.internal is not None
         status = "registered" if ok else "kept_at_prior" if fr.reason is None \
             and fr.unconfirmed is not None else "rejected"
-        return input_row(fr.work.name, status,
-                         fr.unconfirmed if status == "kept_at_prior" else fr.reason,
-                         _inliers(fr.internal) if fr.internal is not None else 0, fr.pose,
-                         fr.sigma_pos_m, fr.sigma_rot_deg, fr.prior_residual, fr.scene_m,
-                         fr.duplicate_of, fr.detail,
-                         sent=sent_residual(fr.pose, fr.work.prior, fr.work.trust))
+        row = input_row(fr.work.name, status,
+                        fr.unconfirmed if status == "kept_at_prior" else fr.reason,
+                        _inliers(fr.internal) if fr.internal is not None else 0, fr.pose,
+                        fr.sigma_pos_m, fr.sigma_rot_deg, fr.prior_residual, fr.scene_m,
+                        fr.duplicate_of, fr.detail,
+                        sent=sent_residual(fr.pose, fr.work.prior, fr.work.trust))
+        if fr.work.body is not None and fr.work.body.motion is not None:
+            # the older mapper uses no body links (map.md §1 "Every engine", oms/2.15)
+            row["body_link"] = {"from": fr.work.body.motion.source_name, "state": "unused",
+                                "reason": "engine", "baseline_m": None, "sigma_m": None,
+                                "rotation_deg": None, "rotation_residual_deg": None}
+        return row
 
     @staticmethod
     def _quality(frames: list[_Frame], registered: list[_Frame], kept: list[_Frame],

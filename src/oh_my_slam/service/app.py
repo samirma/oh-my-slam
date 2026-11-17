@@ -25,6 +25,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oh_my_slam.core.log import get_logger
+from oh_my_slam.mapping import body as bl
 from oh_my_slam.service import analyse, nav, openapi, schema
 from oh_my_slam.service import birdseye as birdseye_read
 from oh_my_slam.service import objects as objects_read
@@ -177,8 +178,101 @@ def _usable(image: bytes, cam: dict[str, Any]) -> bool:
     return bool(rgb.shape[:2] == (cam["height"], cam["width"]))
 
 
+def _stored_frames(store: Store, name: str) -> dict[str, str]:
+    """The frames the map's latest version stores, name to camera id."""
+    latest = store.latest(name)
+    if latest is None:
+        return {}
+    return {str(r["name"]): str(r.get("camera_id", "")) for r in
+            store.version(name, latest)["frames"]}
+
+
+def check_bodies(req: dict[str, Any], cameras: dict[str, dict[str, Any]],
+                 stored: dict[str, str], pending: dict[str, Any]) -> dict[int, bl.Body]:
+    """The request's frames' body records (oms/2.15, api.md §4 "Body links"), each resolved
+    with its camera's ``body_mount``; ``invalid_request`` naming the field when a mount is
+    missing or not rigid, a motion is not rigid, its ``from`` names the frame itself, a frame
+    of another camera, a request frame without ``body`` or no known frame (the request, the
+    map's latest version, a queued or running job: ``pending``, name to its ``FrameWork``), the
+    request's links form a cycle, or a ``none`` motion moved or is not standing at both ends."""
+    frames = req["frames"]
+    first: dict[str, int] = {}
+    for i, f in enumerate(frames):
+        first.setdefault(f["name"], i)
+    out: dict[int, bl.Body] = {}
+    for i, f in enumerate(frames):
+        b = f.get("body")
+        if b is None:
+            continue
+        field = f"frames[{i}].body"
+        cam_mount = cameras[f["camera_id"]].get("body_mount")
+        if b.get("mount") is None and cam_mount is None:
+            raise invalid(f"{field}.mount", f"{field} needs a mount: camera "
+                          f"{f['camera_id']!r} has no body_mount")
+        if b.get("mount") is not None and not _rotation_ok(b["mount"]["T_body_cam"]):
+            raise invalid(f"{field}.mount.T_body_cam", f"{field}.mount.T_body_cam is not a "
+                          "rigid transform (orthonormal rotation, last row 0 0 0 1)")
+        m = b.get("motion")
+        if m is not None:
+            _check_motion(f, b, m, field, frames, first, stored, pending)
+        out[i] = bl.body_of(f["name"], f["camera_id"], b, cam_mount)
+    # the request's links form no cycle
+    parent = {f["name"]: f["body"]["motion"]["from"] for f in frames
+              if (f.get("body") or {}).get("motion") is not None}
+    for i, f in enumerate(frames):
+        seen, cur = {f["name"]}, f["name"]
+        while cur in parent:
+            cur = parent[cur]
+            if cur in seen:
+                raise invalid(f"frames[{i}].body.motion.from", f"frames[{i}].body.motion.from: "
+                              "the request's links form a cycle")
+            seen.add(cur)
+    return out
+
+
+def _check_motion(f: dict[str, Any], b: dict[str, Any], m: dict[str, Any], field: str,
+                  frames: list[dict[str, Any]], first: dict[str, int], stored: dict[str, str],
+                  pending: dict[str, Any]) -> None:
+    """One frame's ``body.motion`` (``check_bodies``)."""
+    if not _rotation_ok(m["T_from_body"]):
+        raise invalid(f"{field}.motion.T_from_body", f"{field}.motion.T_from_body is not a "
+                      "rigid transform (orthonormal rotation, last row 0 0 0 1)")
+    frm = m["from"]
+    at = f"{field}.motion.from"
+    if frm == f["name"]:
+        raise invalid(at, f"{at} names the frame itself")
+    standing: bool | None = None  # a stored frame's: checked when the job runs
+    if frm in first:
+        g = frames[first[frm]]
+        cam, other = g["camera_id"], g.get("body")
+        if other is None:
+            raise invalid(at, f"{at} {frm!r} is a frame of the request without body")
+        standing = bool(other["standing"])
+    elif frm in pending:
+        cam, pb = pending[frm].camera_id, pending[frm].body
+        if pb is None:
+            raise invalid(at, f"{at} {frm!r} is a frame of a queued job without body")
+        standing = pb.standing
+    elif frm in stored:
+        cam = stored[frm]
+    else:
+        raise invalid(at, f"{at} {frm!r} is neither in the request, nor stored in the map, nor "
+                      "a frame of a queued or running job of the map")
+    if cam and cam != f["camera_id"]:
+        raise invalid(at, f"{at} {frm!r} is a frame of camera {cam!r}, not "
+                      f"{f['camera_id']!r}")
+    sources = (m["yaw_source"], m["translation_source"])
+    if "none" in sources and (
+            sources != ("none", "none") or not b["standing"] or standing is False
+            or not bl.is_still(np.asarray(m["T_from_body"], np.float64))):
+        raise invalid(f"{field}.motion", f"{field}.motion: source none means the body did not "
+                      f"move: both sources none, T_from_body the identity within {bl.NONE_MAX_M} "
+                      f"m and {bl.NONE_MAX_DEG} deg, both frames standing")
+
+
 def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, bytes],
-                pending: dict[str, dict[str, Any]] | None = None) -> UpdateWork:
+                pending: dict[str, dict[str, Any]] | None = None,
+                pending_frames: dict[str, Any] | None = None) -> UpdateWork:
     """The job of a valid ``UpdateRequest``, with the cameras (and ignore masks) it adds to the
     map, recorded when the job commits; ``invalid_request`` or ``camera_conflict`` otherwise. A
     frame may name a camera that an earlier job of the map, still queued or running, adds
@@ -203,6 +297,9 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
                               f"{mask.shape[1]}x{mask.shape[0]}, the camera "
                               f"{cam['width']}x{cam['height']}")
             digest = hashlib.sha256(data).hexdigest()
+        if "body_mount" in cam and not _rotation_ok(cam["body_mount"]["T_body_cam"]):
+            raise invalid(f"{field}.body_mount.T_body_cam", f"{field}.body_mount.T_body_cam is "
+                          "not a rigid transform (orthonormal rotation, last row 0 0 0 1)")
         if cid in known:
             if not same_camera(known[cid], cam) or (
                     digest is not None and digest != store.mask_digest(name, cid)):
@@ -214,6 +311,11 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
             masks[cid] = (digest, parts[cam["ignore_mask"]])
         new[cid] = cam
     cameras = {**(pending or {}), **known, **new}
+    for i, f in enumerate(req["frames"]):
+        if f["camera_id"] not in cameras:
+            raise invalid(f"frames[{i}].camera_id", f"frames[{i}].camera_id {f['camera_id']!r} "
+                          "is neither in the request's cameras nor known to the map")
+    bodies = check_bodies(req, cameras, _stored_frames(store, name), pending_frames or {})
     seen: set[str] = set()
     frames = []
     for i, f in enumerate(req["frames"]):
@@ -221,10 +323,7 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
         # a repeated name is the frame's input status, not an error (api.md §3-§4)
         reject = "duplicate" if f["name"] in seen else None
         seen.add(f["name"])
-        cam = cameras.get(f["camera_id"])
-        if cam is None:
-            raise invalid(f"{field}.camera_id", f"{field}.camera_id {f['camera_id']!r} is "
-                          "neither in the request's cameras nor known to the map")
+        cam = cameras[f["camera_id"]]
         image = part(f"{field}.image", f["image"])
         if reject is None and not _usable(image, cam):
             reject = "unusable_image"  # it does not decode, or is not its camera's size
@@ -249,7 +348,7 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
                                 f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask,
-                                reject))
+                                reject, bodies.get(i)))
     return UpdateWork(name, frames, req.get("accept_if"), new, masks,
                       [str(lab).strip() for lab in req.get("labels") or []])
 
@@ -313,10 +412,12 @@ class Api:
                 raise invalid("labels", exc.message, schema="UpdateRequest") from exc
             raise
         pending: dict[str, dict[str, Any]] = {}
+        pending_frames: dict[str, Any] = {}
         for j in self.s.jobs.active_jobs(name):
             pending.update(getattr(j.work, "cameras", None) or {})
+            pending_frames.update({fw.name: fw for fw in getattr(j.work, "frames", None) or []})
         work = await run_in_threadpool(update_work, self.s.store, name, req, parts,
-                                       None if dry else pending)
+                                       None if dry else pending, pending_frames)
         _stage(request, "validate", t0)
         if dry:
             assert self.s.dry_run is not None
