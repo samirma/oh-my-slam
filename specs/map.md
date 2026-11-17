@@ -275,7 +275,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
      qualifies and either no camera height qualifies (item 4) or the link vote's weight exceeds
      the camera heights'; otherwise, with camera heights, it is `camera_height`. Link-measured
      scales never change the scale of a map whose scale comes from `metric` priors or depth
-     images (items 1 and 2): they then enter neither k nor the source;
+     images (items 1 and 2): they then enter neither k nor the source, from the moment the map's
+     scale becomes theirs, also within a job (every estimate of k tests it anew);
   4. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
      floor check did not judge (`floor_not_judged`, §2) gives no such evidence from its own
      depth or floor plane: its sent height constrains only its own camera pose, and is never
@@ -384,8 +385,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     (a stepping body slides as it turns on the spot) and `odometry` translation hypot(0.005 m,
     0.10 × |t|) (wheel odometry's scale error). A motion with source `none` (the body did not
     move: a head pan or tilt with the body still) has floors 0.001 m and 0.1° (its tilt default
-    0.1° too); its baseline is the change of the mount alone, the two mounts taken as different
-    readings.
+    0.1° too); its baseline is the change of the mount alone, the two mounts taken as
+    independent readings unless they are the same reading (baseline about 0; Camera relative
+    pose, below).
   * **Kept frames** (oms/2.15). Whatever the path that keeps it (a failed check, the distance
     limit, no image pose, a loose or unsupported image pose, kept before the job's origin, a
     drift outlier), a frame that ends `kept_at_prior` with a usable link to a

@@ -85,3 +85,35 @@ def test_a_rejected_frame_s_record_composes_paths_in_its_job(
     assert row is not None and row["reason"] == "from_unconfirmed"
     m._bodies["s"] = body("s", pans[50], "r")
     assert bl.path_link(m._bodies, "p0", "s") is not None
+
+
+def test_a_map_whose_scale_becomes_metric_mid_job_stops_pooling_links(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A map holding a link vote (three tight agreeing link-measured scales) and one metric
+    keyframe; a job whose first frame in canonical order lies 0.5 m away (the metric priors then
+    span past ``PRIOR_SPAN_M``): every estimate of k from then on, within the job, leaves the
+    link vote out (map.md §1 "Scale", item 3)."""
+    from tests.unit.test_keyframe_scale import frame as walk_frame
+
+    room = syn.ainex_room()
+    shots = [syn.render(room, syn.head(x), i) for i, x in enumerate((0.0, 0.25, 0.5))]
+    m = AnchoredMap(tmp_path / "m")
+    m.update([walk_frame("f0", shots[0], "metric", 0.01)], lambda _: None)
+    m.scale.links = [[1.2, 0.002], [1.2, 0.002], [1.2, 0.002]]
+    m._estimate()
+    assert m.scale.links_ok and m.scale.source == "baseline"
+    calls: list[tuple[float, bool, str]] = []
+    real = AnchoredMap._estimate
+
+    def spy(self: AnchoredMap) -> None:
+        real(self)
+        calls.append((self.prior_span(), self.scale.links_ok, self.scale.source))
+
+    monkeypatch.setattr(AnchoredMap, "_estimate", spy)
+    pls = m.update([walk_frame("a", shots[2], "metric", 0.01),
+                    walk_frame("b", shots[1], "metric", 0.01)], lambda _: None)
+    assert [p.status for p in pls] == ["registered", "registered"]
+    wide = [c for c in calls if c[0] >= an.PRIOR_SPAN_M]
+    assert len(wide) >= 2  # within the job (``b``'s scale evidence), not only at its end
+    assert all(not ok and source != "baseline" for _, ok, source in wide)
+    assert any(ok for span, ok, _ in calls if span < an.PRIOR_SPAN_M)

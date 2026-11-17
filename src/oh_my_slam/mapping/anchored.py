@@ -2958,6 +2958,13 @@ class AnchoredMap:
                 math.hypot(spread, DEPTH_SENSOR_SIGMA_REL), MIN_SCALE_SIGMA_REL)
         return self.scale.source, self.scale.sigma_rel
 
+    def _estimate(self) -> None:
+        """The map's monocular depth scale k from its evidence (``ScaleState.estimate``), the
+        link vote allowed or not as the map stands now (``_links_allowed``): a map whose scale
+        becomes the metric priors' within a job stops pooling it at once (oms/2.15)."""
+        self.scale.links_ok = self._links_allowed()
+        self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+
     def _links_allowed(self) -> bool:
         """Whether link-measured scales may enter k (oms/2.15): never on a map whose scale
         comes from metric priors or depth images (``scale_summary``)."""
@@ -4401,13 +4408,13 @@ class AnchoredMap:
             self._evidence_from.add(f.name)
         self.add_height_evidence(f, T, depth, K_grid)
         k = self.scale.k
-        self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+        self._estimate()
         depth = (depth * (self.scale.k / k)).astype(np.float32)
         raw *= self.scale.k / k
         if self.mono_unjudged(f, T, sigma_pos_m, depth, K_grid, raw):
             k = self.scale.k
             self.scale, self._evidence_from = before, noted
-            self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+            self._estimate()
             depth = (depth * (self.scale.k / k)).astype(np.float32)
             raw *= self.scale.k / k
         return depth, raw
@@ -4663,14 +4670,13 @@ class AnchoredMap:
         self.scale.links = [[float(k.stereo_scale), float(k.stereo_sigma)]
                             for k in self.confirmed() if k.depth_kind == "mono"
                             and k.link_measured() and k.stereo_scale and k.stereo_sigma]
-        self.scale.links_ok = self._links_allowed()
         pending, self._defer = self._defer or [], None
         for kf, image, ignore, depth, K_grid in pending:
             if kf.id not in gone and kf.contributes():
                 got = self.content_grid(kf) if kf.id in judged else depth
                 assert got is not None
                 self._fuse(image, ignore, kf, got, K_grid)
-        self.scale.estimate(self.prior_span(), self.prior_span("drifting"))
+        self._estimate()
         if new and self.created_with == "none" and self.keyframes:
             self._level_by_floor([pl for pl in pls if pl.name not in dups])
         for pl in dups.values():
