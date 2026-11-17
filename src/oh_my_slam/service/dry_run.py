@@ -79,6 +79,7 @@ from oh_my_slam.service.prior_first import (
     _has_depth,
     body_link,
     frame_class,
+    job_bodies,
     job_drift_correction,
     none_engine,
     stereo_scale,
@@ -319,6 +320,7 @@ def _engine(up: Updater, frames: list[_Frame], prev: dict[str, Any] | None, work
     am.root.mkdir(parents=True, exist_ok=True)
     pairs = standpoint.Pairs(dict(am.pair_cache))  # the map's stored pairs, never written
     am.standpoint = functools.partial(standpoint.join_standpoint, am, pairs)
+    am.job_bodies = job_bodies(frames)  # every frame's body record (oms/2.15)
     todo = [fr for fr in frames if fr.reason is None and fr.path is not None]
     # a new map's origin as the job takes it (``prior_first.run_anchored``): the first frame
     # with a prior in canonical order, else the first frame (map.md §1, §2)

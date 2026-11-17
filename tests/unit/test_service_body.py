@@ -97,10 +97,17 @@ def test_a_frame_the_checks_reject_still_reports_its_link(client: Client) -> Non
     files["p"] = plain(320, 240)
     fr.append({"name": "p", "image": "p", "camera_id": "cam",
                "body": fbody("a0", mount=mount(), mount_stamp_s=5.0, standing=False)})
-    job = client.update("m", fr, files, cameras={"cam": CAM})
+    fr.append({"name": "r", "image": "p", "camera_id": "cam",
+               "body": fbody("a0", mount=mount(), mount_stamp_s=1.0)})
+    q, qfiles = frames_for(client, [base_pose(15)], tag="q")
+    q[0]["body"] = fbody("r", mount=mount(), mount_stamp_s=1.0)
+    files.update(qfiles)
+    job = client.update("m", fr + q, files, cameras={"cam": CAM})
     ins = {r["name"]: r for r in job["inputs"]}
     assert ins["p"]["status"] == "rejected"
     assert ins["p"]["body_link"]["reason"] == "stale_mount"
+    # a link from a frame the checks rejected: its record is the job's, the frame unconfirmed
+    assert ins["q0"]["body_link"]["reason"] == "from_unconfirmed"
 
 
 def bad(fr: list[dict[str, Any]], files: dict[str, bytes], cams: dict[str, Any] | None,

@@ -1652,8 +1652,10 @@ api.md §4 "Body links", map.md §1 "Body links" and "Keyframe depth scale" (bod
 `BodyMotion`, `MountSource`, `MotionSource`, `BodyLink`, `Camera.body_mount`,
 `StereoScale.link_neighbours`. Code: `mapping.body` (records, floors, paths, the camera relative
 pose and its sigmas), `AnchoredMap.set_bodies`, `link_report`, `_linked`, `_place_linked`,
-`_finish_link`, `_scale_neighbours` (link pairs first), `ScaleState.link_votes`, `_links_allowed`;
-validation `service.app.check_bodies`; reports `service.prior_first.body_link`.
+`_finish_link`, `_link_kept` (every kept path at the end of a registration), `job_bodies`
+(every request frame's record, those the checks reject included), `_scale_neighbours` (link pairs first), `ScaleState.link_votes`, `_links_allowed`;
+validation `service.app.check_bodies` (after every other frame field, so earlier errors keep
+their precedence); reports `service.prior_first.body_link`.
 
 Why. A monocular robot turning in place has no prior baseline (oms/2.14 replays: e305's look had
 prior steps of 4-16 cm across 17-109° turns with client fixes between them, so 0 of 13 keyframes
@@ -1731,6 +1733,26 @@ figures; they may change with its measurements):
 | same mount reading | 1 mm and 0.1°, same source | mount errors treated as common |
 | `LINK_PATH_MAX` | 4 links | the oms/2.14 order gap |
 | `LINK_SCALE_MIN` | 3 keyframes | link-measured scales that make scale evidence |
+
+**Jacobians as implemented** (`mapping.body.compose`, `camera_link`; first order, angles in
+radians, everything in body A, sigmas 3-D RMS for positions):
+
+* `compose(steps)`: T starts at the identity. A link walked forward (from its `from` frame to its
+  frame) takes T ← T · T_from_body and its pivot is the child body after it: p_i = T[:3, 3],
+  R_i = T[:3, :3]; a link walked backward takes its pivot before it (the child is where the
+  step starts) and T ← T · T_from_body⁻¹. Its rotation error is a rotation of the child body
+  about its own axes at p_i: yaw about z_i = R_i[:, 2] with σ_yaw,i, tilt about x_i and y_i
+  with σ_tilt,i each; its translation error moves everything past it alike (σ_pos,i). Summed:
+  V_pos = Σ σ_pos,i², V_rot = Σ (σ_yaw,i² + 2 σ_tilt,i²).
+* `camera_link(m_A, m_B, c)`: T_camA_camB = M_A⁻¹ · T · M_B; c_B = (T · M_B)[:3, 3], camera B's
+  centre; with l_i = c_B − p_i,
+  σ_t² = V_pos + Σ_i [σ_yaw,i² |z_i × l_i|² + σ_tilt,i² (|x_i × l_i|² + |y_i × l_i|²)]
+  + σ_mount² + (|t| σ_rot,A)², and σ_R² = V_rot + σ_mrot², where ψ is T's rotation angle and
+  σ_mount = 2 sin(ψ/2) max(σ_pos,A, σ_pos,B), σ_mrot = 2 sin(ψ/2) max(σ_rot,A, σ_rot,B) for the
+  same reading (both fixed, or within 1 mm and 0.1° with one source), else hypot of the two.
+  The tilt term is the two-axis lever sqrt(|x × l|² + |y × l|²) (map.md §1 states it the same
+  way), slightly more than the |l| · σ_tilt of the first spec draft. A Monte Carlo of a
+  three-link path agrees within 15 % (`tests/unit/test_body_links.py::test_paths`).
 
 Validation: the composition and its sigmas against Monte Carlo draws and the client's two cases
 (`tests/unit/test_body_links.py`); synthetic head pans through the linked edge, the linked pose,

@@ -430,11 +430,15 @@ error code `invalid_request` (§9).
       `standing`;
     * `body` on a locate or `analyse` frame (not in their schema).
 
-    At run time a link may still be unusable; that is its `body_link` report, below.
+    The bodies are validated after every other field of the request's frames, so an earlier
+    error (a camera, an image, a depth or mask part) keeps its precedence. At run time a link
+    may still be unusable; that is its `body_link` report, below.
   * **Report.** Every frame that sent `motion` has `inputs[].body_link` ([`BodyLink`]):
     `state` `used` (its linked edge took part in registration, map.md §2, and its paths are
     baseline candidates for the keyframe scale; or it gave the kept frame its pose, map.md §1,
-    Body links, kept frames) or `unused` with `reason`: `from_unknown` (the
+    Body links, kept frames; a frame that ends `rejected`, `prior_conflict` against its linked
+    pose or `too_close`, may carry `used` too, its link having taken part) or `unused` with
+    `reason`: `from_unknown` (the
     `from` frame is neither in the request nor stored in the base version: rejected, reverted,
     or its job did not commit), `from_unconfirmed` (the `from` frame is not image-confirmed: a
     stored `kept_at_prior` frame, or a job frame that ends unregistered), `from_no_mount` (a stored `from` frame without a mount),
@@ -512,7 +516,8 @@ error code `invalid_request` (§9).
     and the stored body records alone, so a client sees before sending whether a turn gives a
     usable baseline (σ / |t| ≤ 0.20, Body links above); `state`, `reason` and
     `rotation_residual_deg` come from the dry run's own matching, and its linked edges enter
-    the predicted statuses (map.md §2, Match graph).
+    the predicted statuses (map.md §2, Match graph). A dry run without the prior-first engine
+    (a map of the older mapper) reports every link `unused` with reason `engine`.
 
   It also gives a predicted `quality`, without fusion (`drift_correction` included, map.md §4),
   and `scale_source` and `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use

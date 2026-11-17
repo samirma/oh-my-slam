@@ -195,10 +195,13 @@ def test_link_verdicts_with_a_prior(tmp_path: Path, pans: dict[int, syn.Shot],
         mp.setattr(an, "CONFIRM_SIGMA_ROT_DEG", 0.0)  # a linked pose too loose to confirm
         pl = run("b", prior(pans[25].T))
     assert pl.status == "kept_at_prior" and pl.detail == "loose_image_pose"
+    assert pl.T is not None and err(pl.T, pans[25].T)[0] < 0.03  # at the linked pose
     pl = run("c", prior(pans[25].T), unconfirmed="blur")
     assert pl.status == "kept_at_prior" and pl.reason == "blur" and pl.detail is None
+    assert pl.T is not None and err(pl.T, pans[25].T)[0] < 0.03  # at the linked pose
     pl = run("d", prior(far), unconfirmed="blur")
     assert pl.status == "kept_at_prior" and pl.detail == "conflict_unsupported"
+    assert pl.T is not None and err(pl.T, pans[25].T)[0] < 0.03  # at the linked pose
 
 
 def test_link_reasons(tmp_path: Path, pans: dict[int, syn.Shot],

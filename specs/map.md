@@ -271,11 +271,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
      median of their sigmas (a mount's calibration error is common to every baseline of the
      camera). The vote is pooled with camera heights (item 4) by inverse variance, never an
      override: k is the weighted mean in ln scale of the two, its `scale_sigma_rel` one over the
-     root of their summed weights. The scale source is `baseline` only when the link vote weighs
-     more than the camera heights' (alone, without camera heights); else it stays
-     `camera_height`. Link-measured scales never change the scale of a map whose scale comes
-     from `metric` priors or depth images (items 1 and 2): they then enter neither k nor the
-     source;
+     root of their summed weights. The scale source is `baseline` exactly when the link vote
+     qualifies and either no camera height qualifies (item 4) or the link vote's weight exceeds
+     the camera heights'; otherwise, with camera heights, it is `camera_height`. Link-measured
+     scales never change the scale of a map whose scale comes from `metric` priors or depth
+     images (items 1 and 2): they then enter neither k nor the source;
   4. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
      floor check did not judge (`floor_not_judged`, §2) gives no such evidence from its own
      depth or floor plane: its sent height constrains only its own camera pose, and is never
@@ -283,6 +283,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
      out-of-bound part. Its height may still count where the evidence is formed from poses
      and other frames' floor;
   5. monocular depth (`monocular`).
+
+  **The order of k's evidence** (the monocular depth scale, oms/2.15): camera heights pooled with
+  the link vote (item 3; the link vote alone without camera heights), then the baselines of
+  `metric` priors once they span `PRIOR_SPAN_M`, then those of `drifting` priors (the
+  odometry's, within its drift; reported as `priors`), then the monocular model's metres. Body
+  links outrank `drifting` priors: their baselines are metric, not the odometry's.
 
   `scale_sigma_rel` is estimated from the residuals of that source, from image-confirmed frames
   only (§2), and never from the depth of a `floor_not_judged` keyframe, whether as the frame's
@@ -380,7 +386,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     move: a head pan or tilt with the body still) has floors 0.001 m and 0.1° (its tilt default
     0.1° too); its baseline is the change of the mount alone, the two mounts taken as different
     readings.
-  * **Kept frames** (oms/2.15). A frame that ends `kept_at_prior` with a usable link to a
+  * **Kept frames** (oms/2.15). Whatever the path that keeps it (a failed check, the distance
+    limit, no image pose, a loose or unsupported image pose, kept before the job's origin, a
+    drift outlier), a frame that ends `kept_at_prior` with a usable link to a
     confirmed `from` frame (both mounts fresh, not `inconsistent`) is kept at the linked pose (the
     `from` keyframe's pose composed with the link, refined on the images when they matched), with
     its composed sigmas (the `from` keyframe's and the link's, root sum of squares), in place of
@@ -397,16 +405,21 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     translation of the rest of the path (the lever of that rotation). A path reads body records
     only, never a pose, so it depends neither on registration nor on frame order.
   * **Camera relative pose.** For a path between frames A and B, both mounts fresh, T_camA_camB =
-    T_body_camA⁻¹ · T_bodyA_bodyB · T_body_camB. Its translation sigma is σ_t = hypot(σ_pos,
-    r_B · σ_yaw, |p_B| · σ_tilt, σ_mount, |t| · σ_rot,A), angles in radians: σ_pos, σ_yaw and
-    σ_tilt the path's; p_B camera B's lever arm (`T_body_camB`'s translation) and r_B the length
-    of its horizontal part; σ_mount the mounts' position error on the baseline, 2 sin(ψ / 2) ·
+    T_body_camA⁻¹ · T_bodyA_bodyB · T_body_camB. Its translation sigma is σ_t² = Σ_links (σ_pos²
+    + σ_yaw² · |z × l|² + σ_tilt² · (|x × l|² + |y × l|²)) + σ_mount² + (|t| · σ_rot,A)², angles
+    in radians: per link of the path its own sigmas, x, y, z the axes of that link's child body
+    and l the lever from the child body's origin (where its rotation error pivots) to camera B's
+    centre, all in body A (for one link: l is camera B's lever arm, |z × l| the length r_B of its
+    horizontal part, and the tilt term the two tilt axes' lever lengths); σ_mount the mounts'
+    position error on the baseline, 2 sin(ψ / 2) ·
     σ_pos,mount when the two mounts are the same reading (both the camera's `body_mount`, or equal
     within 1 mm and 0.1° with the same source: their common error cancels but for the turn ψ),
     else hypot(σ_pos,A, σ_pos,B); σ_rot,A mount A's rotation sigma, which turns the baseline as
     camera A sees it. Its rotation sigma is hypot(σ_yaw, √2 · σ_tilt, the mounts' rotation term:
-    2 sin(ψ / 2) · σ_rot,mount for the same reading, else hypot(σ_rot,A, σ_rot,B)). `README.md`
-    records the implementation's exact Jacobians.
+    2 sin(ψ / 2) · σ_rot,mount for the same reading, else hypot(σ_rot,A, σ_rot,B)), the yaw and
+    tilt variances summed over the path's links. `README.md` records the implementation's exact
+    Jacobians. A `none` motion between two frames whose mounts are the same reading (a head that
+    did not move either) has a baseline of about 0 and a σ_mount of about 0: no usable pair.
   * **One relative pose per pair.** Where two frames have a path, the path is their relative
     pose wherever the mapper takes a relative pose from data other than images: the keyframe
     depth scale's baseline (above) and the linked edge (§2, Match graph). The two priors'
@@ -420,9 +433,12 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     counting it would count its partner twice. Its own image-only points fit, when that fit is a
     placement (§2, Match graph), enters as before.
   * **Persistence.** The body record (mount, stamps, `standing`, motion) is kept with the frame
-    in the mapper's store, as its prior is, also for a frame that ends the job `kept_at_prior`. A
-    frame the job rejects is not stored, so a later job's frame linking `from` it has
-    `from_unknown` (api.md §4); within the job its record still composes paths. A revert
+    in the mapper's store, as its prior is, also for a frame that ends the job `kept_at_prior`.
+    Within its job every frame of the request has its record, a frame the checks reject
+    (`duplicate` name aside, `unusable_image` or any other check) and one of the other engine
+    included: a frame linking `from` it in the same job has `from_unconfirmed`, and paths
+    compose through it. A frame the job rejects is not stored, so a later job's frame linking
+    `from` it has `from_unknown` (api.md §4). A revert
     restores the records with the frames. A frame stored before oms/2.15 has none
     (`from_no_mount`).
 
@@ -697,7 +713,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        rotation-only fit: two measurements, the body's own motion and the images' relative
        rotation, agree against one fit lifted at a monocular scale (a camera turning in place on a
        reference whose depth scale is off slides along its view). A points fit within that bound
-       stands, the linked edge having confirmed it. MapAnything placements are not tested against
+       stands, the linked edge having confirmed it: without a prior it is registered whatever
+       the no-prior minimums of inliers and inlier share; with a prior, when the prior checks
+       would find it loose or in a conflict below the measurable-pair threshold
+       (`conflict_unsupported`), the linked pose takes its place in those checks, as for a fit
+       outside the bound. MapAnything placements are not tested against
        a linked pose (documented limit, as for the guards: they are no points fit).
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests, api.md
        §4) apply frame by frame to the component's fitted poses, a linked pose with its own

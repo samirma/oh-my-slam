@@ -2798,6 +2798,9 @@ class AnchoredMap:
         # the running job's body records by frame name (oms/2.15, map.md §1 "Body links"): the
         # stored keyframes' and the job's frames'
         self._bodies: dict[str, bl.Body] = {}
+        # the body records of every frame of the running job's request, rejected by the checks
+        # or of the other engine included (set by the service: map.md §1 "Body links", paths)
+        self.job_bodies: dict[str, bl.Body] = {}
         # the running job's one-view rule (map.md §1, oms/2.13; ``_one_view_rule``): the views it
         # held (kept by ``_close_drift``), their names (still observations in the next pass) and
         # its report (held, the views agreeing on the largest correction, those consumed)
@@ -3568,9 +3571,12 @@ class AnchoredMap:
             if img is not None:
                 log.info("%s: its %s fit is no placement beside its linked pose", f.name, img[3])
             return self._place_linked(f, ln, pred)
+        held = ln is not None and ln.pose is not None  # its points fit within the bound
         if T0 is None:
-            # without a prior, the images alone must carry it: more inliers, a fair share
-            if img is None or img[1] < NO_PRIOR_MIN_INLIERS or img[2] < NO_PRIOR_MIN_RATIO:
+            # without a prior, the images alone must carry it: more inliers, a fair share;
+            # beside a held link the linked edge confirmed it (oms/2.15)
+            if img is None or (not held and (img[1] < NO_PRIOR_MIN_INLIERS
+                                             or img[2] < NO_PRIOR_MIN_RATIO)):
                 return Placement(f.name, "rejected", reason)
             s, n, _, method, spi, sri, sub, refs = img
             rp, rr = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
@@ -3608,6 +3614,11 @@ class AnchoredMap:
         s, n, _, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
         tested = self._image_conflict(f, img, cands, T0, sp0, sr0)
+        if held and (tested is None or (tested[3] and not measurable_pose(
+                sub[0][s.inliers], sub[3][s.inliers], f.K))):
+            # loose or an unsupported conflict beside a held link: the linked pose decides
+            assert ln is not None
+            return self._place_linked(f, ln, pred)
         if tested is None:
             kept = self.kept_at(f, reason, n, detail="loose_image_pose", pred=pred)
             kept.inlier_floor_share, kept.rival = floor_share, rival
@@ -3680,6 +3691,7 @@ class AnchoredMap:
         job's frames' (map.md §1 "Body links", paths)."""
         self._bodies = {k.name: bl.Body.from_json(k.body) for k in self.keyframes
                         if k.body is not None}
+        self._bodies.update(self.job_bodies)
         self._bodies.update({f.name: f.body for f in frames if f.body is not None})
 
     def _named(self, name: str) -> Keyframe | None:
@@ -4221,8 +4233,7 @@ class AnchoredMap:
         ref_p = np.asarray(prior["T"])[:3, 3] if prior is not None \
             and prior["trust"] == "metric" else centre
         b_prior = float(np.linalg.norm(prior_T[:3, 3] - ref_p))
-        anchored = kind == "sensor" or (kind == "mono" and self.scale.source in (
-            "camera_height", "baseline"))
+        anchored = kind == "sensor" or (kind == "mono" and self.scale.source == "camera_height")
         if trust == "metric" and anchored:
             out.append(("bias", [b_prior, b_img]))
         if kind != "mono":
@@ -5154,7 +5165,26 @@ class AnchoredMap:
         for i in sorted(forced, key=lambda j: _order(frames, j)):
             if out[i].status == "kept_at_prior":
                 self._keep(frames[i], prep[i], out[i], progress)
+        self._link_kept(frames, prep, out)
         return out
+
+    def _link_kept(self, frames: list[FrameIn], prep: list[_Prep],
+                   out: dict[int, Placement]) -> None:
+        """Every frame of the job that ends ``kept_at_prior`` (whatever the path: a failed
+        check, the distance limit, kept before the origin, a drift outlier) with a usable link
+        to a frame confirmed now is kept at the linked pose (map.md §1 "Body links", kept
+        frames; ``_finish_link``), its keyframe with it."""
+        for i, pl in out.items():
+            f = frames[i]
+            if pl.status != "kept_at_prior" or f.body is None or f.body.motion is None:
+                continue
+            ln = self._linked(f, prep[i].feats)
+            assert ln is not None
+            out[i] = pl = self._finish_link(pl, ln)
+            k = self.keyframe(pl.keyframe or "")  # every kept frame is stored (``_keep``)
+            assert k is not None and pl.T is not None and pl.sigma_pos_m is not None \
+                and pl.sigma_rot_deg is not None
+            k.T, k.sigma_pos_m, k.sigma_rot_deg = pl.T.copy(), pl.sigma_pos_m, pl.sigma_rot_deg
 
     def _origin_of(self, frames: list[FrameIn], prep: list[_Prep], pending: list[int],
                    out: dict[int, Placement], progress: Callable[[str], None]) -> None:

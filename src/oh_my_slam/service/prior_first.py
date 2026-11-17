@@ -491,6 +491,16 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     return row
 
 
+def job_bodies(frames: list[_Frame]) -> dict[str, Any]:
+    """The body records of a job's frames by name (map.md §1 "Body links": a frame the checks
+    rejected still composes paths within its job), a repeated name's first."""
+    out: dict[str, Any] = {}
+    for fr in frames:
+        if fr.work.body is not None and fr.reason != "duplicate":
+            out.setdefault(fr.work.name, fr.work.body)
+    return out
+
+
 def body_link(fr: _Frame, pl: Placement | None, am: AnchoredMap | None) -> dict[str, Any] | None:
     """A frame's ``body_link`` (api.md §4, oms/2.15): its placement's when the mapper placed it,
     else (a frame the checks rejected) its link before matching (``AnchoredMap.link_report``:
@@ -641,6 +651,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
             up.store.seed_ids(w.map, mapper, anchored=True)
             am = AnchoredMap(mapper)
         am.begin_job()
+        am.job_bodies = job_bodies(frames)  # every frame's body record (oms/2.15)
         # the stored-to-stored pairs' fits are kept with the map (map.md §1, P27)
         pairs.cache = am.pair_cache
         tm["clone"] = round(time.perf_counter() - t, 3)

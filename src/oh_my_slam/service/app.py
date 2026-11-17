@@ -311,11 +311,6 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
             masks[cid] = (digest, parts[cam["ignore_mask"]])
         new[cid] = cam
     cameras = {**(pending or {}), **known, **new}
-    for i, f in enumerate(req["frames"]):
-        if f["camera_id"] not in cameras:
-            raise invalid(f"frames[{i}].camera_id", f"frames[{i}].camera_id {f['camera_id']!r} "
-                          "is neither in the request's cameras nor known to the map")
-    bodies = check_bodies(req, cameras, _stored_frames(store, name), pending_frames or {})
     seen: set[str] = set()
     frames = []
     for i, f in enumerate(req["frames"]):
@@ -323,7 +318,10 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
         # a repeated name is the frame's input status, not an error (api.md §3-§4)
         reject = "duplicate" if f["name"] in seen else None
         seen.add(f["name"])
-        cam = cameras[f["camera_id"]]
+        cam = cameras.get(f["camera_id"])
+        if cam is None:
+            raise invalid(f"{field}.camera_id", f"{field}.camera_id {f['camera_id']!r} is "
+                          "neither in the request's cameras nor known to the map")
         image = part(f"{field}.image", f["image"])
         if reject is None and not _usable(image, cam):
             reject = "unusable_image"  # it does not decode, or is not its camera's size
@@ -348,7 +346,11 @@ def update_work(store: Store, name: str, req: dict[str, Any], parts: dict[str, b
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         frames.append(FrameWork(i, f["name"], f["camera_id"], image, depth, prior,
                                 f.get("height_above_floor_m"), f.get("height_sigma_m"), frame_mask,
-                                reject, bodies.get(i)))
+                                reject))
+    # the bodies last (oms/2.15): every earlier error keeps its precedence
+    bodies = check_bodies(req, cameras, _stored_frames(store, name), pending_frames or {})
+    for fw in frames:
+        fw.body = bodies.get(fw.index)
     return UpdateWork(name, frames, req.get("accept_if"), new, masks,
                       [str(lab).strip() for lab in req.get("labels") or []])
 
