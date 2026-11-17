@@ -952,6 +952,23 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   * *Monocular replays* (one keyframe per job, through `AnchoredMap.update`): e305 11/22, e205
     2/21, j3 10/25, j5 33/40, j6 19/39, statuses, poses and k identical to 7cc680c (no sensor
     depth: nothing is paired).
+  *A rotation-aware check: tried, refused.* The contradiction margin holds the committed
+  position sigmas only, so a rotation within its sigma (k000014's 0.5°) moves a thin structure
+  across a depth edge and reads as a see-through. Trial (uncommitted): a see-through point
+  counted neither way (like occlusion) unless the other view's nearest valid surface within
+  r = 3 × hypot(σ_rot,a, σ_rot,b) × focal (committed 3-D RMS sigmas; 47-58 px on rev8) lies
+  behind it too. It cleared every thin-structure contradiction (k000014 against the second
+  version 0.93-0.96 → 1.000; all 131 stored pairs ≥ 0.928 → 1.000; `rev8_wheeled` version 5
+  rejects 3 frames instead of the whole look), but it also forgave turns beyond its own 3σ
+  (k000014 turned ±5° passes) and it excused the lattice: in a rectilinear room turned 90° the
+  walls agree by period and the contradictions sit at the corners, which are depth edges
+  (`test_a_lattice_locked_turn_is_depth_inconsistent`: f0-f3 0.80 → 0.973, 474 of 534
+  see-through points excused; that job was then refused by the rotation check only, which a job
+  with priors does not run). A plain lateral term z × 3σ_rot in the margin was not measured: it is
+  the same filter, weaker, on the same corners. *Future work*: excuse only points on a thin
+  foreground structure of their own view (a narrow blob in front of a far background), or a
+  per-pixel reach from the point's own depth geometry instead of a fixed window, so the planar
+  corner contradictions of a lattice still count.
 * **Two-view parallax on repeating textures** (map.md §1 "Two-view parallax";
   `standpoint.turn_parallax`). A turn in place satisfies every essential matrix, so on a
   repeating wall texture the largest epipolar consensus of an adjacent turn takes the walls'
