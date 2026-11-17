@@ -132,7 +132,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   The older mapper is exempt from exactly these, all documented limits that `README.md`
   records: static-content exclusion, standpoint grouping, the match graph (§2), the
   texture-aliasing guards (§2, oms/2.13) and the one-view drift rule (Drift estimate below,
-  No correction from one view, oms/2.13). Its registrations come from its own internal solve
+  No correction from one view, oms/2.13), and body links (oms/2.15: it accepts them and uses
+  none, api.md §4). Its registrations come from its own internal solve
   and are not depth-gated (the depth confirmation of §1, Measurable pair, and §2, Match graph,
   step 2). MapAnything's placements are no points fit and are not tested by the guards.
 * **Without priors, with a camera height** (`height_above_floor_m`): z = 0 is the floor plane,
@@ -261,13 +262,23 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
 * **Scale.** The scale comes from the first available of:
   1. `metric` priors (`scale_source: priors`);
   2. depth images (`depth`);
-  3. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
+  3. body-link baselines (`baseline`, oms/2.15): the link-measured scales (Keyframe depth
+     scale, below: a measurement whose agreeing pairs are all body-link pairs) of at least
+     `LINK_SCALE_MIN` (`README.md`, 3) image-confirmed monocular keyframes, more than half of
+     them agreeing by the rule of its Combined bullet. The map's monocular depth scale k (raw
+     monocular depth to map metres) is then their inverse-variance mean in ln scale. As the
+     scale source, its `scale_sigma_rel` is the larger of their weighted spread over the root of
+     their count and the median of their sigmas, since a mount's calibration error is common to
+     every baseline of the camera. The same evidence sets k ahead of camera heights also on a map
+     whose scale source is `metric` priors: a link baseline depends neither on k nor on the drift
+     estimate, unlike an oms/2.14 measurement on prior baselines, which is no scale evidence;
+  4. camera heights above the floor, per frame or per camera (`camera_height`). A frame the
      floor check did not judge (`floor_not_judged`, §2) gives no such evidence from its own
      depth or floor plane: its sent height constrains only its own camera pose, and is never
      combined with that frame's depth into a scale estimate, since that depth is the
      out-of-bound part. Its height may still count where the evidence is formed from poses
      and other frames' floor;
-  4. monocular depth (`monocular`).
+  5. monocular depth (`monocular`).
 
   `scale_sigma_rel` is estimated from the residuals of that source, from image-confirmed frames
   only (§2), and never from the depth of a `floor_not_judged` keyframe, whether as the frame's
@@ -286,7 +297,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   reliable. It is measured by motion stereo against neighbour keyframes whose relative
   translation is known independently of the images and of any keyframe's depth:
   * **When.** At the end of every job, once its statuses are final, for every image-confirmed
-    monocular keyframe with a `metric` or `drifting` prior that the job added or re-registered,
+    monocular keyframe with a `metric` or `drifting` prior, or (oms/2.15) with a body link path to
+    a possible neighbour (Body links, below), that the job added or re-registered,
     and for every stored one with any such job keyframe within the order gap of it (below,
     whether or not that keyframe then qualifies as a pair), measured again over all its
     neighbours (a measurement that no longer holds is cleared). The
@@ -313,6 +325,13 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     the root sum of squares of the two rotation sigmas. A pair takes part only when σ_t / |t| is
     at most `KEYFRAME_BASELINE_REL_MAX` (0.20); at most `KEYFRAME_SCALE_PAIRS` (4) of them, the
     nearest in viewing direction first.
+    **Body-link pairs** (oms/2.15). A keyframe of the same camera joined to the measured one by a
+    body link path (Body links, below; both mounts fresh) is a neighbour whatever the trust of
+    the two priors, or without priors: its relative pose, σ_t and rotation sigma are the path's,
+    and the two priors' difference is not used for that pair. The order gap is the path's length
+    (at most `LINK_PATH_MAX`, 4 links), the 60° limit applies to the path's relative rotation,
+    and the pair takes part when σ_t / |t| is at most `KEYFRAME_BASELINE_REL_MAX`, as above.
+    Body-link pairs are chosen before prior pairs among the `KEYFRAME_SCALE_PAIRS`.
   * **Each pair** is the motion stereo of frame analysis (api.md §7, oms/2.11): matches, the
     relative rotation and translation direction refined on the images with the priors' relative
     pose as the prior (its length kept), triangulation with per-point σ(ln z); it qualifies with
@@ -333,11 +352,61 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     fits at k as before (§2), and it is no scale evidence (it is measured on the drift estimate's
     odometry scale, which the map's registrations at k measured). Lifting a keyframe at its
     measured scale was replayed and refused (`README.md`, oms/2.14): it cost j5 and j6 laps.
+    Since oms/2.15 a measurement whose agreeing pairs are all body-link pairs (a
+    **link-measured scale**) is scale evidence all the same (Scale, above, item 3): its baselines
+    depend neither on k nor on the drift estimate. A measurement with a prior pair among its
+    agreeing pairs stays no evidence. Lifting at a measured scale stays refused.
   * **Persistence and report.** The scale, its sigma and its neighbours are kept with the
     keyframe in the mapper's store; a keyframe stored before oms/2.14 has none and behaves as
     before. A job's input status reports it as `stereo_scale` (api.md §4), a dry run as its
     frame's predicted `stereo_scale`; a turning look before the robot's first straight move has
-    no baseline, and its keyframes carry none.
+    no prior baseline, and without body links its keyframes carry none (oms/2.15: the lever arm
+    gives it one, Body links below); `link_neighbours` names the body-link pairs.
+* **Body links** (oms/2.15). A frame's `body` (api.md §4, Body links) holds the camera's mount on
+  the robot's body at the exposure (`T_body_cam`, its own or its camera's `body_mount`) and,
+  optionally, the body's motion since an earlier frame (`motion`, `T_from_body`). A link joins
+  the frame to its `from` frame.
+  * **Mounts.** A mount's sigmas are the sent ones (or its source's defaults) raised to its
+    source's floor (`README.md`); it is fresh or stale by its stamps (api.md §4, Timestamps). The
+    motion's sigmas are raised to the floors of their sources the same way.
+  * **Paths.** Links form trees: each frame has at most one `from`. Two frames of the same
+    camera joined through at most `LINK_PATH_MAX` (`README.md`, 4) links have a path, through
+    frames of the job and stored frames with a body record, whatever their status, stale mounts
+    included (a body's motion does not depend on its mount); a link walked from its frame to its
+    `from` is inverted. The path's body motion T_bodyA_bodyB composes the links' `T_from_body`.
+    Its sigmas propagate linearly: yaw variances add, tilt variances add, and the translation's
+    variance is the links' own plus, for each link, its yaw and tilt sigmas acting on the
+    translation of the rest of the path (the lever of that rotation). A path reads body records
+    only, never a pose, so it depends neither on registration nor on frame order.
+  * **Camera relative pose.** For a path between frames A and B, both mounts fresh, T_camA_camB =
+    T_body_camA⁻¹ · T_bodyA_bodyB · T_body_camB. Its translation sigma is σ_t = hypot(σ_pos,
+    r_B · σ_yaw, |p_B| · σ_tilt, σ_mount, |t| · σ_rot,A), angles in radians: σ_pos, σ_yaw and
+    σ_tilt the path's; p_B camera B's lever arm (`T_body_camB`'s translation) and r_B the length
+    of its horizontal part; σ_mount the mounts' position error on the baseline, 2 sin(ψ / 2) ·
+    σ_pos,mount when the two mounts are the same reading (both the camera's `body_mount`, or equal
+    within 1 mm and 0.1° with the same source: their common error cancels but for the turn ψ),
+    else hypot(σ_pos,A, σ_pos,B); σ_rot,A mount A's rotation sigma, which turns the baseline as
+    camera A sees it. Its rotation sigma is hypot(σ_yaw, √2 · σ_tilt, the mounts' rotation term:
+    2 sin(ψ / 2) · σ_rot,mount for the same reading, else hypot(σ_rot,A, σ_rot,B)). `README.md`
+    records the implementation's exact Jacobians.
+  * **One relative pose per pair.** Where two frames have a path, the path is their relative
+    pose wherever the mapper takes a relative pose from data other than images: the keyframe
+    depth scale's baseline (above) and the linked edge (§2, Match graph). The two priors'
+    difference is then not used for that pair as well: the priors and the links usually share
+    the client's odometry, and counting both would count it twice. The priors keep every
+    absolute use: placing a frame (its prior as placed), seeding a component, the conflict bound
+    and the looseness tests, the drift estimate.
+  * **Drift estimate.** A pose placed through a linked edge is not an image-only pose: its
+    position is its partner's plus the link. It is no fit point, no supporting frame and no
+    agreeing view of the drift estimate (Drift estimate, No correction from one view, above):
+    counting it would count its partner twice. Its own image-only points fit, when that fit is a
+    placement (§2, Match graph), enters as before.
+  * **Persistence.** The body record (mount, stamps, `standing`, motion) is kept with the frame
+    in the mapper's store, as its prior is, also for a frame that ends the job `kept_at_prior`. A
+    frame the job rejects is not stored, so a later job's frame linking `from` it has
+    `from_unknown` (api.md §4); within the job its record still composes paths. A revert
+    restores the records with the frames. A frame stored before oms/2.15 has none
+    (`from_no_mount`).
 
 ## 2. Versions (O2)
 
@@ -562,6 +631,21 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        only if the frame's fitted pose then passes the prior checks (step 3). The 100-inlier
        measurable-pair threshold (§1) stays for the rotation check and the other pair
        limits.
+       **Linked edge** (oms/2.15). Two frames joined by a body link (§1, Body links: the frame
+       and its `from` frame, both mounts fresh, the `from` frame in the job or a confirmed
+       stored keyframe; a `from` frame that is a stored `kept_at_prior` frame, or a job frame
+       that ends unregistered, gives none: `from_unconfirmed`) are also joined by an edge when they share at least the registration
+       minimum of epipolar inliers. Their relative pose is the motion stereo refinement of
+       api.md §7 on those matches with the link's camera relative pose as the prior and its
+       translation length kept: the images measure the relative rotation and the translation
+       direction, the link the metric offset. The edge holds only when the refined rotation lies
+       within 3 × hypot(the link's rotation sigma, the refinement's) of the link's; otherwise
+       the link is `inconsistent` (api.md §4) and gives no edge, so a false match set that the
+       body's own yaw contradicts places nothing. A linked edge needs no depth (no points fit, no
+       lifted depth, no monocular scale), so the texture-aliasing guards and the depth
+       confirmation do not apply to it; it is exempt as a rotation-only fit is. It is an image
+       edge: its frames are image-confirmed through it. Only the link itself is an edge, not a
+       longer path.
     2. Each connected component of new frames registers as a whole. Relative poses come from
        the images. The component is placed by its matches to confirmed keyframes, by the
        priors of all its frames together, or both. On every engine but the older mapper (§1,
@@ -585,8 +669,17 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        seed prior's. This floor applies to every frame whose placement depends on the component,
        whatever the engine or pass (MapAnything, a retry, re-registration), until the
        component links to a confirmed keyframe.
+       **A linked pose** (oms/2.15): a frame with a linked edge to a placed frame has a candidate
+       pose there, the partner's pose composed with the edge's relative pose, its position sigma
+       hypot(the partner's, the link's σ_t), its rotation sigma hypot(the partner's, the
+       refinement's). A points fit of the frame (or a MapAnything placement) farther from that
+       linked pose than 3 × sqrt(σ_fit² + σ_linked²), position or rotation, is not a placement: two
+       measurements, the body's own motion and the images' relative rotation, agree against one fit
+       lifted at a monocular scale (a camera turning in place on a reference whose depth scale is
+       off slides along its view). A points fit within that bound is fused with the linked pose.
     3. The prior checks (`prior_conflict` with the combined bound, and the looseness tests, api.md
-       §4) apply frame by frame to the component's fitted poses. A frame that fails a looseness test
+       §4) apply frame by frame to the component's fitted poses, a linked pose with its own
+       sigmas (above) as the frame's hypothesis. A frame that fails a looseness test
        is `kept_at_prior` with `detail` `loose_image_pose`, whatever else it fails. Otherwise, a
        frame beyond the conflict bound is rejected with `prior_conflict` when its image-only pose
        meets the measurable-pair threshold (at least 100 inliers and 10 % overlap, both with the

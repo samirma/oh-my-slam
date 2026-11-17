@@ -78,7 +78,9 @@ error code `invalid_request` (§9).
   id, once defined, stays known to the map with its values: a revert does not roll the registry
   back (map.md §2), and camera ids are never freed. A camera sent by an earlier job of the same
   map that is still queued or running counts as known, so a later job may omit it. If that
-  earlier job does not commit, the later job fails with `invalid_request`.
+  earlier job does not commit, the later job fails with `invalid_request`. A camera on a fixed
+  mount may carry `body_mount` (oms/2.15, [`BodyMount`]), its pose in the robot's body frame
+  (§4, Body links); it is one of the camera's values.
 * **`frames[]`** — each [`FrameInput`] has:
   * `name`, unique within the map: a name the map or the request already holds is rejected
     `duplicate`, whatever the image;
@@ -93,7 +95,10 @@ error code `invalid_request` (§9).
   * an optional `depth`, a part name;
   * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
     union of the two masks contributes nothing anywhere, on every engine, in every use (map.md §2,
-    Ignored pixels): the models see the image unaltered and their outputs drop those pixels.
+    Ignored pixels): the models see the image unaltered and their outputs drop those pixels;
+  * an optional `body` (oms/2.15, [`FrameBody`]): the camera's mount on the robot's body at the
+    exposure and the body's motion since an earlier frame, a metric relative prior (§4, Body
+    links).
 * **`labels`** (update requests, optional, oms/2.3) — text prompts added to the map's label
   vocabulary (map.md §5): at most 64 entries, each 1–64 characters after trimming. Labels are
   compared as map.md §5 defines (case-folded, `_` as a space). An invalid label refuses the
@@ -135,7 +140,8 @@ error code `invalid_request` (§9).
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
   | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's; since oms/2.14 also for a frame judged about its measured scale (`stereo_scale.judged`). Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
-  | `stereo_scale` | Optional (oms/2.14). Present when the frame is an image-confirmed monocular keyframe with a `metric` or `drifting` prior whose own depth scale was measured by motion stereo at the job's end (map.md §1, Keyframe depth scale): `{scale, sigma_rel, neighbours, judged}`, `scale` the factor from its raw depth to map metres (comparable to `depth_scale`), `sigma_rel` its relative sigma, `neighbours` the names of the keyframes whose pairs gave it, `judged` whether it decided the floor check (map.md §2: the frame's own floor-check scale lay beyond the monocular bound about k but within it about this scale, so the frame has `depth_scale` and its content instead of `detail` `floor_not_judged`). Absent when nothing was measured: no neighbour within the pair limits (a turning look before the robot's first straight move; a move shorter than its translation sigma allows, map.md §1), pairs that disagree, or a depth image. It never changes the frame's registration or pose. |
+  | `body_link` | Optional (oms/2.15). Present when the frame sent `body.motion`: what became of its link to its `from` frame, `{from, state, reason, baseline_m, sigma_m, rotation_deg, rotation_residual_deg}` (Body links, below). |
+  | `stereo_scale` | Optional (oms/2.14). Present when the frame is an image-confirmed monocular keyframe with a `metric` or `drifting` prior, or since oms/2.15 a used body link path to a neighbour (map.md §1, Keyframe depth scale; `link_neighbours` names those neighbours), whose own depth scale was measured by motion stereo at the job's end (map.md §1, Keyframe depth scale): `{scale, sigma_rel, neighbours, judged}`, `scale` the factor from its raw depth to map metres (comparable to `depth_scale`), `sigma_rel` its relative sigma, `neighbours` the names of the keyframes whose pairs gave it, `judged` whether it decided the floor check (map.md §2: the frame's own floor-check scale lay beyond the monocular bound about k but within it about this scale, so the frame has `depth_scale` and its content instead of `detail` `floor_not_judged`). Absent when nothing was measured: no neighbour within the pair limits (a turning look before the robot's first straight move; a move shorter than its translation sigma allows, map.md §1), pairs that disagree, or a depth image. It never changes the frame's registration or pose. |
   | `prior_residual_m`, `prior_residual_deg` | The residual between the committed pose and the frame's prior as placed (a `drifting` prior through the drift estimate, map.md §1); null without a prior. On a job the gate rejected, against the pose that would have been committed. Their maximum over the registered frames is `quality.max_displacement_m` / `max_displacement_deg`, frames without a prior aside: those are measured against their image-only pose (map.md §1). |
   | `prior_residual_sent_m`, `prior_residual_sent_deg` | Optional (oms/2.13). The residual between the committed pose (on a job the gate rejected, the pose that would have been committed) and the frame's prior **as sent**, before any drift estimate placed it; null without a prior or a pose. With `prior_residual_*` (against the prior as placed) and `quality.drift_correction`, a client separates what the drift estimate moved from what the images moved. |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the frame's image pose's inliers that are floor points (map.md §2, Texture-aliasing guards): near 1 when the pose rests on the floor's texture. Null when the frame has no points fit (no image pose, a rotation-only fit, the older mapper) or the map has no floor. |
@@ -216,6 +222,11 @@ error code `invalid_request` (§9).
   the prior checks. Each connected component of new frames registers as a whole, and the
   checks below apply frame by frame to its fitted poses, iterating to a fixed point. A lone
   frame with a prior and no edge is `kept_at_prior`, `no_overlap`, `detail` `no_image_pose`.
+  A used body link (oms/2.15, Body links below) whose two frames match is an edge as well, a
+  linked edge: it confirms the frame by its images' relative rotation and places it at the link's
+  metric offset from its partner, and a points fit that conflicts with that linked pose is no
+  placement (map.md §2, Match graph). A frame with no prior placed by a linked edge is
+  `registered` like any frame its images place.
   The outcome does not depend on frame order, and a dry run predicts the same statuses.
   * A hypothesis's support is its inlier count over the best image hypothesis's inlier count;
     it is supported at 0.25 or more (the same definition as locate, §6).
@@ -311,6 +322,129 @@ error code `invalid_request` (§9).
   deviation over `median_ratio`, `frames` their count. Null when no frame qualifies. A ratio far
   from 1 means the sent height and the depth disagree: a wrong height, or a wrong depth scale.
 
+* **Body links** (oms/2.15). A robot that knows where its camera sits on its body (its model
+  and mount joints) and how its body moved between two exposures (an IMU's yaw, odometry, scan
+  matching or a gait model) sends both in a frame's `body`. Composed, they give the
+  camera-to-camera relative pose with a metric baseline, even for a turn in place: the camera's
+  lever arm about the turn axis moves the camera by a few centimetres. It is a relative camera
+  prior; the frame's `prior` keeps its meaning and is still sent.
+  * **Frames.**
+    * The **body frame** is fixed to the robot's body: z up (along gravity when the body stands
+      level), x forward, y left; its origin any point fixed on the body (typically the point the
+      client's odometry reports). The service relies on z up only: the yaw and its sigma are
+      about z.
+    * `T_body_cam` is the pose of the camera's optical frame (x right, y down, z forward) in the
+      body frame, `T_a_b` as in high_level_spec.md §3. Its translation is the lever arm.
+    * `T_from_body` is the pose of the body at this frame's image stamp in the body frame at the
+      `from` frame's image stamp. Its translation is the body origin's motion, whatever axis the
+      body physically turned about: a robot turning about a point other than its origin reports
+      the origin's swing.
+    * The link's camera relative pose is T_camF_cam = T_body_camF⁻¹ · T_from_body · T_body_cam,
+      F the `from` frame, each mount the one at its frame's exposure.
+  * **Fields.** `body` ([`FrameBody`]):
+
+    | Field | Meaning |
+    | --- | --- |
+    | `image_stamp_s` | Required. The exposure time, seconds, on the client's clock. |
+    | `standing` | Required. The body stood still at the exposure and the mount joints did not move between the joint reading and the exposure. |
+    | `mount` | [`BodyMount`] `{T_body_cam, source, sigma_pos_m, sigma_rot_deg}`: this frame's mount, from its joint reading. Overrides the camera's `body_mount`; required when the camera has none. `source` `measured` (calibration, or joints read back) or `commanded` (joints commanded, no readback). |
+    | `mount_stamp_s` | The time of the joint reading `mount` was computed from, same clock. Required with `mount`, and only with it. |
+    | `motion` | [`BodyMotion`] `{from, T_from_body, yaw_source, sigma_yaw_deg, sigma_tilt_deg, translation_source, sigma_pos_m}`: the body's motion since the frame named `from`. Absent on the first frame of a chain (the robot's first view, or after its odometry was reset). |
+
+    **Why per frame and per camera.** A mount moved by joints (a pan-tilt head, an arm) changes
+    with every frame and is read at a stamp; a fixed mount is a camera value, sent once and
+    immutable like the intrinsics (`camera_conflict` otherwise). A frame's own mount overrides
+    the camera's, as `height_above_floor_m` does.
+
+    **Why a motion from a named frame.** The client measures the body's motion between two
+    exposures, and that motion's own sigma (an IMU's yaw change over one turn, a gait model over
+    one step), directly. A body pose in an odometry frame would lose it: two absolute odometry
+    poses share their error since the last fix, so their relative sigma is no combination of
+    their sigmas (oms/2.14 had to bound it from the priors' sigmas, map.md §1). A name rather
+    than "the previous frame of the request" keeps the outcome independent of request order and
+    lets a robot that sends one keyframe per job link to a frame the map already stores. The
+    usual `from` is the frame captured just before.
+
+    **No double counting.** The client's `drifting` or `metric` prior usually comes from the
+    same odometry. Where two frames are joined by links, the mapper takes their relative pose
+    from the links only, never also from the two priors' difference (map.md §1, Body links);
+    the priors keep every absolute use (placing frames, the conflict bound, the drift
+    estimate) unchanged.
+  * **Units, sigmas and sources.** Metres, degrees, seconds. `sigma_pos_m` and `sigma_rot_deg`
+    are 3-D RMS (§6); `sigma_yaw_deg` is the 1-σ of the yaw about body z, `sigma_tilt_deg` of
+    pitch and roll, each axis (default 1°). The motion's sigmas are the motion's alone, not
+    accumulated since any start, and are required: for a turn in place `sigma_pos_m` is the body
+    origin's slip over the turn (a stepping robot's feet), never 0. A sent sigma below its floor
+    is raised to it: the floors are `README.md` constants per mount source and per motion
+    source (`imu`, `odometry`, `lidar_match`, `dead_reckoning`; `yaw_source` and
+    `translation_source` are named separately). Mount sigmas default by source:
+
+    | Mount `source` | Default σ (position / rotation) | Floor |
+    | --- | --- | --- |
+    | `measured` | 0.002 m / 0.5° | `README.md` (0.001 m / 0.2°) |
+    | `commanded` | 0.010 m / 3° | `README.md` (0.005 m / 1.5°) |
+
+  * **Timestamps.** Δ = |`mount_stamp_s` − `image_stamp_s`|. The mount is **fresh** when
+    Δ ≤ `MOUNT_STAMP_TOL_S` (`README.md`, 0.03 s), or when the frame is `standing` and
+    Δ ≤ `MOUNT_STAMP_STANDING_MAX_S` (0.5 s): nothing moved between the reading and the
+    exposure. Otherwise it is **stale**, and no sigma is inflated: the service does not know how
+    fast the joints moved, so a stale mount has no honest sigma. A stale mount is never an
+    error: no link ending at that frame is used (`body_link.reason` `stale_mount`, or
+    `from_stale_mount` on a frame linking from it) and the frame registers as without a body;
+    its motion still composes through it (map.md §1, Body links, paths), since the body's
+    motion does not depend on its mount. A camera's `body_mount` has no stamp and is always
+    fresh. `T_from_body` must hold between the two exposures (the client interpolates its
+    odometry and IMU at the image stamps); the service cannot check that.
+  * **`standing`** decides the stamp tolerance only. A walking frame (its head swaying) with a
+    joint reading within 0.03 s of its exposure links like a standing one.
+  * **Validation.** Refused with `invalid_request`, `details.field` naming the field (for
+    example `frames[3].body.motion.from`), never a frame status:
+    * the schema: a missing required field, an unknown source, a negative sigma, `mount`
+      without `mount_stamp_s` or the reverse;
+    * `T_body_cam` or `T_from_body` not a rigid transform, as for `prior.T_map_cam`;
+    * a `body` without `mount` for a camera without `body_mount`;
+    * `motion.from` naming the frame itself, a frame of another camera, a frame of the request
+      without `body`, or a name that is neither in the request, nor stored in the map, nor a
+      frame of a queued or running job of the map (as for cameras, §3); the links within one
+      request forming a cycle;
+    * `body` on a locate or `analyse` frame (not in their schema).
+
+    At run time a link may still be unusable; that is its `body_link` report, below.
+  * **Report.** Every frame that sent `motion` has `inputs[].body_link` ([`BodyLink`]):
+    `state` `used` (its linked edge took part in registration, map.md §2, and its paths are
+    baseline candidates for the keyframe scale) or `unused` with `reason`: `from_unknown` (the
+    `from` frame is neither in the request nor stored in the base version: rejected, reverted,
+    or its job did not commit), `from_unconfirmed` (the `from` frame is not image-confirmed: a
+    stored `kept_at_prior` frame, or a job frame that ends unregistered), `from_no_mount` (a stored `from` frame without a mount),
+    `stale_mount`, `from_stale_mount`, `no_match` (fewer epipolar inliers between the two than
+    the registration minimum), `inconsistent` (the images' relative rotation disagrees with the
+    link's beyond its bound) or `engine` (the older mapper uses no links). `baseline_m`,
+    `sigma_m` and `rotation_deg` are the link's camera translation length, its 1-σ and its
+    rotation angle (null when a mount is missing or stale or `from` is unknown);
+    `rotation_residual_deg` the angle between the images' relative rotation and the link's when
+    the pair was matched, from which a client calibrates its yaw sigma. `stereo_scale` names in
+    `link_neighbours` the pairs whose baseline was a link path.
+  * **What the mapper does** (map.md §1, Body links, and §2, Match graph): a frame joined to an
+    image-confirmed frame by a used link is placed by a **linked edge**, its relative rotation
+    measured on their matches with the link as prior and its translation the link's, so a
+    turning view lands next to its `from` frame without a points fit lifted at a monocular
+    scale, and a points fit that conflicts with the linked pose is no placement; a link path is
+    the baseline of the keyframe depth scale (map.md §1), so a turning look measures its
+    keyframes' scales; and link-measured scales are evidence for the monocular depth scale k and,
+    without `metric` priors or depth images, the map's scale (`scale_source` `baseline`).
+  * **Planning a usable baseline.** A turn in place by Δψ with the camera at horizontal
+    distance r from the body's z axis gives |t| ≈ 2 r sin(Δψ / 2) plus the body's own
+    translation, with σ_t ≈ hypot(`sigma_pos_m`, r · σ_yaw, the mount terms of map.md §1) (σ_yaw
+    in radians). The pair is a scale baseline when σ_t / |t| ≤ `KEYFRAME_BASELINE_REL_MAX`
+    (0.20) and it triangulates 30 points (map.md §1). For example r = 0.08 m and Δψ = 40° give
+    |t| = 0.055 m; with σ_yaw 2° and `sigma_pos_m` 0.008 m, σ_t ≈ 0.009 m (0.16): usable; with
+    `sigma_pos_m` 0.02 m, 0.37: not. A dry run reports the frame's `body_link` before it is
+    sent.
+  * **Other clients.** A depth-image (RGB-D) robot may send `body`: its links place frames
+    (linked edges) and its scale stays its sensor's (no keyframe scale is measured on depth
+    images). Locate takes no `body` in oms/2.15 (§6). The older mapper accepts it and uses
+    none (`engine`).
+
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
   dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
   its measured, committed and difference angles, so a client can see which pairs drove
@@ -343,7 +477,13 @@ error code `invalid_request` (§9).
     more straight move (map.md §1, Keyframe depth scale) gives it one. Whether a view will be
     kept at its prior for lack of a baseline cannot be predicted beyond this: registration
     depends on the matches, and its `predicted_status` and `predicted_reason` are the
-    prediction.
+    prediction;
+  * `body_link` (oms/2.15): the frame's link as the update would use it, as in `inputs[]`, for
+    every frame that sends `body.motion`. Its `baseline_m` and `sigma_m` follow from the request
+    and the stored body records alone, so a client sees before sending whether a turn gives a
+    usable baseline (σ / |t| ≤ 0.20, Body links above); `state`, `reason` and
+    `rotation_residual_deg` come from the dry run's own matching, and its linked edges enter
+    the predicted statuses (map.md §2, Match graph).
 
   It also gives a predicted `quality`, without fusion (`drift_correction` included, map.md §4),
   and `scale_source` and `scale_sigma_rel`. It accepts `labels` and reports in `labels` the vocabulary it would use
@@ -373,7 +513,9 @@ The versions read, revert and `--keep-versions` are O2.
 ## 6. Locate (O5)
 
 * **Request.** `POST /api/maps/{name}/locate {frames[], record, version?}` registers each frame
-  against one version without changing the map.
+  against one version without changing the map. A locate frame takes no `body` in oms/2.15
+  (§4, Body links): it is refused with `invalid_request` like any field outside its schema.
+  Locate gains from body links only through the keyframes they register and scale.
 * **Response.** [`Locate`] gives `map_version`, `scale_source`, `scale_sigma_rel`, and one entry
   per frame:
 

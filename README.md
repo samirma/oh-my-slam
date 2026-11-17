@@ -1645,6 +1645,82 @@ Capture advice (from the rule and the replays):
   e305's 17-38° steps failed on scale (sliding fits), not on overlap. Keep steps at or below
   ~40° (≥ 60 % overlap at a 100° hfov), and send the first one smaller.
 
+### Body links: a metric relative prior from the camera mount (oms/2.15)
+
+Status: **specified, not implemented** (phase 1, spec commit). api.md §4 "Body links", map.md §1
+"Body links" and "Keyframe depth scale" (body-link pairs), §1 "Scale" item 3, §2 "Match graph"
+(linked edge, linked pose); schema `FrameBody`, `BodyMount`, `BodyMotion`, `MountSource`,
+`MotionSource`, `BodyLink`, `Camera.body_mount`, `StereoScale.link_neighbours`.
+
+Why. A monocular robot turning in place has no prior baseline (oms/2.14 replays: e305's look had
+prior steps of 4-16 cm across 17-109° turns with client fixes between them, so 0 of 13 keyframes
+were measured), and its look views registered against unjudged references slide along their
+view by the reference's scale error (e305 k000003/k000007/k000008/k000010: strong fits 0.9-1.1 m
+off, oms/2.13 notes). The client knows its camera's pose on its body to millimetres (robot model
+plus mount joints) and its body yaw between frames from an IMU (1-3° per turn); the lever arm of a
+few to over 10 cm then moves the camera by a known few centimetres over a turn. That is a metric
+relative pose between two frames independent of every keyframe's depth, k and the drift
+estimate: what oms/2.14 lacked for turning looks and what a cold map lacks for its scale.
+
+Decisions:
+
+* **Per frame, with a per-camera fixed mount.** A head on joints has a mount per exposure, read
+  at a stamp; a fixed mount is a camera value (immutable, `camera_conflict`). A frame's mount
+  overrides its camera's, as `height_above_floor_m` does.
+* **Motion from a named frame, not a body pose in an odometry frame.** The client measures the
+  relative motion's sigma directly; two absolute odometry poses share their error since the last
+  fix, so their relative sigma cannot be recovered from their own sigmas (oms/2.14 bounded it
+  with hypot(0.10 |t|, 0.03 m, sqrt(|σ_a² − σ_b²|)), which kills every 5 cm baseline). Naming
+  the frame (not "the previous one in the request") keeps the outcome order-independent and lets
+  a one-keyframe-per-job client link to a stored keyframe. Paths compose up to
+  `LINK_PATH_MAX` links through frames of the job and stored frames, stale mounts included.
+* **No double counting.** The drifting/metric prior and the link usually come from the same
+  odometry: for a pair with a path, the path is the relative pose and the priors' difference is
+  not used too. The priors keep their absolute uses. A linked pose is no image-only pose for the
+  drift estimate (its position is its partner's plus the link).
+* **Stale mounts are unused, not inflated.** Without the joints' rates no sigma inflation is
+  honest. Fresh: |mount stamp − image stamp| ≤ `MOUNT_STAMP_TOL_S`, or ≤
+  `MOUNT_STAMP_STANDING_MAX_S` when `standing` (nothing moved in between). `standing` decides only
+  that tolerance.
+* **Linked edge in registration.** The images measure the relative rotation and translation
+  direction (the oms/2.11 refinement with the link as prior, its length kept); the link gives the
+  metric offset; the edge holds only when the images' rotation agrees with the link's within
+  3 sigma (a false match set must also fool the IMU). It needs no lifted depth, so a turning view
+  is placed without the sliding points fit; a points fit beyond 3 sigma of the linked pose is no
+  placement.
+* **Scale.** A link path is a body-link pair of the keyframe depth scale (preferred over prior
+  pairs, same 0.20 relative limit and pair rules). A measurement on link pairs only is scale
+  evidence (it does not depend on k or the drift estimate): `LINK_SCALE_MIN` such keyframes,
+  more than half agreeing, set k ahead of camera heights, and the map's scale (`baseline`) when
+  there are no metric priors or depth images. Lifting a keyframe at its own measured scale stays
+  refused (oms/2.14).
+
+Constants (proposed; phase 2 confirms or changes them by replay and records the evidence here):
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MOUNT_STAMP_TOL_S` | 0.03 s | a joint reading this close to the exposure is fresh |
+| `MOUNT_STAMP_STANDING_MAX_S` | 0.5 s | the same for a `standing` frame |
+| mount default σ, `measured` / `commanded` | 0.002 m, 0.5° / 0.010 m, 3° | when the client sends none |
+| mount floor σ, `measured` / `commanded` | 0.001 m, 0.2° / 0.005 m, 1.5° | sent sigmas are raised to it |
+| yaw floor σ: `imu`, `lidar_match` / `odometry` / `dead_reckoning` | 0.5° / 1.0° / 1.0° | per relative motion |
+| translation floor σ: `lidar_match`, `odometry` / `dead_reckoning` / `imu` | 0.005 m / 0.010 m / 0.05 m | per relative motion |
+| tilt default σ | 1° | per axis, when `sigma_tilt_deg` is absent |
+| same mount reading | 1 mm and 0.1°, same source | mount errors treated as common |
+| `LINK_PATH_MAX` | 4 links | the oms/2.14 order gap |
+| `LINK_SCALE_MIN` | 3 keyframes | link-measured scales that make scale evidence |
+
+Validation plan (phase 2): unit tests of the composition and its sigmas against Monte Carlo
+draws; synthetic turn-in-place pairs (known lever arm, known yaw) through the linked edge and the
+pair scale; replays of e305, e205, j3, j5 and j6 with links synthesised from their stored priors
+only where the captures logged the mount and IMU (otherwise the replays check that nothing
+changes without `body`); a live round when the client sends `body`.
+
+Client advice: link each frame `from` the frame captured just before (stored or in the request);
+send a turn's translation sigma honestly (a stepping body slips: it is what limits a turn's
+baseline); take turn-in-place views `standing`, after the step settles; read the dry run's
+`body_link.sigma_m / baseline_m` (≤ 0.20 for a scale pair) before sending a look.
+
 ### Objects, surfaces and relations (O8)
 
 * **Label vocabulary** (oms/2.3, map.md §5). An update's optional `labels` (at most 64, each

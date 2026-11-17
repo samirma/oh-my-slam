@@ -69,6 +69,8 @@ Each row is something the skill needs. Each row's test is in §11.
 * **Poses.** `T_a_b` is the 4×4 homogeneous pose of frame b in frame a, written as nested
   row-major arrays `M[row][col]`. `T_map_cam` is the pose of the camera's *optical* frame in the
   map frame, so it maps optical-frame points to map-frame points.
+* **Body frame** (oms/2.15). Fixed to the robot's body: z up (along gravity when the body stands
+  level), x forward, y left. `T_body_cam` is the pose of the camera's optical frame in it.
 * **Scale.** Every response that carries map-frame metres also carries:
   * `scale_source`: one of `priors`, `depth`, `camera_height`, `monocular`, and `baseline`
     (frame analysis with motion stereo, oms/2.11);
@@ -98,8 +100,16 @@ Each row is something the skill needs. Each row's test is in §11.
   * `drifting` — reliable relative motion between frames of one request, with drift over time.
   * `none` — no prior. This is the case for camera-only robots.
 
-  Odometry, depth and joint kinematics reach oh-my-slam only through priors and depth. There is
-  no IMU, stereo or LiDAR input.
+* **Body links** (oms/2.15). A frame may carry its camera's mount on the robot's body
+  (`T_body_cam`, from the robot's model and its joints, per frame or fixed per camera) and the
+  body's motion since an earlier named frame (yaw and translation, each with its sigma and
+  source), with the image and joint-reading stamps and whether the body stood still. Composed,
+  they are a metric relative camera prior: the camera's lever arm about the turn axis gives a
+  turn in place a known baseline (api.md §4, Body links; map.md §1).
+
+  Odometry, depth and joint kinematics reach oh-my-slam only through priors, body links and
+  depth: an IMU's yaw, odometry and scan matching enter only as a body motion between frames.
+  There is no raw IMU, stereo or LiDAR input.
 * There is no video input. The client samples its own frames.
 
 ## 5. Map model and lifecycle
@@ -257,6 +267,23 @@ judged and gives its content at its floor-check scale (map.md §2, Floor check).
 registration: lifting at the measured scale was replayed and refused. New optional fields: the
 input status's and the dry run frame's `stereo_scale` `{scale, sigma_rel, neighbours, judged}`
 (api.md §4).
+
+**oms/2.15** is additive: a frame's `body` carries its camera's mount on the robot's body
+(`T_body_cam`, `measured` or `commanded`, with its joint-reading stamp; a fixed mount as the
+camera's `body_mount`) and the body's motion since an earlier frame it names (`T_from_body` with
+yaw and translation sigmas and their sources `imu`, `odometry`, `lidar_match`,
+`dead_reckoning`), with the image stamp and a `standing` flag (api.md §4, Body links). Composed,
+they are a metric relative camera prior between frames of one body that replaces the priors'
+difference for that pair, never adds to it (map.md §1, Body links). A mount read more than
+0.03 s from its exposure (0.5 s when standing) is stale and its links are unused, never an
+error. A link whose frames match is a linked edge of registration: the images measure the
+relative rotation, the link the metric offset, and a points fit that conflicts with the linked
+pose is no placement (map.md §2, Match graph). A link path is the baseline of the keyframe depth
+scale, so a turning look measures its keyframes' scales, and link-measured scales are scale
+evidence, for the monocular depth scale k and, without `metric` priors or depth images, the map's
+scale (`scale_source` `baseline`; map.md §1, Scale). New optional fields: the camera's
+`body_mount`, the frame's `body`, the input status's and the dry run frame's `body_link`, and
+`stereo_scale.link_neighbours`. Locate takes no `body`.
 
 ## 8. Concurrency and latency
 
