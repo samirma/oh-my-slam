@@ -43,6 +43,17 @@ sigmas. A frame is matched to the keyframes (all of them up to ``MATCH_ALL``; el
   hypotheses also hold a fit on the off-floor correspondences alone, and only one with
   ``MIN_INLIERS`` off-floor inliers (``standing``) can be reported; a floor-dominated one stays
   a rival. None standing is no pose (``no_overlap``).
+* **Query depth** (api.md §6, oms/2.17; ``depth_verdicts``). A frame that sends a depth image
+  (``Query.depth``) has each hypothesis tested against the sensor depth of its references
+  (``Keyframe.sensor``) with registration's depth confirmation (map.md §1 "Depth agreement",
+  ``anchored.depth_counts``): the reference carrying a depth image that holds most of the
+  hypothesis's inliers (at least ``MIN_INLIERS``) decides, as in the registration gate; a pair
+  that neither passes nor fails (fewer than ``MIN_AGREEING`` points measured either way) hands
+  the decision to the next one; a confirmed one whose agreement falls short of the best confirmed
+  one's by more than ``DEPTH_AGREEMENT_MARGIN`` is refused too. A refused hypothesis is no
+  hypothesis: neither reported nor a
+  rival, nor the support's base; when every hypothesis is refused the frame is
+  ``depth_inconsistent``. Monocular references test nothing.
 * **Rivals.** Every other supported hypothesis farther than ``RIVAL_POS_M`` or ``RIVAL_ROT_DEG``
   from the reported pose, whatever else its inliers explain, strongest first (``rivals_of``);
   ``ambiguity`` is the first (api.md §6)."""
@@ -66,6 +77,14 @@ from oh_my_slam.core.constants import (
 )
 from oh_my_slam.mapping import sigmas
 from oh_my_slam.mapping.anchor import DEFAULT_SIGMA_POS_M, DEFAULT_SIGMA_ROT_DEG
+from oh_my_slam.mapping.anchored import (
+    DEPTH_CONFIRM_AGREEMENT,
+    MIN_AGREEING,
+    SENSOR_DEPTH_TOL,
+    DepthCounts,
+    DepthRef,
+    depth_counts,
+)
 from oh_my_slam.mapping.locate import kabsch, turn_ransac
 
 Array = NDArray[np.float64]
@@ -114,6 +133,10 @@ GROUP_M = 0.5
 GROUP_DEG = 30.0
 GROUP_MIN_POINTS = 2 * MIN_INLIERS
 RIVAL_GROUPS = 4
+SENSOR_SIDE = 160  # a keyframe's sensor depth kept for the query depth test (oms/2.17)
+# a confirmed hypothesis whose depth agreement is this far below the best confirmed one's is
+# refused (oms/2.17, README "Locate": tiled-wall twins 0.90-0.93 against 1.00)
+DEPTH_AGREEMENT_MARGIN = 0.05
 
 
 # ------------------------------------------------------------------------------------------------
@@ -145,6 +168,15 @@ def extract(gray: NDArray[np.uint8], mask: NDArray[np.bool_] | None = None
         return np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8)
     uv = (np.array([k.pt for k in kps], np.float32) + 0.5) / s - 0.5
     return uv.astype(np.float32), np.clip(np.round(desc), 0, 255).astype(np.uint8)
+
+
+def reduced_depth(depth: NDArray[Any]) -> NDArray[np.float32]:
+    """A depth image on a grid of at most ``SENSOR_SIDE`` per axis (every s-th pixel, at the
+    centre of its s x s block): a keyframe's sensor depth as the locate index keeps it."""
+    d = np.asarray(depth)
+    h, w = d.shape
+    s = max(1, math.ceil(max(h, w) / SENSOR_SIDE))
+    return np.ascontiguousarray(d[s // 2:(h // s) * s:s, s // 2:(w // s) * s:s], np.float32)
 
 
 def keyframe_points(uv: NDArray[Any], K: Array, depth: NDArray[Any] | None, T_map_cam: Array
@@ -193,6 +225,11 @@ class Keyframe:
     # per keypoint, whether its point is lifted from that depth as it was stored (neither
     # triangulated nor rescaled to triangulated points, ``triangulated``); None: every point
     lifted: NDArray[np.bool_] | None = None
+    # its sensor depth image in map metres on a reduced grid (0: none) and that grid's 3x3
+    # intrinsics: what a query's depth is tested against (api.md §6 "Query depth", oms/2.17);
+    # None for a monocular keyframe, or one whose depth is unused
+    sensor: NDArray[np.float32] | None = None
+    sensor_K: Array | None = None
 
     def lifted_mask(self) -> NDArray[np.bool_]:
         """Per keypoint, whether its point is lifted from stored depth (``lifted``)."""
@@ -390,6 +427,9 @@ class Query:
     # the map's scale comes from camera heights (api.md §6 "Camera-height scale"): a pose's
     # height disagreement joins its position sigma and ranks it (``height_consistent``)
     height_scale: bool = False
+    # its own depth image in metres on its pixels (``K``; 0: no value, ignored pixels have none):
+    # every hypothesis is tested against its references' sensor depth (oms/2.17); None: none sent
+    depth: NDArray[np.float32] | None = None
 
 
 @dataclass
@@ -417,6 +457,10 @@ class Outcome:
     # the share of its inliers that are floor points (api.md §6, oms/2.13); None without a
     # points fit or a map floor
     floor_share: float | None = None
+    # with a query depth (oms/2.17): the distinct hypotheses it refused, and the reported pose's
+    # verdict, "confirmed" or "untested" (None: no pose)
+    depth_refused: int = 0
+    depth_pose: str | None = None
 
     @property
     def located(self) -> bool:
@@ -838,6 +882,15 @@ def locate(q: Query, index: Index) -> Outcome:
                 hyps.append(hypothesis(got[0]))
         # a degenerate solve is no hypothesis (a wrong pose is worse than none)
         hyps = [h for h in hyps if plausible(h, kfs, index)]
+        # one the query's own depth contradicts is none either (oms/2.17)
+        verdicts = depth_verdicts(q, hyps, kfs, index)
+        refused = [h.T for h, v in zip(hyps, verdicts, strict=True) if v == REFUSED]
+        out.depth_refused = distinct(refused)
+        hyps = [h for h, v in zip(hyps, verdicts, strict=True) if v != REFUSED]
+        verdicts = [v for v in verdicts if v != REFUSED]
+        if not hyps and refused:
+            out.reason = "depth_inconsistent"
+            return out
         # each hypothesis's own image-only calibrated sigmas: the conflict bound's (api.md §4)
         every = [_sigmas(h, q, uv, xyz, iq, None, _keyframe_sigmas(h, kfs, index),
                          _on_depth(h, kfs, index), srel) for h in hyps]
@@ -848,6 +901,7 @@ def locate(q: Query, index: Index) -> Outcome:
             return out
         cands = [hyps[j] for j in keep]
         sig = [every[j] for j in keep]
+        cand_verdicts = [verdicts[j] for j in keep]
         zs = [_ref_z_sigma(q, kfs[h.mask], index) for h in cands]
         k = choose(q, [h.T for h in cands], [h.inliers for h in cands], sig, zs)
         if k is None:
@@ -868,6 +922,7 @@ def locate(q: Query, index: Index) -> Outcome:
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
+        out.depth_pose = None if q.depth is None else cand_verdicts[k]
         if out.inlier_ratio < LOW_RATIO:  # most matches unexplained: never millimetres
             sp, sr = max(sp, LOW_RATIO_SIGMA_POS_M), max(sr, LOW_RATIO_SIGMA_ROT_DEG)
         out.T, out.sigma_pos_m, out.sigma_rot_deg = main.T, round(sp, 4), round(sr, 3)
@@ -881,8 +936,90 @@ def locate(q: Query, index: Index) -> Outcome:
         turned = _turn(q, index, np.concatenate(ray_q), np.concatenate(ray_k),
                        np.concatenate(ray_kf))
         if turned is not None:
+            # a turn fit stands at its keyframes' own centre: no depth test (oms/2.17)
+            turned.depth_pose = None if q.depth is None else UNTESTED
             return _with_votes(turned, out)
     return out
+
+
+CONFIRMED, REFUSED, UNTESTED = "confirmed", "refused", "untested"
+
+
+def contradicts(c: DepthCounts) -> bool:
+    """One way of a depth agreement fails (map.md §4: the depth confirmation's minimum count and
+    agreement threshold): at least ``MIN_AGREEING`` points agree or contradict, and fewer than
+    ``DEPTH_CONFIRM_AGREEMENT`` of them agree."""
+    n = c.agree + c.through
+    return n >= MIN_AGREEING and c.agree < DEPTH_CONFIRM_AGREEMENT * n
+
+
+def _pair_counts(T: Array, q: Query, k: Keyframe) -> tuple[DepthCounts, DepthCounts]:
+    """Both ways of the depth agreement of the query at pose ``T`` with keyframe ``k``'s sensor
+    depth (``anchored.depth_counts``): the query's points seen by ``k``, ``k``'s seen by it."""
+    assert q.depth is not None and k.sensor is not None and k.sensor_K is not None
+    own, ref = DepthRef(T, q.depth, q.K), DepthRef(k.T, k.sensor, k.sensor_K)
+    return depth_counts(own, ref, SENSOR_DEPTH_TOL), depth_counts(ref, own, SENSOR_DEPTH_TOL)
+
+
+def depth_verdict(q: Query, h: Hypothesis, kfs: NDArray[np.int64], index: Index
+                  ) -> tuple[str, int | None]:
+    """A hypothesis tested against its references' sensor depth with the query's own (api.md §6
+    "Query depth", oms/2.17): the references carrying a depth image (``Keyframe.sensor``) that
+    hold at least ``MIN_INLIERS`` of its inliers, most first (ties: the lowest index), as the
+    registration gate takes them (map.md §2 step 2). The first whose pair with the query at the
+    hypothesis passes both ways (``DepthCounts.passes``) confirms it, the first one failing in
+    either way (``contradicts``) refuses it; a pair with too few points measured both ways
+    hands it to the next. With the verdict, the deciding reference (its index); ``UNTESTED``
+    (None) without a query depth or such a reference."""
+    if q.depth is None:
+        return UNTESTED, None
+    per = np.bincount(kfs[h.mask], minlength=len(index.keyframes))
+    order = sorted((int(i) for i in np.flatnonzero(per >= MIN_INLIERS)
+                    if index.keyframes[int(i)].sensor is not None), key=lambda i: (-per[i], i))
+    for i in order:
+        ab, ba = _pair_counts(h.T, q, index.keyframes[i])
+        if contradicts(ab) or contradicts(ba):
+            return REFUSED, i
+        if ab.passes and ba.passes:
+            return CONFIRMED, i
+    return UNTESTED, None
+
+
+def agreement_over(T: Array, q: Query, refs: Sequence[Keyframe]) -> float | None:
+    """The lowest agreement ratio (``DepthCounts.ratio``) of the query at pose ``T`` over the
+    ways of its pairs with ``refs`` that measure at least ``MIN_AGREEING`` points (agreeing or
+    contradicting); None when none does. The true pose agrees with every reference's depth."""
+    got = [c.ratio for k in refs for c in _pair_counts(T, q, k)
+           if c.agree + c.through >= MIN_AGREEING]
+    return min(got) if got else None
+
+
+def depth_verdicts(q: Query, hyps: Sequence[Hypothesis], kfs: NDArray[np.int64], index: Index
+                   ) -> list[str]:
+    """Each hypothesis's ``depth_verdict``; then, between the confirmed ones, the depth tells
+    which pose the scene is (as the parallax picks between translational twins in registration,
+    map.md §1): each is measured against every reference that decided one of them
+    (``agreement_over``), and one whose agreement falls short of the best one's by more than
+    ``DEPTH_AGREEMENT_MARGIN`` is refused too (a twin along a tiled wall agrees at about 0.9,
+    the true pose at 1.0)."""
+    got = [depth_verdict(q, h, kfs, index) for h in hyps]
+    refs = [index.keyframes[i] for i in sorted({i for v, i in got if v == CONFIRMED
+                                                and i is not None})]
+    score = [agreement_over(h.T, q, refs) if v == CONFIRMED else None
+             for h, (v, _) in zip(hyps, got, strict=True)]
+    best = max((r for r in score if r is not None), default=None)
+    return [REFUSED if r is not None and best is not None and r < best - DEPTH_AGREEMENT_MARGIN
+            else v for (v, _), r in zip(got, score, strict=True)]
+
+
+def distinct(poses: Sequence[Array]) -> int:
+    """How many distinct poses: one within ``RIVAL_POS_M`` and ``RIVAL_ROT_DEG`` of an earlier
+    kept one is that pose again (as rivals are listed once)."""
+    kept: list[Array] = []
+    for T in poses:
+        if not any(_same_pose(T, o) for o in kept):
+            kept.append(T)
+    return len(kept)
 
 
 def confirms(q: Query, T: Array, sig: tuple[float, float]) -> bool:

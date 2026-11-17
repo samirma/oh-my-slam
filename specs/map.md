@@ -62,6 +62,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       it: it lies in front of the surface that view measures along that ray. A point behind
       that surface (occluded) is no contradiction. A point outside the other view's image or
       depth range counts neither way. The agreement is measured over the points that count.
+      Locate applies the same test to each pose hypothesis of a frame that sends a depth image,
+      against its references' sensor depth (api.md §6, Query depth, oms/2.17).
     * **Symmetric scenes.** When the scene itself is symmetric, depth cannot reject a lattice
       pose: both poses agree with the depths. When two distinct pose hypotheses of a pair,
       with rotations at least 10° apart (a constant in `README.md`), both pass the depth
@@ -613,8 +615,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
        own depth scale is not tested here: the floor check judges it (a frame beyond the
        monocular scale bound keeps its pose, `floor_not_judged`), so for monocular depth r is
        taken about its median (the depth's shape is tested, not its scale) and the median test
-       does not apply. A fit left below the registration minimum is no pose either. A frame without depth of its own (a locate query)
-       is not tested.
+       does not apply. A fit left below the registration minimum is no pose either. A locate query is not tested here,
+       even one that sends a depth image (oms/2.17): its depth tests whole pose hypotheses
+       instead (api.md §6, Query depth).
     2. **Floor points.** With a map floor (`floor_z_m` from priors, a camera height or the base
        version, §6; on a first update without one, none), a map point is a floor point when it
        lies within max(0.06 m, 3 × hypot(the floor's sigma, the point's height sigma)) of the

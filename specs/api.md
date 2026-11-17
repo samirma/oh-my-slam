@@ -92,7 +92,12 @@ error code `invalid_request` (§9).
     gravity, independent of `sigma_rot_deg`; when given, pitch and roll are weighted by it and
     yaw by `sigma_rot_deg` (map.md §1);
   * an optional `height_above_floor_m` with `height_sigma_m`, overriding the camera's;
-  * an optional `depth`, a part name;
+  * an optional `depth`, a part name: a 16-bit single-channel PNG of the colour image's size,
+    pixel-aligned with it (registered depth); a value times the camera's `depth_scale_m` (default
+    0.001) is metres along the optical axis (z-depth), 0 no value. Another size, or a part that
+    is not a 16-bit PNG, refuses the request with `invalid_request` (`details.field`
+    `frames[i].depth`). The ignore masks remove its pixels as they remove the image's. A locate
+    frame may carry one too since oms/2.17 (§6, Query depth);
   * an optional `ignore_mask`, a part name, combined with the camera's mask. A pixel in the
     union of the two masks contributes nothing anywhere, on every engine, in every use (map.md §2,
     Ignored pixels): the models see the image unaltered and their outputs drop those pixels;
@@ -581,7 +586,9 @@ The versions read, revert and `--keep-versions` are O2.
 * **Request.** `POST /api/maps/{name}/locate {frames[], record, version?}` registers each frame
   against one version without changing the map. A locate frame takes no `body` in oms/2.15
   (§4, Body links): it is refused with `invalid_request` like any field outside its schema.
-  Locate gains from body links only through the keyframes they register and scale.
+  Locate gains from body links only through the keyframes they register and scale. A locate
+  frame may carry a `depth` part since oms/2.17, with the conventions and validation of an
+  update frame's (§3): see Query depth, below.
 * **Response.** [`Locate`] gives `map_version`, `scale_source`, `scale_sigma_rel`, and one entry
   per frame:
 
@@ -589,7 +596,7 @@ The versions read, revert and `--keep-versions` are O2.
   | --- | --- |
   | `name` | The frame's name. |
   | `status` | `located` or `rejected`. |
-  | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `blur` or `prior_conflict`; otherwise null. |
+  | `reason` | When rejected: `no_overlap`, `few_features`, `plain`, `blur` or `prior_conflict`; since oms/2.17 also `depth_inconsistent`, for a frame that sent depth (Query depth, below); otherwise null. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. The sigmas describe the chosen hypothesis only, not the spread of rivals; they include the image-registration noise, calibrated so that `locate.sigma_containment` (evaluation.md) is met. |
   | `inlier_ratio` | The share of inliers. |
   | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
@@ -598,6 +605,7 @@ The versions read, revert and `--keep-versions` are O2.
   | `height_consistent` | With a camera-height scale (see below): whether the located camera height agrees with the expected one within 3 sigma; null otherwise. |
   | `prior_residual_m`, `prior_residual_deg` | Optional (oms/2.13). The located pose against the frame's prior as sent; null without a prior or a pose. |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the located pose's inliers that are floor points (Floor points, below); null for a turn fit, without a pose or without a map floor. |
+  | `depth_check` | Optional (oms/2.17). Present only when the frame sent `depth`: `{pose, refused}` (Query depth, below). `pose` is `confirmed` or `untested` for the reported pose, null without a pose; `refused` counts the distinct hypotheses the depth refused. Absent for a frame without depth. |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
   support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
@@ -650,8 +658,43 @@ The versions read, revert and `--keep-versions` are O2.
     | without depth | 0.15 m / 2.1° | 0.15 m / 2.1° | 0.15 m / 2.1° |
 
     Locate uses the `none` column.
-* **Floor points** (oms/2.13). A locate frame has no depth of its own, so the depth-consistency
-  guard of registration (map.md §2, Texture-aliasing guards) does not apply; the floor guard
+* **Query depth** (oms/2.17). A frame that sends `depth` (§3) has every pose hypothesis tested
+  against its references' sensor depth images, with registration's depth confirmation (map.md
+  §1, Measurable pair and Depth agreement: `SENSOR_DEPTH_TOL`, `MIN_AGREEING`,
+  `DEPTH_CONFIRM_AGREEMENT`, the occlusion rule):
+  * the references taken, in order, are those carrying a sensor depth image that hold at least
+    the registration minimum of the hypothesis's inliers, most inliers first, as the
+    registration gate takes them (map.md §2, Match graph, step 2). The query's depth points at
+    the hypothesis are mapped into the reference's view and the reference's into the query's.
+    The first reference whose pair fails in either direction (at least `MIN_AGREEING` points
+    agree or contradict, fewer than `DEPTH_CONFIRM_AGREEMENT` of them agree: the failing pair of
+    map.md §4) refuses the hypothesis; the first whose pair passes both ways confirms it; a pair
+    measuring too few points either way passes the decision to the next reference. With none
+    left the hypothesis is untested;
+  * between confirmed hypotheses the depth tells which pose the scene is, as the parallax does
+    for translational twins in registration (map.md §1): each is measured against every
+    reference that decided one of them, its agreement the lowest ratio over the pairs' ways
+    that measure at least `MIN_AGREEING` points, and one whose agreement falls short of the best
+    one's by more than a margin (`README.md`, 0.05) is refused too. On a tiled wall the twin
+    shifted by one tile agrees at about 0.9, the true pose at 1.0;
+  * a refused hypothesis is no hypothesis: it is neither the reported pose nor a rival, nor the
+    best hypothesis that support is counted against. When every hypothesis is refused the frame
+    is `rejected` with `depth_inconsistent`: its depth contradicts the map at every pose its
+    images give (a changed scene, an obstacle close to the camera). Locating it again without
+    depth gives the images' answer;
+  * a reference without a sensor depth image (a monocular keyframe, whose depth scale is
+    estimated) tests nothing: the query depth measures no reference's scale, and locate never
+    changes the map. A scene symmetric in depth too (a translational twin along a plain wall
+    that agrees with every reference's depth, a symmetric room's flip) keeps its rival: it is
+    the accepted degenerate case of map.md §4;
+  * the query depth does not change the located pose, its sigmas (they keep the `none` column
+    and the calibration of `locate.sigma_containment`), the floor points rule below or a turn
+    fit (placed at its keyframes' own centre, reported `untested`); in oms/2.17 it only tests
+    hypotheses;
+  * `depth_check` reports it; a frame without depth is answered exactly as before.
+* **Floor points** (oms/2.13). The depth-consistency guard of registration (map.md §2,
+  Texture-aliasing guards: each inlier against the frame's own depth) does not apply to a locate
+  frame, even one that sends depth (Query depth tests whole hypotheses instead); the floor guard
   does. With a map floor (the version's `floor_z_m`, when its record holds one), a map point
   within max(0.06 m, 3 × hypot(`floor_sigma_m`, its height sigma)) of it is a floor point (its
   height sigma: its depth's relative sigma, the version's `scale_sigma_rel` unless that is
@@ -689,6 +732,7 @@ The versions read, revert and `--keep-versions` are O2.
   * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
     The client then asks for a second frame.
 * **Reasons.**
+  * `depth_inconsistent` (oms/2.17): the frame's depth refused every hypothesis (Query depth).
   * `few_features`: the frame has fewer keypoints than a pose needs inliers, counted as
     registration extracts them (oms/2.13: SIFT at registration's contrast threshold, outside the
     ignored pixels, `README.md`). That minimum is an

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.16. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
+  "description": "Schema version oms/2.17. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -2552,6 +2552,10 @@
         "ignore_mask": {
           "$ref": "#/$defs/PartName",
           "description": "Per-frame 8-bit PNG mask, non-zero = ignore; combined with the camera's ignore_mask."
+        },
+        "depth": {
+          "$ref": "#/$defs/PartName",
+          "description": "oms/2.17. The frame's own depth image, as an update frame's: 16-bit single-channel PNG of the colour image's size, pixel-aligned with it (registered depth); value x the camera's depth_scale_m (default 0.001) = metres along the optical axis, 0 = no value. Pixels in the camera's or the frame's ignore mask carry none. Each pose hypothesis is tested against the sensor depth of its references (api.md section 6, Query depth): one the depths contradict is no hypothesis, neither reported nor a rival. Another size, or a part that is not a 16-bit PNG, is invalid_request (details.field frames[i].depth)."
         }
       }
     },
@@ -2618,14 +2622,15 @@
                 "few_features",
                 "plain",
                 "blur",
-                "prior_conflict"
+                "prior_conflict",
+                "depth_inconsistent"
               ]
             },
             {
               "type": "null"
             }
           ],
-          "description": "few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior, position and rotation tested separately (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg). With a map floor (oms/2.13), a fit whose off-floor inliers are fewer than that minimum is no pose: no_overlap when no other hypothesis has enough."
+          "description": "depth_inconsistent (oms/2.17, only for a frame that sent depth): the frame's depth refused every pose hypothesis its images gave (a changed scene, a near obstacle; locating it again without depth gives the images' answer). few_features: fewer keypoints than a pose needs inliers (README constant, currently 15). no_overlap: enough keypoints but no pose; carries nearest_view when the frame has a prior. prior_conflict: with a prior, no hypothesis of support >= 0.25 lies within 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) of the prior, position and rotation tested separately (defaults for a prior without sigmas: metric 0.05 m / 2 deg, drifting 0.20 m / 5 deg). With a map floor (oms/2.13), a fit whose off-floor inliers are fewer than that minimum is no pose: no_overlap when no other hypothesis has enough."
         },
         "T_map_cam": {
           "oneOf": [
@@ -2779,6 +2784,36 @@
             }
           ],
           "description": "For no_overlap rejections: the most similar keyframe, else null. Only confirmed keyframes qualify, never a kept_at_prior one."
+        },
+        "depth_check": {
+          "type": "object",
+          "required": [
+            "pose",
+            "refused"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "pose": {
+              "oneOf": [
+                {
+                  "enum": [
+                    "confirmed",
+                    "untested"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The reported pose against its references' sensor depth: confirmed (the depth agreement passed), untested (no reference with a depth image held enough of its inliers and measured enough points, all references monocular, or a turn fit); null without a pose."
+            },
+            "refused": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "How many distinct pose hypotheses (those within 0.10 m and 5 deg of each other counted once) the frame's depth refused: they are neither the reported pose nor rivals, nor the base of support."
+            }
+          },
+          "description": "oms/2.17. Present only when the frame sent depth: what its depth did (api.md section 6, Query depth). Absent for a frame without depth, whose answer is as before."
         }
       }
     },

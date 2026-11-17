@@ -304,6 +304,17 @@ no longer paired nor a registration or locate reference; the mark belongs to the
 version (frames reads: `depth_suspect_version`). `quality.depth_pairs` rows gain `outcome` and
 keep listing the rejected frames' pairs.
 
+**oms/2.17** is additive: a locate frame may carry `depth`, with an update frame's conventions
+(16-bit PNG of the image's size, registered, × the camera's `depth_scale_m`, 0 = no value, the
+ignore masks applied; another size is `invalid_request`). Each pose hypothesis is tested against
+its references' sensor depth with registration's depth confirmation, and between confirmed
+hypotheses the one whose agreement falls short of the best by more than a margin is refused, as
+the parallax separates translational twins in registration (api.md §6, Query depth). A refused
+hypothesis is neither reported nor a rival; every hypothesis refused is the new locate reason
+`depth_inconsistent`. Monocular references test nothing; the located pose and its sigmas are
+unchanged. New optional field: the locate result's `depth_check` `{pose, refused}`, present only
+when the frame sent depth; a frame without depth is answered as before.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

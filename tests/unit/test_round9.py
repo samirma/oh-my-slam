@@ -252,7 +252,9 @@ def test_the_locate_index_carries_each_reference_s_status(tmp_path: Path) -> Non
     dv = SimpleNamespace(name="m", dir=vdir, record={"frames": rows, "scale_source": "monocular",
                                                      "scale_sigma_rel": 0.1},
                          meta={"keyframes": names, "keys": {n: n for n in names}})
-    self = SimpleNamespace(store=None, dir=lambda name: tmp_path / name)
+    # an index written before oms/2.17: its sensor depth from the mapper map (none here)
+    self = SimpleNamespace(store=None, dir=lambda name: tmp_path / name,
+                           _sensor_grids=lambda dv: {})
     cams = {"cam": CAM}
     idx = derived.Derived._build_index(self, dv, cams)  # type: ignore[arg-type]
     assert [k.registered for k in idx.keyframes] == [True, False]

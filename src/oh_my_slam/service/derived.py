@@ -6,7 +6,9 @@ Under ``<data>/oms/maps/<name>/derived/``:
   previous version's plus the rays of its frames that are new or moved (all of them again when a
   stored frame moved);
 * ``<n>/cloud.npz`` — the fused cloud in the map frame (``xyz`` float32, ``rgb``, ``object_id``);
-* ``<n>/locate.npz`` — per keyframe, the map-frame points of its keypoints;
+* ``<n>/locate.npz`` — per keyframe, the map-frame points of its keypoints and, for a keyframe
+  with a sensor depth image, that depth on a reduced grid (``s<i>``, oms/2.17: what a locate
+  query's own depth is tested against);
 * ``<n>/meta.json`` — the floor, door positions and objects in the map frame (written last: a
   version is derived once it exists);
 * ``features/<key>.npz`` — each keyframe image's SIFT keypoints and descriptors, shared by every
@@ -160,6 +162,24 @@ class DerivedVersion:
                                    "rgb": np.zeros((0, 3), np.uint8),
                                    "object_id": np.zeros(0, np.uint32)}
             return self._cloud
+
+
+def sensor_grid(f: dict[str, Any], internal: InternalMap | None, sim: Sim3
+                ) -> NDArray[np.float32] | None:
+    """A version frame's sensor depth image in map metres on the locate index's reduced grid
+    (``relocalize.reduced_depth``), its ignored pixels without value (api.md §6 "Query depth",
+    oms/2.17); None for a frame without one (monocular, a depth left unused, or none stored)."""
+    if f.get("depth_kind") != "sensor" or f.get(DEPTH_UNUSED) or internal is None \
+            or not f.get("internal"):
+        return None
+    raw = internal.depth(f["internal"])
+    if raw is None:
+        return None
+    d = np.asarray(raw, np.float32) * np.float32(sim.s)
+    ignore = on_grid(internal.ignore(f["internal"]), d.shape)
+    if ignore is not None:
+        d = np.where(ignore, np.float32(0.0), d)
+    return relocalize.reduced_depth(d)
 
 
 def _occupies(f: dict[str, Any]) -> bool:
@@ -540,6 +560,7 @@ class Derived:
         # keyframe features and their points: triangulated with the stored poses, else depth
         kfs: list[relocalize.Keyframe] = []
         keys: dict[str, str] = {}
+        sensor: dict[int, NDArray[np.float32]] = {}
         for f in frames:
             if f.get("pose_state") == "kept_at_prior" or f.get("depth_suspect"):
                 # a pose the images did not confirm, or a keyframe the depth consistency marked
@@ -565,6 +586,9 @@ class Derived:
             kfs.append(relocalize.Keyframe(f["name"], T, Kf, uv, desc, relocalize.keyframe_points(
                 uv, Kf, None if f.get(DEPTH_UNUSED) else depth(f), T)))
             keys[f["name"]] = key
+            grid = sensor_grid(f, internal, sim)
+            if grid is not None:
+                sensor[len(kfs) - 1] = grid
 
         def pair(i: int, j: int) -> NDArray[np.int64]:
             k = (keys[kfs[i].name], keys[kfs[j].name])
@@ -582,6 +606,9 @@ class Derived:
         # "Reference scale", oms/2.12)
         arrays: dict[str, Any] = {f"p{i}": p for i, p in enumerate(points)}
         arrays.update({f"l{i}": m for i, m in enumerate(lifted)})
+        # the keyframes' sensor depth (oms/2.17); ``sensor`` marks an index that says
+        arrays.update({f"s{i}": g.astype(np.float16) for i, g in sensor.items()})
+        arrays["sensor"] = np.ones(1, np.uint8)
         np.savez(buf, **arrays)
         atomic_write_bytes(vdir / "locate.npz", buf.getvalue())
         # the floor: the version's one estimate (map.md §5), which its objects used, when its
@@ -666,6 +693,26 @@ class Derived:
 
     # -- locate index ---------------------------------------------------------------------------
 
+    def _sensor_grids(self, dv: DerivedVersion) -> dict[str, NDArray[np.float32]]:
+        """The sensor depth of a version's keyframes (``sensor_grid``) from the mapper map it
+        was committed with, for a locate index written before oms/2.17; none when that map is
+        gone."""
+        try:
+            path = self.store.mapper_for(dv.name, dv.version)
+            internal = None if path is None else self.read_map(path)
+        except (ApiError, OSError, OhMySlamError):
+            return {}
+        if internal is None:
+            return {}
+        sim = Sim3.from_dict(dv.record["sim3"])
+        by_name = {f["name"]: f for f in dv.record["frames"]}
+        out = {}
+        for kname in dv.meta["keyframes"]:
+            grid = sensor_grid(by_name[kname], internal, sim)
+            if grid is not None:
+                out[kname] = grid
+        return out
+
     def index(self, dv: DerivedVersion, cameras: dict[str, Any] | None = None
               ) -> relocalize.Index:
         """The version's locate index, built once (the first caller builds it, the others
@@ -685,6 +732,11 @@ class Derived:
         # the map's, or a monocular keyframe's own
         scale = recorded_scale_sigma(str(dv.record["scale_source"]),
                                      dv.record["scale_sigma_rel"])
+        # the keyframes' sensor depth: from the index, else (an index written before oms/2.17)
+        # from the version's mapper map while it is kept
+        sensor = {kname: z[f"s{i}"].astype(np.float32)
+                  for i, kname in enumerate(dv.meta["keyframes"]) if f"s{i}" in z.files} \
+            if "sensor" in z.files else self._sensor_grids(dv)
         kfs = []
         for i, kname in enumerate(dv.meta["keyframes"]):
             f = by_name[kname]
@@ -700,6 +752,11 @@ class Derived:
                 float(f.get(OWN_SCALE_SIGMA, scale)),
                 # a locate index written before oms/2.12 does not say: every point lifted
                 z[f"l{i}"] if f"l{i}" in z.files else None))
+            grid = sensor.get(kname)
+            if grid is not None:
+                kfs[-1].sensor = grid
+                kfs[-1].sensor_K = cams[f["camera_id"]].canonical().resized(
+                    grid.shape[1], grid.shape[0]).K()
         # its map floor (api.md §6 "Floor points", oms/2.13): only a version whose record holds one
         idx = relocalize.Index(kfs, None if dv.record.get("floor_z_m") is None
                                else (dv.floor_z, dv.floor_sigma),

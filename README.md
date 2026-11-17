@@ -2252,6 +2252,48 @@ server.
   the keyframe looks (the mean of its keypoints' map points) seen from the prior's position,
   counter-clockwise positive, in (−180, 180]; null without a prior. Without a prior,
   `nearest_view` is null when no keyframe has a vote.
+* **Query depth** (api.md §6, oms/2.17; `relocalize.depth_verdicts`). A locate frame may send
+  `depth` as an update frame does: a 16-bit PNG of the image's size, registered to it, read with
+  the camera's `depth_scale_m` (default 1 mm), 0 no value, rectified with the image (nearest) and
+  emptied on the ignored pixels of both masks (`cameras.mapper_depth`); another size or a part
+  that is not a 16-bit PNG is `invalid_request` with `details.field` `frames[i].depth`, as in an
+  update. Decisions:
+  * **What is tested.** Every plausible hypothesis, against the references carrying a sensor
+    depth image (`depth_kind` `sensor`, not `depth_unused`) that hold ≥ 15 (`MIN_INLIERS`) of
+    its inlier correspondences, most first, as the registration gate takes them
+    (`AnchoredMap.depth_confirms`). Each pair maps the query's depth points (`anchored.backproject`,
+    ≤ 64 per side) at the hypothesis into the reference's view and back (`anchored.depth_counts`:
+    `SENSOR_DEPTH_TOL` = 0.10 relative, a point behind the other surface occluded, outside the
+    image or the 0.05–`FUSE_MAX_DEPTH_M` range uncounted). The first pair failing either way
+    (≥ `MIN_AGREEING` = 40 agree or contradict, < `DEPTH_CONFIRM_AGREEMENT` = 0.90 agree: the
+    failing pair of map.md §4) refuses; the first passing both ways (`DepthCounts.passes`)
+    confirms; one measuring fewer than 40 either way hands over to the next; none left: untested.
+    A contradiction refuses, a pair too thin to measure does not (unlike the registration gate,
+    where a candidate pose without a confirmation is no placement): a locate answer is read-only,
+    and "untested" is reported.
+  * **Twins.** Between the confirmed hypotheses, each is measured again against every reference
+    that decided one of them (`agreement_over`: the lowest ratio over the pairs' ways measuring
+    ≥ 40 points), and one more than **`DEPTH_AGREEMENT_MARGIN` = 0.05** below the best is
+    refused. Measured on `smoke_9ca6a86_base` (below): a twin shifted one wall tile (1 m) agrees
+    at 0.90–0.93 with the reference that sees the doorway beside the wall, the true pose at 1.00
+    with every reference; the registration threshold alone (0.90) left those twins standing.
+    The rule relies on the map's references agreeing with each other's depth (map.md §4, the
+    depth-consistency limit and suspect keyframes).
+  * **Refused** hypotheses are dropped before the floor rule and the choice: not reported, not
+    rivals, not the support's base. All refused: `depth_inconsistent`.
+  * **Not done in oms/2.17.** Monocular references are not tested and the query depth measures
+    no reference's scale (locate never writes the map; a monocular depth's scale is estimated,
+    and the depth-consistency limit tests sensor pairs only for that reason). The located pose,
+    its sigmas (still the `none` column, calibrated by `locate.sigma_containment` without query
+    depth), the floor-points rule (no per-inlier depth guard: it would change inlier counts and
+    the sigmas' calibration) and turn fits (`untested`) are unchanged. Each would need its own
+    calibration on real RGB-D locates.
+  * **Index.** `locate.npz` keeps each sensor keyframe's depth on a grid of ≤ 160 per side
+    (`relocalize.SENSOR_SIDE`, every s-th pixel; float16 metres, `s<i>`, with the marker
+    `sensor`); an index written before oms/2.17 takes it from the version's mapper map while
+    that map is kept (`Derived._sensor_grids`), else its references test nothing.
+  * `depth_check` `{pose, refused}` is answered only for a frame that sent depth, so a frame
+    without one gets the same fields and values as before, `schema` aside (checked on `arch_e305` and `arch_e205`).
 * **Index.** The derivation worker builds each version's locate index, its nearest-neighbour
   index of every keyframe descriptor included (`Index.prepare`), right after deriving it; the
   first locate does not wait for it. Concurrent locates share it under a lock (built once).
@@ -2938,6 +2980,47 @@ median `sigma_pos_m` 0.173 → 0.180 m, median error 0.070 m (p90 0.169) unchang
 the term stays well below 0.65 × d. On the synthetic scenes of `tests/unit/test_reference_scale.py`
 (a 1.4 × depth error in one group of keyframes from one spot) the reference groups add the rival
 the subsets of one group missed, and the term covers the biased pose's 0.2 m error within 3 σ.
+
+### Locate query depth measured (oms/2.17, 2026-11-17, M3 Pro, in process)
+
+**The ~1 m same-rotation rivals** of the RGB-D smoke maps (`smoke_7cc680c_base`,
+`smoke_9ca6a86_base`: a 17-view turn in place, metric priors, every reference with sensor depth;
+four live locates from the start spot each reported a rival at 0.995–1.010 m, 0.07–0.19°, support
+0.57–0.82) are not a lifting bug. Every reference point of those maps is lifted from its sensor
+depth as stored (all keypoints `lifted`, distances 1.5–4 m; nothing is triangulated on a turn in
+place, so no monocular k or grid rescale enters). The rivals are wall-texture aliases: the
+simulated bathroom's walls carry one marble tile texture repeated every 1 m, so the keypoints of
+a wall seen at 2.2 m also match the next tile, and the hypotheses solved on one keyframe's
+correspondences or on the pooled fit's leftovers (the second fit) land one tile to the side, at
+the same rotation, moved along the wall (not along the optical axis), on both sides (±0.99 m);
+the 90° rivals at 0.9–1.4 m are the same lattice turned. The constant 1.0 m is the tile period.
+`PRIOR_RADIUS_M` plays no part (no keyframe lies near the rival) and `PLAUSIBLE_BOUNDS_M` = 1.0
+lets them through only because the period is just under it (the keyframes' centres span 8 cm; a
+2 m alias would be cut). A leave-one-out locate of the start keyframe reproduces the live rival
+exactly (0.996 m, 0.11°, support 0.86). With a drifting prior of 1 cm / 1° the answer is the same:
+api.md §6 lists every supported rival whatever the prior (the prior only ranks and gates the
+reported pose), so a mm-sigma prior does not exclude a 1 m rival under the spec.
+
+**Replay.** Leave-one-out on read-only copies: each confirmed keyframe's stored image (and its
+stored sensor depth, as a mm PNG) located against the version's locate index without it, through
+the service's query path, no prior; error against the map's own pose of the keyframe.
+
+| Map (keyframes) | Located without / with depth | Ambiguous frames without → with | Rivals without → with | Same-rotation ~1 m rivals | Hypotheses refused |
+| --- | --- | --- | --- | --- | --- |
+| `smoke_9ca6a86_base` (17) | 17 / 17 | 13 → 4 | 21 → 4 | 12 → 2 | 28 |
+| same, drifting prior 1 cm / 1° | 17 / 17 | 13 → 4 | 21 → 4 | 12 → 2 | 29 |
+| `smoke_7cc680c_base` (17) | 15 / 15 | 13 → 4 | 30 → 5 | 13 → 2 | 31 |
+| `rev8_wheeled_depth` v5 (39) | 39 / 39 | 29 → 13 | 76 → 17 | 14 → 2 | 93 |
+| `rev8_wheeled2_depth` v5 (31) | 27 / 27 | 12 → 10 | 29 → 12 | 1 → 0 | 33 |
+
+No reported pose was refused (every located frame `confirmed`, none `depth_inconsistent`); the
+reported pose changed on 3 of 104 frames (errors 0.032 → 0.030 m, 0.145 → 0.186 m, 0.398 →
+0.274 m). The registration test alone (no twin comparison) took `smoke_9ca6a86_base` from 13 to
+11 ambiguous frames; with the comparison, 4. The rivals left are twins that agree with every
+reference's depth (a tile shift along a plain wall whose references never see its end; 90° turns
+of the square room): the accepted degenerate case. Monocular maps without depth, against the
+oms/2.16 code: `arch_e305` (6 queries) and `arch_e205` (3 queries) answered identically (poses,
+sigmas, rivals, reasons).
 
 ### Monocular scale sigma (oms/2.12, measured 2026-11-13, M3 Pro)
 

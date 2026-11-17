@@ -22,7 +22,14 @@ from numpy.typing import NDArray
 from oh_my_slam.core.atomic import atomic_write_json
 from oh_my_slam.core.log import get_logger, log_context
 from oh_my_slam.mapping import anchor, checks, navgrid, relocalize, sigmas
-from oh_my_slam.service.cameras import Camera, decode_mask, decode_rgb, same_camera
+from oh_my_slam.service.cameras import (
+    Camera,
+    decode_mask,
+    decode_png16,
+    decode_rgb,
+    mapper_depth,
+    same_camera,
+)
 from oh_my_slam.service.derived import Derived, DerivedVersion
 from oh_my_slam.service.errors import ApiError, invalid
 from oh_my_slam.service.store import Store, read_scale, utc
@@ -270,6 +277,8 @@ class LocateFrame:
     prior: dict[str, Any] | None
     height_m: float | None
     height_sigma_m: float | None
+    # its depth image as sent (oms/2.17: read with its camera's ``depth_scale_m``); None: none
+    depth: NDArray[np.uint16] | None = None
 
 
 def locate_frames(store: Store, name: str, req: dict[str, Any], parts: dict[str, bytes]
@@ -315,6 +324,13 @@ def locate_frames(store: Store, name: str, req: dict[str, Any], parts: dict[str,
         if rgb.shape[:2] != (cam["height"], cam["width"]):
             raise invalid(f"{field}.image", f"{field}.image is {rgb.shape[1]}x{rgb.shape[0]}; "
                           f"camera {f['camera_id']!r} is {cam['width']}x{cam['height']}")
+        depth = None
+        if "depth" in f:  # as an update frame's (api.md §3, oms/2.17)
+            depth = decode_png16(part(f"{field}.depth", f["depth"]), f"{field}.depth")
+            if depth.shape != rgb.shape[:2]:
+                raise invalid(f"{field}.depth", f"{field}.depth is {depth.shape[1]}x"
+                              f"{depth.shape[0]}; camera {f['camera_id']!r} is "
+                              f"{cam['width']}x{cam['height']}")
         mask = cam_masks.get(f["camera_id"])
         if mask is None and f["camera_id"] in known and store.mask_digest(name, f["camera_id"]):
             mask = decode_mask(store.mask_path(name, f["camera_id"]).read_bytes(),
@@ -332,7 +348,7 @@ def locate_frames(store: Store, name: str, req: dict[str, Any], parts: dict[str,
             raise invalid(f"{field}.prior.T_map_cam", f"{field}.prior.T_map_cam is not a rigid "
                           "transform (orthonormal rotation, last row 0 0 0 1)")
         out.append(LocateFrame(f["name"], Camera.from_json(cam), rgb, mask, prior,
-                               f.get("height_above_floor_m"), f.get("height_sigma_m")))
+                               f.get("height_above_floor_m"), f.get("height_sigma_m"), depth))
     return out
 
 
@@ -348,6 +364,8 @@ def _query(fr: LocateFrame, floor_z: float, height_scale: bool = False
     uv, desc = relocalize.extract(gray, mask)
     K = cam.canonical()
     q = relocalize.Query(uv, desc, K.K(), K.width, K.height)
+    if fr.depth is not None:  # metres on the canonical pinhole, none on ignored pixels
+        q.depth = mapper_depth(fr.depth, cam, fr.mask)
     p = fr.prior
     if p is not None and p.get("trust") in ("metric", "drifting") and "T_map_cam" in p:
         q.prior = np.asarray(p["T_map_cam"], np.float64)
@@ -419,6 +437,8 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                                "consistent_with_prior": None, "height_consistent": None,
                                "prior_residual_m": None, "prior_residual_deg": None,
                                "inlier_floor_share": None, "nearest_view": None}
+        if fr.depth is not None:  # oms/2.17: present only for a frame that sent depth
+            res["depth_check"] = {"pose": None, "refused": 0}
         reason = checks.reason(measures, None)
         if reason not in ("plain", "blur"):  # locate's few_features is its own keypoint count
             reason = "few_features" if len(q.uv) < relocalize.MIN_INLIERS else None
@@ -427,6 +447,9 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
             out.append(res)
             continue
         o = relocalize.locate(q, index)
+        if fr.depth is not None:
+            res["depth_check"] = {"pose": o.depth_pose if o.located else None,
+                                  "refused": o.depth_refused}
         if o.located:
             assert o.T is not None and o.sigma_pos_m is not None
             # api.md §6 "Camera-height scale": the height disagreement joins the position sigma
@@ -440,7 +463,7 @@ def _locate(derived: Derived, dv: DerivedVersion, frames: list[LocateFrame]
                         "inlier_floor_share": o.floor_share})
             res["prior_residual_m"], res["prior_residual_deg"] = prior_residual(
                 fr, res["T_map_cam"])
-        elif o.reason is not None:  # prior_conflict
+        elif o.reason is not None:  # prior_conflict, depth_inconsistent
             res["reason"] = o.reason
         else:  # enough keypoints, no pose: no overlap with the map
             res["reason"] = "no_overlap"
