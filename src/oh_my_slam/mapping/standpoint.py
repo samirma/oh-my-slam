@@ -145,6 +145,13 @@ PAIR_MAX_DIST_M = CANDIDATE_MAX_DIST_M
 SUSPECT_MIN_FRAMES = 3
 DEPTH_REJECT_MAX_SHARE = 0.5
 DEPTH_RESOLVE_RUNS = 3
+# a pair's contradiction (map.md §4 "Depth consistency", oms/2.19): a direction agreeing below
+# ``DEPTH_CONFIRM_AGREEMENT`` fails when fewer than this share of its counted points agree, or
+# with at least this many see-through points; between the two, fewer see-through points are the
+# background of correct poses (thin structures, mixed pixels at depth edges, far range: up to 87
+# of a view's 3071 points at 0.79-0.91 on the correct views of README "Contradiction support")
+CONTRADICTION_CLEAR = 0.75
+CONTRADICTION_MIN_POINTS = 100
 PAIR_MAX_ANGLE_DEG = CANDIDATE_MAX_ANGLE_DEG
 PNP_MIN_POINTS = 6  # a hypothesis's depth pose (``depth_pose``) needs this many lifted inliers
 PNP_ITERATIONS = 200
@@ -1141,13 +1148,15 @@ class DepthPair:
     @staticmethod
     def _fails(c: DepthCounts) -> bool:
         n = c.agree + c.through
-        return n >= MIN_AGREEING and c.agree < DEPTH_CONFIRM_AGREEMENT * n
+        return n >= MIN_AGREEING and c.agree < DEPTH_CONFIRM_AGREEMENT * n and (
+            c.agree < CONTRADICTION_CLEAR * n or c.through >= CONTRADICTION_MIN_POINTS)
 
     @property
     def fails(self) -> bool:
-        """Under the depth confirmation's minimum count and agreement threshold, in either
-        direction: at least ``MIN_AGREEING`` points agree or contradict, fewer than
-        ``DEPTH_CONFIRM_AGREEMENT`` of them agree."""
+        """A supported contradiction in either direction (map.md §4, oms/2.19): at least
+        ``MIN_AGREEING`` points agree or contradict and fewer than ``DEPTH_CONFIRM_AGREEMENT``
+        of them agree, with fewer than ``CONTRADICTION_CLEAR`` of them agreeing or at least
+        ``CONTRADICTION_MIN_POINTS`` contradicting."""
         return self._fails(self.ab) or self._fails(self.ba)
 
     @property

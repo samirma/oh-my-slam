@@ -378,12 +378,16 @@ def test_depth_consistency_pairs_registered_sensor_frames_only(tmp_path: Any) ->
     assert sp.depth_consistency(am, []) == (False, [])
     kept = dataclasses.replace(pls[0], status="kept_at_prior")
     assert sp.depth_consistency(am, [kept]) == (False, [])
-    # a committed view turned 90 deg off the stored ones fails the update
+    # a committed view turned 10-45 deg off the stored ones fails the update; turned 60 deg in
+    # this box room it overlaps them little and contradicts 72 points at 0.88, below the support
+    # a contradiction needs (oms/2.19, README "Contradiction support")
     kf = am.keyframe(more[0].keyframe or "")
     assert kf is not None
-    kf.T = an.pose(an.exp_so3(np.array([0.0, 0.0, np.radians(60.0)])) @ kf.T[:3, :3], kf.centre)
-    bad, rows = sp.depth_consistency(am, more)
-    assert bad and any(r["fails"] for r in rows)
+    R0 = kf.T[:3, :3].copy()
+    for deg, fails in ((10.0, True), (45.0, True), (60.0, False)):
+        kf.T = an.pose(an.exp_so3(np.array([0.0, 0.0, np.radians(deg)])) @ R0, kf.centre)
+        bad, rows = sp.depth_consistency(am, more)
+        assert bad == fails and any(r["fails"] for r in rows) == fails
 
 
 def _no_rotated_choice(monkeypatch: pytest.MonkeyPatch) -> None:

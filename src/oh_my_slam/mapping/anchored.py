@@ -193,6 +193,12 @@ SENSOR_SCALE_SIGMA_REL = 0.03  # a depth image's scale, as a prior of its refere
 CONFIRM_SIGMA_POS_M = 0.10  # an image pose confirms a frame only this well determined (or
 # within twice the prior's sigma)
 CONFIRM_SIGMA_ROT_DEG = 2.0
+# a rotation-only image pose more than this many of a metric prior's rotation sigmas from it
+# confirms the frame only on a depth confirmation with at least this many agreeing points both
+# ways (map.md §2, oms/2.19): fewer is a thin overlap (smoke_777f678 _0012 on near clutter, 5.2
+# deg off on 57/114 agreeing points; README "Contradiction support")
+ROTATION_PRIOR_K = 2.0
+ROTATION_CONFIRM_MIN = 200
 METRIC_IMAGE_SIGMA_POS_M = 0.05  # an image pose weighed against a metric prior: at least this
 METRIC_IMAGE_SIGMA_ROT_DEG = 1.0
 K_SIGMA = 3.0
@@ -875,13 +881,15 @@ def sample_depth(depth: NDArray[np.float32], K_grid: Intrinsics, K: Intrinsics,
 @dataclass
 class Solve:
     """A refined pose: rotation, centre, 6x6 covariance (rotation vector, centre) and the
-    reprojection inliers."""
+    reprojection inliers; once the depth confirmation passed it (``depth_confirms``), the fewer
+    agreeing points of its two directions (None: not depth-confirmed)."""
 
     R: Array
     c: Array
     cov: Array
     inliers: NDArray[np.bool_]
     rms_px: float
+    confirmed: int | None = None
 
     @property
     def T(self) -> Array:
@@ -3603,6 +3611,8 @@ class AnchoredMap:
                 return None
             s, sub, rot_only = twin, gate[1], False
             n = int(s.inliers.sum())
+        else:
+            s = gate[0]  # with its confirmation's agreeing count
         spi, sri = s.sigmas()
         spi = max(spi, MIN_SIGMA_POS_M)
         sri = max(sri, IMAGE_SIGMA_ROT_MIN_DEG)
@@ -3925,7 +3935,10 @@ class AnchoredMap:
         ``CONFIRM_SIGMA_ROT_DEG``, or position sigma above max(``CONFIRM_SIGMA_POS_M``, 2 x the
         prior's)); else its residual (m, deg), its calibrated image-only sigmas (σ_hypothesis;
         a rotation-only pose takes the standpoint's position sigma: its centre is the prior's)
-        and whether it lies beyond the combined conflict bound."""
+        and whether it lies beyond the combined conflict bound. A rotation-only pose more than
+        ``ROTATION_PRIOR_K`` x a metric prior's rotation sigma from it whose depth confirmation
+        agreed on fewer than ``ROTATION_CONFIRM_MIN`` points (one way) is too loose as well
+        (map.md §2, oms/2.19): a thin overlap does not outweigh a metric heading."""
         assert f.prior is not None
         s, _, _, method, spi, sri, sub, refs = img
         rot_only = method == "rotation"
@@ -3933,6 +3946,11 @@ class AnchoredMap:
                                                                        2.0 * sp0)):
             return None
         dp, dr = pose_residual(s.T, T0)
+        if (rot_only and f.prior["trust"] == "metric" and s.confirmed is not None
+                and s.confirmed < ROTATION_CONFIRM_MIN and dr > ROTATION_PRIOR_K * sr0):
+            log.info("%s: its rotation-only pose lies %.1f deg from its metric prior on %d "
+                     "agreeing depth points: too loose to confirm it", f.name, dr, s.confirmed)
+            return None
         ci = sigmas.calibrated(*_real_sigmas(s, refs), self._on_sensor(cands, sub[3]),
                                f.prior["trust"])
         if rot_only:
@@ -4250,6 +4268,7 @@ class AnchoredMap:
                      "confirmed" if ok else "fails")
             if not ok:
                 return None
+            s = dataclasses.replace(s, confirmed=min(ab.agree, ba.agree))
             if corr is None:
                 return s, None
             # (only a pose the depth confirms asks whether another one would pass too)
