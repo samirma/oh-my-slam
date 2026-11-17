@@ -1879,6 +1879,15 @@ class Drift:
             T[:3, :3] = level_toward(T[:3, :3], P[:3, :3], sr ** 2 / (sr ** 2 + sigma_tilt ** 2))
         return T, sp, sr
 
+    def evidence_scale(self) -> float:
+        """The odometry scale its own evidence fits (``confirm``'s least squares of map on
+        odometry baselines, clipped to ``ODO_SCALE_RANGE``), 1 without evidence."""
+        if not self.evidence:
+            return 1.0
+        odo_m = np.array([e[0] for e in self.evidence])
+        map_m = np.array([e[1] for e in self.evidence])
+        return float(np.clip((odo_m * map_m).sum() / (odo_m ** 2).sum(), *ODO_SCALE_RANGE))
+
     def confirm(self, T: Array, P: Array, fixed: float | None = None) -> None:
         """A drifting frame the images placed at ``T``: the new reference, odometry scale
         evidence against the previous one, and a supporting frame. Its reference pose is then
@@ -1890,10 +1899,7 @@ class Drift:
             moved = float(np.linalg.norm(T[:3, 3] - self.ref_T[:3, 3]))
             if odo >= ODO_SCALE_MIN_TRAVEL_M:
                 self.evidence = [*self.evidence, [odo, moved]][-MAX_EVIDENCE:]
-                odo_m = np.array([e[0] for e in self.evidence])
-                map_m = np.array([e[1] for e in self.evidence])
-                s = float((odo_m * map_m).sum() / (odo_m ** 2).sum())
-                self.odo_scale = float(np.clip(s, *ODO_SCALE_RANGE))
+                self.odo_scale = self.evidence_scale()
         if fixed is not None:
             self.odo_scale = fixed
         self.ref_T, self.ref_prior = T.copy(), P.copy()
@@ -1940,7 +1946,7 @@ def prior_scale_estimate(evidence: list[list[float]], span: float
     baselines ``evidence`` ([prior m, image m, ...]) when the priors span ``span``: with r = ln
     (image / prior), the baselines within 3 × max(1.4826 MAD, ``PRIOR_SCALE_NOISE_REL``) of the
     median agree; with at least ``PRIOR_SCALE_MIN`` agreeing, more than half, from at least
-    ``DRIFT_AGREE_MIN`` frames (an entry's frame: its prior position, entries [3:5]; an entry
+    ``DRIFT_AGREE_MIN`` frames (an entry's frame: its prior position, entries [2:4]; an entry
     without one counts as its own frame), and a span of at least ``PRIOR_SCALE_SPAN_M``, the
     agreeing baselines' least-squares ratio and its relative sigma (their robust spread,
     floored at the noise, over the root of their count); else None."""
@@ -3305,11 +3311,13 @@ class AnchoredMap:
         while one is in force the drift estimate's odometry scale is it. Returns whether the
         scale in force changed."""
         span = max(self.prior_span(), self.prior_span("drifting"))
-        before = self.pscale.in_force
+        before, was = self.pscale.in_force, self.pscale.applied
         self.pscale = self.pscale.decide(prior_scale_estimate(self.bias, span))
         self.pscale.count = sum(e[0] >= SCALE_EVIDENCE_MIN_M for e in self.bias)
         if self.pscale.applied:
             self.drift.odo_scale = self.pscale.value
+        elif was:  # no longer applied: the drift estimate's own evidence fit, else 1
+            self.drift.odo_scale = self.drift.evidence_scale()
         return self.pscale.in_force != before
 
     def fixed_odo(self) -> float | None:
@@ -4923,6 +4931,11 @@ class AnchoredMap:
         epoch, its odometry scale the prior scale in force (else 1), no support, evidence or
         held views."""
         eps = [prior_epoch(f.prior) for f in frames
+               if f.prior is not None and f.prior["trust"] in ("metric", "drifting")]
+        if eps and not self.keyframes:
+            self.drift.epoch = max(eps)  # a new map: its estimate starts in its first epoch
+            return
+        eps = [prior_epoch(f.prior) for f in frames
                if f.prior is not None and f.prior["trust"] == "drifting"]
         if eps and max(eps) > self.drift.epoch:
             log.info("odometry epoch %d (was %d): the drift estimate restarts", max(eps),
@@ -5035,6 +5048,8 @@ class AnchoredMap:
                 ref = by.get(k.placed.get("ref") or "")
                 up = np.zeros(3) if ref is None else delta(ref, seen | {k.id})
                 out = a * own + (1.0 - a) * up
+                if float(np.linalg.norm(out)) < REPLACE_MIN_M:
+                    out = np.zeros(3)  # not applied: its dependents see it in place
             memo[k.id] = out
             return out
 
@@ -5847,8 +5862,11 @@ class AnchoredMap:
         for i, f in enumerate(frames):
             pl = out.get(i)
             if pl is None or f.prior is None or f.prior["trust"] != "drifting" \
-                    or pl.method == "linked":
-                continue  # a linked pose is its partner's plus the link (map.md §1, oms/2.15)
+                    or pl.method == "linked" or prior_epoch(f.prior) != self.drift.epoch:
+                # a linked pose is its partner's plus the link (map.md §1, oms/2.15); a prior
+                # of another odometry epoch than the estimate's is placed as sent and gives no
+                # drift evidence (map.md §1 "Odometry epochs", oms/2.18)
+                continue
             if pl.status == "registered" and pl.method in ("origin", "prior"):
                 assert pl.T is not None
                 T, sh = pl.T, (MIN_SIGMA_POS_M, MIN_SIGMA_ROT_DEG)
@@ -5882,7 +5900,8 @@ class AnchoredMap:
         each a ``prior_conflict`` rejection."""
         every = self._drift_evidence(frames, out)
         able = {i for i, pl in out.items() for p in [frames[i].prior]
-                if p is not None and p["trust"] == "drifting" and _can_support(pl)}
+                if p is not None and p["trust"] == "drifting" and _can_support(pl)
+                and prior_epoch(p) == used.epoch}  # oms/2.18: a stale epoch's frame, none
         if not every:
             self._held, self._rule = [], (False, [], [])
             return None, {}
@@ -5890,7 +5909,7 @@ class AnchoredMap:
             # an unsignalled re-anchor (map.md §1 "Odometry epochs"): restart, no change fitted
             self._held, self._rule = [], (False, [], [])
             self.reanchored = "detected"
-            return Drift(odo_scale=used.odo_scale, epoch=used.epoch), {}
+            return Drift(odo_scale=self.fixed_odo() or 1.0, epoch=used.epoch), {}
         # no correction from one view (map.md §1, oms/2.13): a frame moving its prior beyond the
         # prior's own sigma without enough independent views agreeing is held out of the fit
         held = self._one_view_rule(every, used)
@@ -6007,8 +6026,9 @@ class AnchoredMap:
         self.drift = copy.deepcopy(used)
         for i in sorted(range(len(frames)), key=lambda j: _order(frames, j)):
             f = frames[i]
-            if f.prior is None or f.prior["trust"] != "drifting":
-                continue
+            if f.prior is None or f.prior["trust"] != "drifting" \
+                    or prior_epoch(f.prior) != self.drift.epoch:
+                continue  # (oms/2.18: a stale epoch's frame is no reference nor supporter)
             P = np.asarray(f.prior["T_map_cam"], np.float64)
             pl = out[i]
             if pl.status == "registered" and pl.T is not None and pl.method != "linked":

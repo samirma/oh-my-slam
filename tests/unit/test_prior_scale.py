@@ -126,18 +126,16 @@ def test_no_scale_from_one_sample(tmp_path: Path) -> None:
 
 def test_re_placement_carries_the_references_corrections(tmp_path: Path) -> None:
     """Keyframes placed before the scale was known move by their prior's share of its change
-    plus their image's share of their reference's correction; the drift estimate's reference
-    moves with its keyframe; a stored keyframe that gave content refuses the cloud."""
+    plus their image's share of their reference's correction; a stored keyframe that gave
+    content refuses the cloud."""
     m = new_map(tmp_path)
     truth = walk(12)
-    m.update([frame("w00", truth[0], p=prior(odo(truth[0]), "drifting", 0.03))])
-    m.update([frame(f"w{k:02d}", truth[k], p=prior(odo(truth[k]), "drifting", 0.03))
-              for k in range(1, 3)])
-    assert not m.pscale.applied and m.drift.ref_T is not None
+    m.update([frame("w00", truth[0], p=_metric(truth[0], 0.03))])
+    m.update([frame(f"w{k:02d}", truth[k], p=_metric(truth[k], 0.03)) for k in range(1, 3)])
+    assert not m.pscale.applied
     before = {k.name: k.centre.copy() for k in m.keyframes}
-    ref_before = m.drift.ref_T.copy()
     cloud_before = len(m.cloud.keys)
-    pls = m.update([frame(f"w{k:02d}", truth[k], p=prior(odo(truth[k]), "drifting", 0.03))
+    pls = m.update([frame(f"w{k:02d}", truth[k], p=_metric(truth[k], 0.03))
                     for k in range(3, 9)])
     assert m.pscale.applied and m.replaced
     names = {e["name"] for e in m.replaced}
@@ -147,10 +145,7 @@ def test_re_placement_carries_the_references_corrections(tmp_path: Path) -> None
             assert err(k.T, truth[int(k.name[1:])])[0] < float(
                 np.linalg.norm(before[k.name] - truth[int(k.name[1:])][:3, 3]))
     assert all(err(p.T, truth[k])[0] < 0.05 for k, p in zip(range(3, 9), pls, strict=True))
-    assert not np.allclose(m.drift.ref_T, ref_before)
     assert len(m.cloud.keys) > 0 and cloud_before > 0
-    # the stored keyframes' re-placement is not a stored keyframe's movement (previous
-    # residuals): every record's scale is the one in force now
     assert all(k.placed is None or k.placed["scale"] in (m.pscale.value, m.drift.odo_scale)
                for k in m.keyframes)
 
@@ -173,9 +168,13 @@ def test_replace_edges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     real = m.image_path
     monkeypatch.setattr(m, "image_path", lambda kid: None if kid == b.id else real(kid))
     pls = [an.Placement("r", "rejected"), an.Placement(c.name, "registered", keyframe=c.id)]
+    # b defines the drift estimate's reference: it moves with b
+    b.prior = {"trust": "drifting", "T": b.T.tolist(), "sigma_pos_m": 0.1, "sigma_rot_deg": 2.0}
+    m.drift.ref_T, m.drift.ref_prior = b.T.copy(), b.T.copy()
+    ref_before = m.drift.ref_T.copy()
     got = m._replace(pls, {c.id})
     assert {e["name"] for e in got} == {a.name, b.name}
-    assert c.placed is None
+    assert c.placed is None and not np.allclose(m.drift.ref_T, ref_before)
 
 
 def test_lever_and_scaled_edges(tmp_path: Path) -> None:
@@ -252,6 +251,72 @@ def test_a_new_epoch_restarts_the_drift_estimate(tmp_path: Path) -> None:
     assert m.keyframes[-1].prior is not None and m.keyframes[-1].prior["odometry_epoch"] == 1
     m.update([frame("w0b", truth[0], p=prior(truth[0], "drifting", 0.03))])
     assert m.drift.epoch == 1  # an older epoch's frame does not restart it
+    # a mixed-epoch job: the stale epoch's frame is placed as sent and gives no drift evidence
+    support, ref_prior = list(m.drift.support), m.drift.ref_prior
+    stale = prior(base_pose(25, -1.1, 0.1), "drifting", 0.03)
+    m.update([frame("w2b", base_pose(25, -1.1, 0.1), p=stale),
+              frame("w7b", base_pose(-10, -0.15, 0.0), p=re(7))])
+    assert np.asarray(stale["T_map_cam"])[:3, 3].tolist() not in m.drift.support
+    assert ref_prior is not None and m.drift.ref_prior is not None
+    assert all(c in m.drift.support for c in support)
+    assert an.prior_epoch({"odometry_epoch": 1}) == m.drift.epoch
+
+
+def test_a_new_map_starts_in_its_first_epoch(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    truth = walk(3)
+    m.update([frame(f"w{k}", truth[k], p=prior(truth[k], "drifting", 0.03)
+                    | {"odometry_epoch": 2}) for k in range(3)])
+    assert m.reanchored is None and m.drift.epoch == 2
+
+
+def test_a_detected_restart_takes_the_prior_scale_or_one(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    m = new_map(tmp_path)
+    monkeypatch.setattr(m, "_drift_evidence", lambda frames, out: ["obs"])
+    monkeypatch.setattr(m, "_reanchor", lambda obs, able, used: True)
+    stale = Drift(base_pose(0), base_pose(0), 1.3, epoch=2)
+    got, out = m._fit_drift([], {}, stale)
+    assert got is not None and got.odo_scale == 1.0 and got.epoch == 2 and out == {}
+    assert m.reanchored == "detected"
+    m.pscale = PriorScale(0.9, 0.01, True)
+    got, _ = m._fit_drift([], {}, stale)
+    assert got is not None and got.odo_scale == 0.9
+
+
+def test_a_scale_no_longer_applied_returns_the_drift_to_its_evidence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prior scale stops being applied: the drift estimate's odometry scale returns to its
+    own evidence's fit, and a keyframe placed through it re-places back."""
+    m = new_map(tmp_path)
+    truth = walk(2)
+    m.update([frame(f"w{k}", truth[k], p=_metric(truth[k])) for k in range(2)])
+    k = m.keyframes[1]
+    m.pscale = PriorScale(0.9, 0.01, True)
+    m.drift = Drift(base_pose(0), base_pose(0), 0.9, evidence=[[1.0, 1.1]])
+    k.placed = {"lever": [1.0, 0.0, 0.0], "scale": 0.9, "share": 1.0, "ref": None,
+                "drift": True}
+    before = k.centre.copy()
+    monkeypatch.setattr(an, "prior_scale_estimate", lambda ev, span: (1.0, 0.01))
+    assert m.estimate_prior_scale() and not m.pscale.applied
+    assert m.drift.odo_scale == pytest.approx(1.1)
+    m._replace([], set())
+    assert k.centre[0] - before[0] == pytest.approx(0.2)
+    assert Drift().evidence_scale() == 1.0
+
+
+def test_a_correction_below_the_minimum_propagates_nothing(tmp_path: Path) -> None:
+    m = new_map(tmp_path)
+    truth = walk(2)
+    m.update([frame(f"w{k}", truth[k], p=_metric(truth[k])) for k in range(2)])
+    a, b = m.keyframes
+    a.placed = {"lever": [0.08, 0.0, 0.0], "scale": 1.0, "share": 1.0, "ref": None,
+                "drift": False}
+    b.placed = {"lever": [0.15, 0.0, 0.0], "scale": 1.0, "share": 0.5, "ref": a.id,
+                "drift": False}
+    m.pscale = PriorScale(0.9, 0.01, True)
+    # a moves 8 mm (not applied); b's own half is 7.5 mm: with a's 4 mm it would pass 1 cm
+    assert m._replace([], {a.id, b.id}) == []
 
 
 def test_an_unsignalled_re_anchor_is_detected(tmp_path: Path) -> None:

@@ -295,6 +295,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     image's own scale sigma, `SENSOR_SCALE_SIGMA_REL` in `README.md`). The scale in force is
     the significant estimate, else 1; it changes only when it would move by more than 2 × the
     estimate's sigma in ln scale, so small fluctuations of the evidence never move the map.
+    When the scale stops being applied, the drift estimate's odometry scale returns to its own
+    evidence's fit (the least squares of its map on odometry baselines, as before oms/2.18), 1
+    without evidence; keyframes placed through it re-place back accordingly (Re-placement).
     It is decided at each job's end, once the job's statuses are final (after the
     pose-duplicate pass), never within a job: every frame of a job is placed with the scale in
     force at its start, so the outcome does not depend on frame order, and a job's own
@@ -327,7 +330,8 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     committed fusion to its prior's change, every image constraint kept: a frame registered on
     a moved keyframe moves with it as far as its image weighed. Positions only: the scale turns
     nothing. The corrections are computed once per change, in the order of the references,
-    deterministically; one below `REPLACE_MIN_M` (`README.md`, 0.01 m) is not applied. The
+    deterministically; one below `REPLACE_MIN_M` (`README.md`, 0.01 m) is not applied, and a
+    keyframe left in place passes Δ_ref = 0 to the keyframes that rest on it. The
     drift estimate's reference moves with the keyframe that defines it, and the cloud is fused
     again from the keyframes at their new poses. Versions are immutable: the re-placement is
     part of the version the job commits. The job lists every moved keyframe, stored or its own,
@@ -344,7 +348,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     estimate: the identity of the newest epoch (priors as sent, with their sigmas), its
     odometry scale the prior scale in force (else 1), no support, no odometry-scale evidence,
     no held views; the job's fit may then make a first estimate under the usual support rule.
-    A `drifting` prior of another epoch than the estimate's is placed as sent.
+    A map's first job starts its estimate in that job's newest epoch: no restart is reported.
+  * **Stale epochs.** A `drifting` prior of another epoch than the estimate's is placed as sent,
+    with its sigmas, and gives no drift evidence: it is never a fit observation, a reference,
+    a supporting frame, one of the n frames that can support an estimate, a view of the one-view
+    rule, nor a hit or non-hit of the unsignalled test below.
   * No baseline straddles two epochs: the prior scale's baselines, the drift estimate's
     odometry-scale evidence (restarted with it) and the keyframe depth scale's prior pairs take
     two priors of one epoch only. The prior scale itself is pooled over epochs: each baseline
@@ -356,8 +364,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     of a job's frames that can support an estimate (Drift estimate), and more than half of
     them, have points-fit image poses within the conflict bound of their priors as sent and
     beyond it of their priors as placed, the odometry was re-anchored without a signal: the
-    estimate restarts as for a new epoch (its epoch number unchanged) instead of fitting a
-    change, and the job is registered again under it.
+    estimate restarts as for a new epoch (its epoch number unchanged; its odometry scale the
+    prior scale in force, else 1) instead of fitting a change, and the job is registered again
+    under it.
   * `quality.drift_correction.restarted` reports `signalled` or `detected` (§4).
 * **Static image content.** Features whose image position stays within 2 px across at least 3
   frames of a job whose relative rotation exceeds 5° are excluded from matching. A job without

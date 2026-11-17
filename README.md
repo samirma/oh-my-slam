@@ -1967,6 +1967,21 @@ map.md §1 "Prior scale", "Odometry epochs", §2 "Reference sigma"; `anchored.pr
   job's supporting frames, more than half, within the conflict bound of their priors as sent and
   beyond it as placed: the fit returns the identity as an accepted change (the job is registered
   again under it) and `drift_correction.restarted` is `detected`.
+* **Follow-up of the spec audit.** A drifting prior of another epoch than the estimate's gives
+  no drift evidence (not a fit observation, reference, supporter, one of the n, a view, nor a
+  hit of the unsignalled test: `_drift_evidence`, `_close_drift`, `_fit_drift`). A detected
+  restart takes the prior scale in force, else 1 (as `_new_epoch`). A prior scale that stops
+  being applied returns the drift estimate's odometry scale to its own evidence's least squares
+  (`Drift.evidence_scale`, 1 without evidence) and re-places the drifting keyframes back. A
+  correction below `REPLACE_MIN_M` is zeroed before it propagates: a keyframe left in place
+  passes Δ_ref = 0. A new map's estimate starts in its first job's newest epoch (no restart
+  reported). Replayed again after it: the RGB-D maps, the monocular maps and the rev9_x3_c locate
+  proxy are identical to the first 2.18 run; rev9_x3_a changes 4 statuses (the whole-job rejection
+  moves from 06:24:27 to a one-frame job, 1 frame rejected `depth_inconsistent` as before; median
+  errors against 0.92: drifting fused 0.050 m, drifting kept 0.164, metric fused 0.016); rev9_x3_b
+  rejects two jobs whole (5 frames) and one frame: frames after the client's re-anchor (07:42:43,
+  07:44:01, 07:44:33) against 07:33:32_0004/0005, agreements 0.84-0.89 below the 0.90 threshold
+  with 15-87 see-through points: the false-rejection kind oms/2.19 takes up.
 * **Not done.** The region-level suspect test (design item v): a region misplaced by a scale error
   is re-placed instead; the false depth rejections of rev9_x3_b's arc are oms/2.19's (range- and
   rotation-aware margins). Demoting metric priors to drifting (item iii): unnecessary with one
