@@ -2661,6 +2661,41 @@ server.
   the chord for 0.4 m, no free cell on the line, ≥ 50 % occupied (beside the line included) — and
   ≤ 2 m long; the shortest one per gap (2.5 m let furniture gaps through: 11 → 18 passages on
   the house bench, doors unchanged).
+* **A chord must cut the free space** (`navgrid._separates`; bug fix, no API change). Each
+  chord (plain, after narrowing, or a door's) is cut together with the chords kept before it and
+  judged within 3 m of its midpoint (`SEPARATE_M`), its sides voted as `features` votes (the
+  commonest region 1–3 cells off its midpoint each side). *no*: its sides still connect, or one
+  side has no part of 0.25 m² (`MIN_REGION_M2`) beside its midpoint: not kept, suppresses no
+  other chord of the gap; *beside*: they were apart
+  already (a chord beside a kept one): dropped; *pocket*: it cuts off less than 1 m²
+  (`POCKET_M2`) on a side: suppresses the chords beside it as before and goes to the global test;
+  *cuts*: kept. 3 m holds the detour around an obstacle beside a gap (within a door's width,
+  2 m, of it) and is less than a room, so a doorway is not judged through the room's other
+  doorways before they are cut; chords that cut only together (two doorways nearer than 3 m)
+  still go to the global test unless they cross a kept chord or lie beside one (`_together`). A
+  door object takes the best-ranked chord that cuts, else the shortest of a door's width or
+  walled that cuts, else its old pick for the global test, unless its midpoint lies within
+  0.3 m of a cut chord's; no door object gets a chord when one already found (cut, a pocket's,
+  or an earlier door's fallback) passes within 0.6 m of it. **Specks** (`navgrid._specks`):
+  8-connected occupied pieces under 0.05 m² (as `DROP_MIN_M2`) with only free cells around them
+  count as free in the chord search — no chord ends on one, none is wall evidence — and stay
+  obstacles for the regions and for `width_m`: the longest free run along the chord
+  (`navgrid._blocked`, sampled every quarter cell), so a chair leg in a doorway still narrows it.
+* **Pockets** (`navgrid._pockets`). A region under 1 m² (`POCKET_M2`) that a chord bounds is
+  merged, smallest first, into its smallest neighbour across one of its chords, that chord
+  dropped, until none is left: a niche, a corner or a slice of a corridor is no place of its own
+  (1 m² is about the smallest room a robot is sent to, a WC; 0.25 m², `MIN_REGION_M2`, only
+  drops slivers). A closed pit 1.1 × 2 m therefore has no passage (no narrowing; its halves are
+  pockets), a 3 m one a single passage; a corridor is cut in parts of 1 m² at least. Passages
+  to such pockets, which the old code reported (e305 14, x3_a 19, ax 71 over 20 versions), are
+  gone. Region and passage counts over 20 archived versions, before → after: e305 44 → 32
+  regions, 23 → 11 passages; rev8_wheeled_depth 12 → 11, 6 → 5; rev9_x3_a 122 → 122,
+  113 → 66; rev9_ax_a 137 → 147, 190 → 143. On rev9_ax_a the 1.5 m opening at (0.6, −2.9)
+  that vanished at v54 (a blob grown on its west jamb plus specks: the 0.47–0.52 m chords left
+  free channels beside them) stays a passage: v54 0.91 m between 25.9 and 20.8 m² instead of one
+  53.9 m² region; v55–v58 0.30 m, where the grid shows the blob across most of the opening (its
+  free width). Passages that flickered for the same reason now persist (rev9_ax_a (−0.42, −7.2)
+  from v41, rev9_x3_a (−3.65, −7.67) v17–v23, (−6.54, −6.77) from v22).
 * **Door objects' passages.** For each door-labelled object of the version that no chord passes
   within 0.6 m of: through the free cells within 1 m of it, every 10°, the free chords 0.55–2.5 m
   wide (a 2 m double door) across the gap (their midpoint at least 0.4 of their length from any obstacle) that lie in

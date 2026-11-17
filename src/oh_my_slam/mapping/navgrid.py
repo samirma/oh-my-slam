@@ -42,7 +42,13 @@ through every free cell on the medial axis of the free space (its clearance a lo
 some direction) with a clearance below ``PASSAGE_MAX_W / 2``, the chord toward its nearest
 obstacle and on to the opposite one, refined to the shortest within ``CHORD_REFINE_DEG``. A chord
 is kept when the obstacle goes on beyond both of its ends along its line (``_walled``: a gap
-between furniture, or between furniture and a wall, is no passage), the shortest one of each gap.
+between furniture, or between furniture and a wall, is no passage) and it cuts the free space
+there (``_separates``: its two sides do not connect within ``SEPARATE_M``, with the chords kept
+before it cut), the shortest one of each gap; a chord that cuts nothing neither wins a door's
+ranking nor suppresses the chords beside it (those that cut only together are kept for the test
+below: ``_together``). Isolated occupied specks (``_specks``) are no jamb and no wall. A
+region smaller than ``POCKET_M2`` that a chord bounds is a pocket, merged back into its
+neighbour, the chord dropped (``_pockets``).
 Its ends are the jambs, its length the clear width (the free width at the narrowest point: an
 open leaf is an obstacle), its midpoint the centre, its normal the crossing direction. Every chord
 is cut out of the free space, and the connected parts are the regions (at least
@@ -57,6 +63,7 @@ runs of at least ``MIN_FRONTIER_M``."""
 from __future__ import annotations
 
 import io
+import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -132,6 +139,10 @@ LEAF_SAMPLES = 5  # _box_leaf: a box footprint sampled on this many points per s
 PASSAGE_FRONTIER_M = 1.0  # a passage to a never-observed side: its frontier is this near
 PASSAGE_FRONTIER_BEHIND_M = 0.1  # ... and not farther than this behind the jamb line
 LEAF_WALL_M = 0.15  # cells farther than this from the jamb line, near a jamb, are leaf cells
+SEPARATE_M = 3.0  # _separates: a chord's two sides must not connect within this of its midpoint
+POCKET_M2 = 1.0  # a region smaller than this is a pocket (_pockets): no place of its own
+BLOCK_STEP = 0.25  # _blocked: a chord sampled every this (cells)
+SPECK_M2 = 0.05  # _specks: an occupied piece smaller than this, free all around, is no obstacle
 
 UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 FLOOR_BY_RULE = 2  # floor_observed: free by rule (camera stand, blind disc), floor not seen
@@ -969,13 +980,18 @@ def _chord_at(free: NDArray[np.bool_], p: Array, theta: float, max_t: float
     return t1 + t2, p + u * t1, p - u * t2, c1, c2
 
 
-def _passage_chords(state: NDArray[np.uint8], cell: float
-                    ) -> list[tuple[float, Array, Array, tuple[int, int] | None, tuple[int, int] | None]]:
+def _passage_chords(state: NDArray[np.uint8], cell: float,
+                    cut_free: NDArray[np.bool_] | None = None
+                    ) -> tuple[list[Any], list[Any], list[Any]]:
     """The passages' chords: through every free cell on the ridge of the clearance (its distance
     to anything not free a local maximum) with a clearance below ``PASSAGE_MAX_W / 2``, the chord
     toward its nearest obstacle, refined to the shortest within ``CHORD_REFINE_DEG``; kept when it
-    lies in a wall (``_walled``), the shortest of those whose centres lie within half its length
-    or ``NMS_M`` of each other, then narrowed beside it (``_narrowest``)."""
+    lies in a wall (``_walled``), narrowed beside it (``_narrowest``) and cuts the free space
+    (``cut_free``, else ``state``'s; ``_separates``, with the chords kept before it), the
+    shortest of those whose centres lie within half its length or ``NMS_M`` of each other: a chord
+    that does not cut the free space suppresses none. (kept, rest, pockets): ``rest`` the chords
+    that cut nothing alone, or only a pocket, the shortest per gap beside no kept one
+    (``_together``); ``pockets`` those of them that cut off a pocket."""
     free = state == FREE
     edt, idx = ndimage.distance_transform_edt(np.pad(free, 1), return_indices=True)
     edt = edt[1:-1, 1:-1]
@@ -1007,29 +1023,57 @@ def _passage_chords(state: NDArray[np.uint8], cell: float
             if L * cell <= PASSAGE_MAX_W and _walled(state, e1, e2, cell):
                 found.append((L, P[k], float(theta[k])))
     out: list[tuple[float, Array, Array, tuple[int, int] | None, tuple[int, int] | None]] = []
+    rest: list[tuple[float, Array, Array, tuple[int, int] | None, tuple[int, int] | None]] = []
     centres: list[tuple[Array, float]] = []
+    left: list[tuple[Array, float, Any]] = []  # chords that do not separate the free space alone
+    pockets: list[Any] = []  # those of rest that cut off a pocket
+    barrier = np.zeros(state.shape, np.uint8)
+    cut_free = state == FREE if cut_free is None else cut_free
+
+    def near(p: Array) -> bool:
+        return any(float(np.linalg.norm(p - q)) * cell < max(Lq * cell / 2, NMS_M)
+                   for q, Lq in centres)
+
+    def accept(p: Array, L: float, narrow: Any, into: list[Any]) -> None:
+        centres.append((p, L))
+        mid = (narrow[1] + narrow[2]) / 2
+        if all(float(np.linalg.norm(mid - (o[1] + o[2]) / 2)) * cell >= NMS_M
+               for o in [*out, *rest]):
+            into.append(narrow)
+            if into is out:
+                _draw(barrier, narrow[1], narrow[2])
+
     for _, p, th in sorted(found, key=lambda f: (f[0], f[1][1], f[1][0])):
-        if any(float(np.linalg.norm(p - q)) * cell < max(Lq * cell / 2, NMS_M)
-               for q, Lq in centres):
+        if near(p):
             continue
         walled = [ch for ch in (_chord_at(free, p, th + math.radians(a), max_t)
                                 for a in np.arange(-CHORD_REFINE_DEG, CHORD_REFINE_DEG + 0.5, 1.0))
                   if _walled(state, ch[1], ch[2], cell)]
         best = min(walled, key=lambda ch: round(ch[0], 6)) if walled else \
             _chord_at(free, p, th, max_t)
-        centres.append((p, best[0]))
         narrow = _narrowest(free, best, cell, max_t, state)
-        mid = (narrow[1] + narrow[2]) / 2
-        if all(float(np.linalg.norm(mid - (o[1] + o[2]) / 2)) * cell >= NMS_M for o in out):
-            out.append(narrow)
-    return out
+        cuts = _separates(cut_free, barrier, narrow, cell)
+        if cuts == "cuts":
+            accept(p, best[0], narrow, out)
+        elif cuts == "pocket":  # suppressing the chords beside it, as before, for features' test
+            n_rest = len(rest)
+            accept(p, best[0], narrow, rest)
+            pockets += rest[n_rest:]
+        elif cuts == "no":  # neither kept nor suppressing the chords beside it, for now
+            left.append((p, best[0], narrow))
+    # those that may cut it only together, the shortest per gap
+    for p, L, narrow in left:
+        if not near(p):
+            accept(p, L, narrow, rest)
+    return out, rest, pockets
 
 
 def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
-                 doors: Sequence[Sequence[float]]
-                 ) -> list[tuple[float, Array, Array, tuple[int, int] | None,
-                                 tuple[int, int] | None]]:
-    """The chords of the door-labelled objects no chord passes near (within ``DOOR_OBJECT_M``):
+                 doors: Sequence[Sequence[float]], cut_free: NDArray[np.bool_] | None = None,
+                 others: Sequence[Any] = ()) -> tuple[list[Any], list[Any]]:
+    """The chords of the door-labelled objects no chord passes near (within ``DOOR_OBJECT_M``;
+    ``chords``, the cut ones, ``others``, the pockets' chords, and the doors' before, fallbacks
+    included):
     a wall seen from one side, or partly, or hidden behind open leaves, need not pass
     ``_walled``, but a door object says where the gap is. Through the free cells within
     ``DOOR_SEARCH_M`` of the door, every ``DOOR_CHORD_STEP_DEG``, the free chords that end on
@@ -1037,22 +1081,32 @@ def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
     gap (their midpoint's clearance ``DOOR_CLEAR_SHARE`` of their length at least): of those that
     lie in the door's wall line (``_door_walled``) and end on occupied cells, or on a jamb hidden
     behind an open leaf (unknown, with the wall going on beyond it), the one with most wall seen
-    beyond its ends, then the shortest; else (a door
-    seen partly) the shortest ending on occupied cells of a door's width (up to ``DOOR_MAX_W``).
-    Then narrowed beside it (``_narrowest``): open leaves count as obstacles."""
+    beyond its ends, then the shortest; else (a door seen partly) the shortest ending on occupied
+    cells of a door's width (up to ``DOOR_MAX_W``) or in a wall (``_walled``). Then narrowed
+    beside it (``_narrowest``): open leaves count as obstacles. Only a chord that cuts the free
+    space (``cut_free``, else ``state``'s), with ``chords`` and the doors' chords before it
+    (``_separates``, before and after narrowing), is picked. (picked, rest): ``rest`` the
+    pick of the rules alone (of a door's width) of each door where none does, unless its
+    midpoint lies within ``NMS_M`` of a cut chord's (``_together``)."""
     free = state == FREE
+    cut_free = free if cut_free is None else cut_free
     cell = lay.cell
     max_t = CHORD_MAX_M / cell
     clear = ndimage.distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1]
+    barrier = np.zeros(state.shape, np.uint8)
+    for ch in chords:
+        _draw(barrier, ch[1], ch[2])
     out: list[Any] = []
+    rest: list[Any] = []
     for d in doors:
         c = np.array([(d[0] - lay.origin[0]) / cell, (d[1] - lay.origin[1]) / cell])
         if any(_segment_distance(c, ch[1], ch[2]) * cell <= DOOR_OBJECT_M
-               for ch in [*chords, *out]):
+               for ch in [*chords, *others, *out, *rest]):
             continue
         k = math.ceil(DOOR_SEARCH_M / cell)
         r0, c0 = math.floor(c[1]), math.floor(c[0])
-        best, best_any, best_key = None, None, (0, 0.0)
+        ranked: dict[Any, tuple[Any, Any]] = {}  # per pair of end cells: (key, chord)
+        other: dict[Any, tuple[Any, Any]] = {}
         for r in range(max(r0 - k, 0), min(r0 + k + 1, state.shape[0])):
             for cc in range(max(c0 - k, 0), min(c0 + k + 1, state.shape[1])):
                 if not free[r, cc] or math.hypot(r - r0, cc - c0) > k:
@@ -1071,16 +1125,205 @@ def _door_chords(state: NDArray[np.uint8], lay: Layers, chords: Sequence[Any],
                                                   zip(ends, walled[:2], strict=True)):
                         # the most wall beyond its ends (the wall line, not a chord between
                         # two open leaves), then the shortest
-                        key = (-round(walled[2] / cell), ch[0])
-                        if best is None or key < best_key:
-                            best, best_key = ch, key
-                    elif ends == (OCCUPIED, OCCUPIED) and w <= DOOR_MAX_W and \
-                            (best_any is None or ch[0] < best_any[0]):
-                        best_any = ch
-        pick = best if best is not None else best_any
+                        _rank(ranked, (ch[3], ch[4]), (-round(walled[2] / cell), ch[0]), ch)
+                    elif ends == (OCCUPIED, OCCUPIED):
+                        _rank(other, (ch[3], ch[4]), (ch[0],), ch)
+        # the best that cuts the free space; else the shortest of a door's width, or in a wall,
+        # that does; else the best of the rules alone, for features' test
+        first = sorted(ranked.values(), key=lambda kc: kc[0])
+        second = sorted(other.values(), key=lambda kc: kc[0])
+        door_wide = [ch for _, ch in second if (ch[0] + 2 * JAMB_IN_CELL) * cell <= DOOR_MAX_W]
+        pick = None
+        for ch in itertools.chain((ch for _, ch in first), (
+                ch for _, ch in second if (ch[0] + 2 * JAMB_IN_CELL) * cell <= DOOR_MAX_W
+                or _walled(state, ch[1], ch[2], cell))):
+            if _separates(cut_free, barrier, ch, cell) == "cuts" and _separates(
+                    cut_free, barrier, narrow := _narrowest(free, ch, cell, max_t, state),
+                    cell) == "cuts":
+                pick = narrow
+                break
         if pick is not None:
-            out.append(_narrowest(free, pick, cell, max_t, state))
+            out.append(pick)
+            _draw(barrier, pick[1], pick[2])
+            continue
+        fallback = first[0][1] if first else door_wide[0] if door_wide else None
+        if fallback is not None:
+            narrow = _narrowest(free, fallback, cell, max_t, state)
+            mid = (narrow[1] + narrow[2]) / 2
+            if all(float(np.linalg.norm(mid - (o[1] + o[2]) / 2)) * cell >= NMS_M
+                   for o in [*chords, *out]):
+                rest.append(narrow)
+    return out, rest
+
+
+def _together(free: NDArray[np.bool_], chords: Sequence[Any], rest: Sequence[Any], cell: float
+              ) -> list[Any]:
+    """The chords of ``rest`` (none cutting the free space alone) that may cut it together (two
+    doorways between the same rooms, nearer each other than ``SEPARATE_M``), for ``features``'
+    test as before: those that neither cross one of ``chords`` (the cut ones), nor lie beside one
+    (``_separates`` "beside"), nor have their midpoint within ``NMS_M`` of an earlier one's (a
+    door's chord found by the plain search too)."""
+    barrier = np.zeros(free.shape, np.uint8)
+    for ch in chords:
+        _draw(barrier, ch[1], ch[2])
+    out: list[Any] = []
+    for ch in rest:
+        line = np.zeros(free.shape, np.uint8)
+        _draw(line, ch[1], ch[2])
+        mid = (ch[1] + ch[2]) / 2
+        if not (line & barrier).any() and _separates(free, barrier, ch, cell) != "beside" and \
+                all(float(np.linalg.norm(mid - (o[1] + o[2]) / 2)) * cell >= NMS_M for o in out):
+            out.append(ch)
     return out
+
+
+def _pockets(free: NDArray[np.bool_], chords: Sequence[Any], cell: float) -> list[Any]:
+    """``chords`` but those that cut off pockets: a region smaller than ``POCKET_M2`` (a niche, a
+    corner, a slice of a corridor: no place of its own) is merged, smallest first, into its
+    smallest neighbour across one of the chords that bound it, that chord dropped, until no
+    chord bounds one."""
+    chords = list(chords)
+    fixed: set[int] = set()  # pockets no chord bounds, by their first cell
+    order = np.arange(free.size).reshape(free.shape)
+    while True:
+        barrier = np.zeros(free.shape, np.uint8)
+        for ch in chords:
+            _draw(barrier, ch[1], ch[2])
+        parts, n = ndimage.label(free & (barrier == 0))
+        area = np.bincount(parts.ravel(), minlength=n + 1) * cell * cell
+        labels = np.where(area[parts] >= MIN_REGION_M2, parts, 0)
+        first = ndimage.minimum(order, parts, np.arange(n + 1))
+        small = [i for i in range(1, n + 1)
+                 if MIN_REGION_M2 <= area[i] < POCKET_M2 and int(first[i]) not in fixed]
+        if not small:
+            return chords
+        p = min(small, key=lambda i: (area[i], int(first[i])))
+        sides = [_sides(labels, ch[1], ch[2]) for ch in chords]
+        bound = [k for k, sd in enumerate(sides) if p in sd]
+        if not bound:
+            fixed.add(int(first[p]))
+            continue
+        del chords[min(bound, key=lambda k: (area[sum(sides[k]) - p], k))]
+
+
+def _rank(best: dict[Any, tuple[Any, Any]], ends: Any, key: Any, ch: Any) -> None:
+    """Keep in ``best`` the chord of lowest ``key`` per pair of end cells."""
+    if ends not in best or key < best[ends][0]:
+        best[ends] = (key, ch)
+
+
+def _draw(barrier: NDArray[np.uint8], e1: Array, e2: Array) -> None:
+    """Draw a chord (ends in cell coordinates) into ``barrier``, as ``features`` cuts it."""
+    import cv2
+
+    cv2.line(barrier, (math.floor(e1[0]), math.floor(e1[1])),
+             (math.floor(e2[0]), math.floor(e2[1])), 1, 1)
+
+
+def _sides(labels: NDArray[Any], e1: Array, e2: Array, offset: tuple[int, int] = (0, 0)
+           ) -> list[int]:
+    """The labels on a chord's two sides: of the cells 1 to 3 cells off its midpoint along its
+    normal, the commonest non-zero label per side (0: none). ``offset``: the (row, col) of
+    ``labels``' first cell."""
+    return [lab for lab, _ in _side_cells(labels, e1, e2, offset)]
+
+
+def _side_cells(labels: NDArray[Any], e1: Array, e2: Array, offset: tuple[int, int]
+                ) -> list[tuple[int, tuple[int, int]]]:
+    """``_sides``, each with the first of its cells holding that label (in ``labels``)."""
+    R, C = labels.shape
+    u = (e2 - e1) / max(float(np.linalg.norm(e2 - e1)), 1e-9)
+    n = np.array([-u[1], u[0]])
+    mid = (e1 + e2) / 2
+    sides = []
+    for sgn in (-1, 1):
+        votes: dict[int, int] = {}
+        first: dict[int, tuple[int, int]] = {}
+        for t in np.arange(1.0, 3.5, 0.5):
+            x, y = mid + sgn * n * t
+            r, c = math.floor(y) - offset[0], math.floor(x) - offset[1]
+            if 0 <= r < R and 0 <= c < C and labels[r, c] > 0:
+                votes[int(labels[r, c])] = votes.get(int(labels[r, c]), 0) + 1
+                first.setdefault(int(labels[r, c]), (r, c))
+        best = max(votes, key=lambda v: votes[v]) if votes else 0
+        sides.append((best, first.get(best, (0, 0))))
+    return sides
+
+
+def _blocked(state: NDArray[np.uint8], e1: Array, e2: Array) -> float:
+    """How much (cells) of a chord (ends in cell coordinates) lies outside its longest run of
+    cells that are not occupied: a speck the chord search took as free (a chair leg, perhaps)
+    still narrows the width a robot passes. Sampled at the middles of steps of about
+    ``BLOCK_STEP`` cell (never on its ends, which lie on the jambs' boundaries)."""
+    L = float(np.linalg.norm(e2 - e1))
+    n = max(1, math.ceil(L / BLOCK_STEP))
+    q = e1[None] + (e2 - e1)[None] * ((np.arange(n) + 0.5) / n)[:, None]
+    R, C = state.shape
+    x = np.clip(np.floor(q[:, 0]).astype(np.int64), 0, C - 1)
+    y = np.clip(np.floor(q[:, 1]).astype(np.int64), 0, R - 1)
+    occ = np.flatnonzero(state[y, x] == OCCUPIED)
+    free_run = int(np.max(np.diff(np.concatenate([[-1], occ, [n]])) - 1))
+    return L - free_run * L / n
+
+
+def _specks(state: NDArray[np.uint8], cell: float) -> NDArray[np.bool_]:
+    """The isolated occupied specks: 8-connected pieces of occupied cells smaller than
+    ``SPECK_M2`` (as ``DROP_MIN_M2``), every cell around them free (not unknown, a drop or the
+    grid's edge) — depth noise in a doorway, a chair leg: no jamb a chord ends on, no wall."""
+    occ = state == OCCUPIED
+    eight = np.ones((3, 3), bool)
+    lab, n = ndimage.label(occ, structure=eight)
+    small = np.bincount(lab.ravel(), minlength=n + 1) * cell * cell < SPECK_M2
+    small[0] = False
+    other = np.pad(~occ & (state != FREE), 1, constant_values=True)
+    small[lab[occ & ndimage.binary_dilation(other, eight)[1:-1, 1:-1]]] = False
+    return small[lab]
+
+
+def _parts(cut: NDArray[np.bool_], cell: float, min_m2: float = MIN_REGION_M2
+           ) -> NDArray[np.int32]:
+    """The connected parts of ``cut`` as ``features`` labels its regions: parts smaller than
+    ``MIN_REGION_M2`` are 0."""
+    parts, n = ndimage.label(cut)
+    big = np.bincount(parts.ravel(), minlength=n + 1) * cell * cell >= min_m2
+    big[0] = False
+    return np.where(big[parts], parts, 0).astype(np.int32)
+
+
+def _cut(free: NDArray[np.bool_], barrier: NDArray[np.uint8], ch: Any, cell: float,
+         min_m2: float = MIN_REGION_M2) -> tuple[list[int], list[int]]:
+    """A chord's two sides (``_sides``, of the parts ``_parts`` labels) within ``SEPARATE_M``
+    of its midpoint, with the chords drawn in ``barrier`` and it: the labels, without it, of the
+    cells that give them, and the labels with it."""
+    mid = (ch[1] + ch[2]) / 2
+    k = math.ceil(SEPARATE_M / cell)
+    r0, c0 = max(math.floor(mid[1]) - k, 0), max(math.floor(mid[0]) - k, 0)
+    win = barrier[r0:math.floor(mid[1]) + k + 1, c0:math.floor(mid[0]) + k + 1].copy()
+    near = free[r0:r0 + win.shape[0], c0:c0 + win.shape[1]]
+    before = _parts(near & (win == 0), cell, min_m2)
+    _draw(win, ch[1] - (c0, r0), ch[2] - (c0, r0))
+    after = _side_cells(_parts(near & (win == 0), cell, min_m2), ch[1], ch[2], (r0, c0))
+    return [int(before[rc]) for _, rc in after], [lab for lab, _ in after]
+
+
+def _separates(free: NDArray[np.bool_], barrier: NDArray[np.uint8], ch: Any, cell: float
+               ) -> str:
+    """How a chord (ends in cell coordinates) cuts the free space, with the chords already drawn
+    in ``barrier`` (``_cut``), as ``features`` judges a passage but locally: within
+    ``SEPARATE_M`` of its midpoint (a doorway's chord is judged before the room's other doorways
+    are cut; the window holds the detour around an obstacle beside a gap — a door's width,
+    ``PASSAGE_MAX_W``, beyond the gap — but rarely a loop through another doorway).
+    ``"no"``: its two sides still connect, or one has no region beside its midpoint (a chord
+    along an obstacle's face); ``"beside"``: the regions on its two sides were apart already (a
+    chord beside one drawn: it adds nothing); ``"pocket"``: it cuts off less than ``POCKET_M2``
+    on a side (a corner, a niche: no room of its own); ``"cuts"``: it splits two regions of
+    ``POCKET_M2`` at least."""
+    before, after = _cut(free, barrier, ch, cell)
+    if after[0] == after[1] or 0 in after:
+        return "no"
+    if before[0] != before[1]:
+        return "beside"
+    return "pocket" if 0 in _cut(free, barrier, ch, cell, POCKET_M2)[1] else "cuts"
 
 
 def _segment_distance(p: Array, a: Array, b: Array) -> float:
@@ -1352,16 +1595,17 @@ def features(lay: Layers, footprint_radius: float | None = None,
     free = state == FREE
     R, C = state.shape
     cell = lay.cell
-    chords = _passage_chords(state, cell)
-    chords += _door_chords(state, lay, chords, doors)
+    # the chords are looked for with isolated specks as free (no jamb, no wall), and must cut the
+    # free space as it is
+    search = np.where(_specks(state, cell), FREE, state).astype(np.uint8)
+    kept, left, pockets = _passage_chords(search, cell, free)
+    picked, fallback = _door_chords(search, lay, kept, doors, free, pockets)
+    chords = _pockets(free, kept + picked + _together(free, kept + picked, left + fallback, cell),
+                      cell)
     # cut the chords out of the free space; the parts are the regions
-    import cv2
-
     barrier = np.zeros((R, C), np.uint8)
     for _, e1, e2, *_ in chords:
-        for pt_a, pt_b in ((e1, e2),):
-            cv2.line(barrier, (math.floor(pt_a[0]), math.floor(pt_a[1])),
-                     (math.floor(pt_b[0]), math.floor(pt_b[1])), 1, 1)
+        _draw(barrier, e1, e2)
     cut = free & (barrier == 0)
     parts, n_parts = ndimage.label(cut)
     areas = ndimage.sum(cut, parts, np.arange(1, n_parts + 1)) * cell * cell
@@ -1407,16 +1651,7 @@ def features(lay: Layers, footprint_radius: float | None = None,
     for _, e1, e2, _c1, _c2 in chords:
         u = (e2 - e1) / max(float(np.linalg.norm(e2 - e1)), 1e-9)
         n = np.array([-u[1], u[0]])
-        mid = (e1 + e2) / 2
-        sides = []
-        for sgn in (-1, 1):
-            votes: dict[int, int] = {}
-            for t in np.arange(1.0, 3.5, 0.5):
-                x, y = mid + sgn * n * t
-                r, c = math.floor(y), math.floor(x)
-                if 0 <= r < R and 0 <= c < C and labels[r, c] > 0:
-                    votes[int(labels[r, c])] = votes.get(int(labels[r, c]), 0) + 1
-            sides.append(max(votes, key=lambda v: votes[v]) if votes else 0)
+        sides = _sides(labels, e1, e2)
         if sides[0] == sides[1]:  # one region on both sides (or none): no narrowing between
             continue
         # the jambs' faces lie inside the cells the chord ends on: half a cell beyond its ends
@@ -1425,7 +1660,7 @@ def features(lay: Layers, footprint_radius: float | None = None,
             - u * cell * JAMB_IN_CELL
         j2 = np.array([lay.origin[0] + e2[0] * cell, lay.origin[1] + e2[1] * cell]) \
             + u * cell * JAMB_IN_CELL
-        width = float(np.linalg.norm(j2 - j1))
+        width = float(np.linalg.norm(j2 - j1)) - _blocked(state, e1, e2) * cell
         centre = (j1 + j2) / 2
         frontier = None
         if 0 in sides:  # a doorway whose far side was never observed: regions [a, null]
