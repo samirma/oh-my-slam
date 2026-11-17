@@ -1,9 +1,13 @@
 """oms/2.19: a depth pair fails only on a supported contradiction (map.md §4 "Depth
 consistency"), and a rotation-only fit far from its metric prior on a thin depth confirmation is
 too loose to confirm it (map.md §2 "Thin rotation-only fits")."""
+import logging
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
+import pytest
 
 from oh_my_slam.mapping import anchored as an
 from oh_my_slam.mapping import standpoint as sp
@@ -47,3 +51,44 @@ def test_a_thin_rotation_only_fit_does_not_confirm_a_metric_prior(tmp_path: Path
                  confirmed=an.ROTATION_CONFIRM_MIN - 1)
     img = (s, 20, 0.5, "rotation", 0.02, 0.5, None, None)
     assert m._image_conflict(f, img, [], T0, 0.02, 1.0) is None
+
+
+def _conflict(tmp_path: Path, p: str, deg: float, confirmed: int | None,
+              method: str = "rotation") -> Any:
+    """``_image_conflict`` of a frame at ``base_pose(0)`` with a prior of trust ``p`` (rotation
+    sigma 1 deg) for an image pose turned ``deg`` about its centre, confirmed on ``confirmed``
+    agreeing points."""
+    m = new_map(tmp_path / f"{p}-{deg}-{confirmed}-{method}")
+    T0 = base_pose(0.0)
+    f = frame("r", T0, p=p)
+    R = an.exp_so3(np.array([0.0, np.radians(deg), 0.0])) @ T0[:3, :3]
+    s = an.Solve(R, T0[:3, 3].copy(), np.eye(6) * 1e-6, np.ones(20, bool), 0.5,
+                 confirmed=confirmed)
+    sub = (None, None, None, np.zeros(0, np.intp))
+    refs = SimpleNamespace(median=np.array([2.0]))
+    img = (s, 20, 0.5, method, 0.02, 0.5, sub, refs)
+    return m._image_conflict(f, img, [], T0, 0.02, 1.0)
+
+
+def test_the_thin_rotation_only_rule_fires_only_where_it_applies(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The rule does not fire for a drifting prior, for a rotation within ``ROTATION_PRIOR_K``
+    x the prior's rotation sigma, for a confirmation of ``ROTATION_CONFIRM_MIN`` agreeing points
+    or more, for a pose without a depth confirmation, nor for a points fit: each is tested as
+    before (a residual and the conflict bound), never loose by this rule."""
+    thin = an.ROTATION_CONFIRM_MIN - 1
+    caplog.set_level(logging.INFO, logger=an.log.name)
+    for p, deg, confirmed, method in (
+            ("drifting", 2.5, thin, "rotation"),
+            ("metric", 1.5, thin, "rotation"),  # within 2 sigma of the prior
+            ("metric", 2.5, an.ROTATION_CONFIRM_MIN, "rotation"),
+            ("metric", 2.5, None, "rotation"),
+            ("metric", 2.5, thin, "pnp")):
+        got = _conflict(tmp_path, p, deg, confirmed, method)
+        assert got is not None, (p, deg, confirmed, method)
+        dp, dr, _, _ = got
+        assert dr == pytest.approx(deg, abs=1e-6)
+    assert not any("too loose to confirm it" in r.getMessage() for r in caplog.records)
+    # and the case it applies to, through the same helper
+    assert _conflict(tmp_path, "metric", 2.5, thin) is None
+    assert any("too loose to confirm it" in r.getMessage() for r in caplog.records)
