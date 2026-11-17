@@ -294,8 +294,8 @@ updates. A new frame whose committed view contradicts a stored keyframe's sensor
 frames involved (two new frames contradicting each other are both rejected; a frame of any
 depth kind registered only through rejected frames goes with them); the job registers again without them, in rounds
 to a fixed point, and the rest commits when it passes every limit. The whole update is still
-rejected `depth_inconsistent` when the frames rejected for a contradiction are more than half of
-its depth frames (a lattice-registered sequence) or a contradiction remains; that last round's
+rejected `depth_inconsistent` when the frames so rejected (with their dependents) are more than
+half of its registered frames (a lattice-registered sequence) or a contradiction remains; that last round's
 decision is reported with `applied: false`. A stored keyframe contradicted by
 at least three new frames that are anchored in the stored map, agree with a stored keyframe
 they were not registered against, contradict no other stored keyframe, and no two of which fail

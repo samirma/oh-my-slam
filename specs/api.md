@@ -495,9 +495,10 @@ error code `invalid_request` (§9).
     frames is rejected with them. The job registers again without them, and the rest commits
     when it passes every limit.
   * The update is rejected whole (`failed_checks` `depth_inconsistent`, as before oms/2.16)
-    only when the frames rejected for a contradiction (not those rejected as dependents) are
-    more than half of its frames that registered with a depth image (a lattice-registered
-    sequence is most of its update), or a contradiction remains after the re-runs. A one-frame
+    only when the frames rejected `depth_inconsistent` (for a contradiction or as
+    dependents) are more than half of its frames registered in its first registration, of any
+    depth kind (a lattice-registered sequence is most of its update), or a contradiction
+    remains after the re-runs. A one-frame
     update whose frame contradicts is rejected whole. The last round's decision is still
     reported, flagged `applied: false` on its `depth_pairs` rows and `suspect_keyframes`
     entries.

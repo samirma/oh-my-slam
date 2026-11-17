@@ -154,37 +154,38 @@ def test_contradictors_that_disagree_or_contradict_others_mark_nothing() -> None
 def test_plan_depth_rerun_rounds(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """``plan_depth_rerun`` applies a round: marks and unmarks keyframes, forces the rejected
     frames for the next registration; ends without a change. A round that would cross the share
-    (frames rejected for a contradiction only, dependents aside) or that is pending at the run
-    limit is not applied: the update is rejected whole and the round reported ``applied``
+    (frames rejected, for a contradiction or as dependents, over the frames registered in the
+    first registration) or that is pending at the run limit is not applied: the update is rejected whole and the round reported ``applied``
     false (its rows, its marks in ``depth_pending``)."""
     am = AnchoredMap(tmp_path / "m")
     am.keyframes = [Keyframe(k, f"s{i}", "cam", an.Intrinsics(1, 1, 0, 0, 2, 2), np.eye(4), 0.0,
                              0.0, "fused", None, "sensor") for i, k in enumerate(("k_s0", "k_s1"))]
     plans: list[Any] = []
     monkeypatch.setattr(sp, "depth_plan", lambda m, pls: plans.pop(0))
-    pls = [Placement(f"n{i}", "registered", inliers=40 + i) for i in range(4)]
+    pls = [Placement(f"n{i}", "registered", inliers=40 + i) for i in range(8)]
     plans.append(None)
     assert not am.plan_depth_rerun(pls)  # no new frame with sensor depth
     row = {("n0", "s0"): P("n0", "s0", 0.5).row("frame_rejected")}
     plans.append((row, sp.DepthResolution(reject={"n0": ("s0",), "n3": ("n0",)},
                                           contradict={"n0"},
-                                          mark={"k_s0": [{"name": "n1"}]}), 4))
-    assert am.plan_depth_rerun(pls) and am.depth_first == 4 and am.depth_runs == 1
+                                          mark={"k_s0": [{"name": "n1"}]}), 8))
+    assert am.plan_depth_rerun(pls) and am.depth_first == 8 and am.depth_runs == 1
     assert am.excluded()["n0"].reason == "depth_inconsistent"
     assert am.excluded()["n0"].depth_with == ("s0",) and am.excluded()["n0"].inliers == 40
-    assert am.excluded()["n3"].depth_with == ("n0",)  # a dependent: not counted for the share
-    assert am.depth_contradicting == {"n0"} and set(am.depth_rejected) == {"n0", "n3"}
+    assert am.excluded()["n3"].depth_with == ("n0",)  # a dependent: counted for the share
+    assert set(am.depth_rejected) == {"n0", "n3"}
     assert am.keyframes[0].suspect == {"contradicted_by": [{"name": "n1"}]}
     assert not am.keyframes[0].reference() and am.depth_rows == row and "depth" in am.reran
     plans.append(({}, sp.DepthResolution(veto={"k_s0"}), 3))
     assert am.plan_depth_rerun(pls) and am.keyframes[0].suspect is None
-    assert am.depth_vetoed == {"k_s0"} and am.depth_suspects == {} and am.depth_first == 4
+    assert am.depth_vetoed == {"k_s0"} and am.depth_suspects == {} and am.depth_first == 8
     plans.append(({("n1", "n2"): P("n1", "n2").row()}, sp.DepthResolution(), 3))
     assert not am.plan_depth_rerun(pls) and ("n1", "n2") in am.depth_rows  # the fixed point
-    # one more contradicting frame: 2 of 4, not more than half: applied
-    plans.append(({}, sp.DepthResolution(reject={"n1": ("s1",)}, contradict={"n1"}), 3))
-    assert am.plan_depth_rerun(pls) and am.depth_contradicting == {"n0", "n1"}
-    # a third would cross the share: not applied, reported as decided
+    # two more: 4 of 8 rejected, not more than half: applied
+    plans.append(({}, sp.DepthResolution(reject={"n1": ("s1",), "n4": ("n1",)},
+                                         contradict={"n1"}), 3))
+    assert am.plan_depth_rerun(pls) and set(am.depth_rejected) == {"n0", "n1", "n3", "n4"}
+    # a fifth would cross the share: not applied, reported as decided
     pend = {("n2", "s1"): P("n2", "s1", 0.5).row("frame_rejected"),
             ("n1", "s0"): P("n1", "s0", 0.5).row("keyframe_suspect"),
             ("n2", "s0"): P("n2", "s0", 0.5).row("keyframe_suspect"),
@@ -209,7 +210,7 @@ def test_plan_depth_rerun_rounds(tmp_path: Any, monkeypatch: pytest.MonkeyPatch)
     am.reran = set()
     am.begin_job()
     assert not am.depth_whole and am.depth_rows == {} and am.depth_first is None
-    assert am.depth_pending == {} and am.depth_contradicting == set()
+    assert am.depth_pending == {} and am.depth_rejected == {}
 
 
 def test_a_monocular_frame_resting_on_a_rejected_frame_goes_with_it() -> None:
@@ -356,16 +357,19 @@ def test_a_monocular_frame_registered_through_the_rejected_frame_goes_with_it(
         client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
     """A mixed RGB-D and monocular job: the sensor frame ``t1`` contradicts the stored views
     and is rejected; the monocular ``m0``, turned beyond the stored views' reach and registered
-    only through ``t1``, is rejected ``depth_inconsistent`` naming it; ``t0`` commits."""
+    only through ``t1``, is rejected ``depth_inconsistent`` naming it (2 of 4 registered frames,
+    not more than half); ``t0`` and ``t2`` commit."""
     fr, files = frames_for(client, [base_pose(30.0 * k) for k in range(3)], tag="s")
     assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
     _corrupt(monkeypatch, {"t1"})
-    fr, files = frames_for(client, [base_pose(45.0), base_pose(105.0)], tag="t")
+    fr, files = frames_for(client, [base_pose(45.0), base_pose(105.0), base_pose(15.0)],
+                           tag="t")
     fm, fmf = frames_for(client, [base_pose(160.0)], tag="m", depth=False)
     job = client.update("m", [*fr, *fm], {**files, **fmf})
     st = {i["name"]: i for i in job["inputs"]}
     assert job["state"] == "committed", job["quality"]
     assert st["t1"]["reason"] == "depth_inconsistent" and st["t0"]["status"] == "registered"
+    assert st["t2"]["status"] == "registered"
     assert st["m0"]["status"] == "rejected" and st["m0"]["reason"] == "depth_inconsistent"
     assert st["m0"]["depth_inconsistent_with"] == ["t1"]
 

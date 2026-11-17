@@ -1335,8 +1335,9 @@ def depth_plan(am: AnchoredMap, placed: list[Placement]
     """One round of the depth-consistency resolution (map.md §4, oms/2.16) of a job's
     placements ``placed`` at its registration fixed point (``AnchoredMap.plan_depth_rerun``):
     the round's ``quality.depth_pairs`` rows by pair (``outcome`` as this round decides), its
-    decision (``depth_resolve``) and the count of new frames paired with sensor depth; None
-    without such a frame."""
+    decision (``depth_resolve``) and the count of the job's registered frames, of any depth kind
+    (the whole-update share's population); None without a new frame paired with sensor
+    depth."""
     marked = set(am.depth_suspects)
     views, new, pls = _depth_views(am, placed, marked)
     if not new:
@@ -1358,7 +1359,7 @@ def depth_plan(am: AnchoredMap, placed: list[Placement]
         rejected = p.a in res.reject or p.b in res.reject
         rows[(p.a, p.b)] = p.row("keyframe_suspect" if sus else
                                  "frame_rejected" if rejected else "update_rejected")
-    return rows, res, len(new)
+    return rows, res, len(newd) + len(others)
 
 
 def depth_consistency(am: AnchoredMap, placed: list[Placement]

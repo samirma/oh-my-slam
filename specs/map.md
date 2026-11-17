@@ -1022,12 +1022,13 @@ becomes a job with a `job_id`. A job goes through these states:
     * **Whole-update rejection.** No consistent part of the update remains, and the hard limit
       rejects it (`failed_checks` `depth_inconsistent`, nothing committed, every frame keeping
       its status as resolved), when:
-      * the frames rejected in step 2 for a contradiction (over all rounds; frames rejected
-        in step 3 as dependents do not count) are more than `DEPTH_REJECT_MAX_SHARE`
-        (`README.md`: half) of the update's frames that registered with a sensor depth image in
-        its first registration (one population, top and bottom: the frames the limit pairs): a
-        sequence registered through a lattice pose is most of its update, and what remains of
-        it would be the lattice pose's own frames; or
+      * the frames rejected `depth_inconsistent` (over all rounds, in step 2 for a
+        contradiction and in step 3 as dependents, of any depth kind) are more than
+        `DEPTH_REJECT_MAX_SHARE` (`README.md`: half) of the update's frames registered in its
+        first registration, of any depth kind (one population, top and bottom): a sequence
+        registered through a lattice pose is most of its update, the frames contradicting the
+        first view and those registered through them, and what remains of it would be the
+        lattice pose's own frames; or
       * the run limit is reached with a decision still pending (a contradiction remains), or a
         failing pair that involves no suspect keyframe remains on the committed poses at the
         job's end.

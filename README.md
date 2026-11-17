@@ -884,22 +884,24 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   Monotone (rejections and withdrawn marks only grow; a withdrawn mark is never made again in
   the job, `depth_vetoed`), at most `DEPTH_RESOLVE_RUNS` = 3 re-runs; a failing pair left after
   them, or on the committed poses, rejects the update. *Whole update*: rejected when the frames
-  rejected for a contradiction (step 2, `DepthResolution.contradict`, cumulative
-  `depth_contradicting`; dependents do not count) exceed `DEPTH_REJECT_MAX_SHARE` = 0.5 of the
-  frames that registered with sensor depth in the first registration (`depth_first`: the
-  paired frames, one population top and bottom), or when the run limit is reached with a
-  decision pending. That round applies nothing (`depth_whole`) but is reported as decided: its
+  rejected `depth_inconsistent` (step 2's contradictions and step 3's dependents, any depth
+  kind, cumulative `depth_rejected`) exceed `DEPTH_REJECT_MAX_SHARE` = 0.5 of the job's frames
+  registered in the first registration, any depth kind (`depth_first`: one population top and
+  bottom), or when the run limit is reached with a decision pending. That round applies nothing (`depth_whole`) but is reported as decided: its
   `frame_rejected` / `keyframe_suspect` rows carry `applied: false`, its marks appear in
   `suspect_keyframes` with `applied: false` (`depth_pending`). Re-registered stored keyframes
   count as stored for step 2, are never marked nor witnesses, and a failing pair with one does
   not disqualify a suspect-test frame. A suspect keyframe is also left out of
   `standpoint.stored_views` (standpoint joins, rotation-check pairs): a lattice-registered sequence is most of its
   update, and a single failing frame is its whole update. The diag-lattice turn
-  (`test_a_lattice_locked_turn_is_depth_inconsistent`): f0, f3 and f4 fail their pairs (3 of the
-  7 paired frames, not most), f1, f2, f5 and f6 rested only on them and go as dependents, and f7
-  alone commits as the re-run's origin: the lattice commit never happens, but the update is not
-  rejected whole (it was until the audit counted dependents out of the share; a share of 0.4
-  rejects it whole). *Suspect*: at least `SUSPECT_MIN_FRAMES` = 3 new frames,
+  (`test_a_lattice_locked_turn_is_depth_inconsistent`): f0, f3 and f4 fail their pairs, f1, f2,
+  f5 and f6 rested only on them: 7 of the 7 frames registered in its first registration (f7
+  registers only in a re-run), rejected whole. Counting the
+  contradictions alone over the paired frames (3 of 7, tried in the audit) committed f7 alone
+  out of an 8-frame lattice look, a worse signal to a client than a clear rejection: the share
+  is the lattice detector, so dependents count, over all registered frames. `rev8_wheeled`
+  version 4: 1 of 4 registered frames (0007; 0008 keeps its prior after the re-run, no
+  dependent), applied. *Suspect*: at least `SUSPECT_MIN_FRAMES` = 3 new frames,
   each failing its pair with the keyframe, anchored (a stored keyframe among its references,
   not suspect, agrees with it: `DepthPair.agrees`, not failing and at least `MIN_AGREEING`
   counted points one way), agreeing with a stored keyframe that is not among its references
