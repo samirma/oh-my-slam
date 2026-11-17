@@ -291,14 +291,15 @@ Scale). New optional fields: the camera's
 **oms/2.16** is additive: a depth-consistency contradiction (map.md §4) rejects frames, not
 updates. A new frame whose committed view contradicts a stored keyframe's sensor depth is
 `rejected` with the new reason `depth_inconsistent` and `depth_inconsistent_with` naming the
-frames involved (two new frames contradicting each other are both rejected; a frame registered
-only through rejected frames goes with them); the job registers again without them, in rounds
+frames involved (two new frames contradicting each other are both rejected; a frame of any
+depth kind registered only through rejected frames goes with them); the job registers again without them, in rounds
 to a fixed point, and the rest commits when it passes every limit. The whole update is still
-rejected `depth_inconsistent` when the rejected frames are more than half of its depth frames
-(a lattice-registered sequence) or a contradiction remains. A stored keyframe contradicted by
+rejected `depth_inconsistent` when the frames rejected for a contradiction are more than half of
+its depth frames (a lattice-registered sequence) or a contradiction remains; that last round's
+decision is reported with `applied: false`. A stored keyframe contradicted by
 at least three new frames that are anchored in the stored map, agree with a stored keyframe
-they were not registered against, contradict no other stored keyframe and agree with each other
-is marked suspect instead (`quality.suspect_keyframes`): it keeps its pose and content but is
+they were not registered against, contradict no other stored keyframe, and no two of which fail
+their pair with each other (an unevaluated pair counts as agreement) is marked suspect instead (`quality.suspect_keyframes`): it keeps its pose and content but is
 no longer paired nor a registration or locate reference; the mark belongs to the committed
 version (frames reads: `depth_suspect_version`). `quality.depth_pairs` rows gain `outcome` and
 keep listing the rejected frames' pairs.

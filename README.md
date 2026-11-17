@@ -878,23 +878,34 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   the job, not re-registered by it); (2) failing pairs that involve no keyframe marked suspect
   in the job: a new frame's with a stored keyframe (a re-registered one counts as stored)
   rejects that frame; only in a round without any, a pair of two new frames rejects both;
-  (3) a new frame whose `Placement.refs` all belong to rejected frames goes with them
-  (transitively); rejected frames become `_exclude` placements (`depth_inconsistent`,
+  (3) a new frame of any depth kind (monocular ones too, `others` of `depth_resolve`: never
+  paired) whose `Placement.refs` all belong to rejected frames goes with them (transitively); rejected frames become `_exclude` placements (`depth_inconsistent`,
   `Placement.depth_with`), and when anything changed the job registers again from its start.
   Monotone (rejections and withdrawn marks only grow; a withdrawn mark is never made again in
   the job, `depth_vetoed`), at most `DEPTH_RESOLVE_RUNS` = 3 re-runs; a failing pair left after
   them, or on the committed poses, rejects the update. *Whole update*: rejected when the frames
-  rejected `depth_inconsistent` exceed `DEPTH_REJECT_MAX_SHARE` = 0.5 of the frames that
-  registered with sensor depth in the first registration (`depth_first`; the round that
-  crosses it applies nothing, `depth_whole`): a lattice-registered sequence is most of its
-  update (the diag-lattice turn of `test_a_lattice_locked_turn_is_depth_inconsistent`: 7 of
-  its 7 paired frames rejected in the first round), and a single failing frame is its whole
-  update. *Suspect*: at least `SUSPECT_MIN_FRAMES` = 3 new frames,
+  rejected for a contradiction (step 2, `DepthResolution.contradict`, cumulative
+  `depth_contradicting`; dependents do not count) exceed `DEPTH_REJECT_MAX_SHARE` = 0.5 of the
+  frames that registered with sensor depth in the first registration (`depth_first`: the
+  paired frames, one population top and bottom), or when the run limit is reached with a
+  decision pending. That round applies nothing (`depth_whole`) but is reported as decided: its
+  `frame_rejected` / `keyframe_suspect` rows carry `applied: false`, its marks appear in
+  `suspect_keyframes` with `applied: false` (`depth_pending`). Re-registered stored keyframes
+  count as stored for step 2, are never marked nor witnesses, and a failing pair with one does
+  not disqualify a suspect-test frame. A suspect keyframe is also left out of
+  `standpoint.stored_views` (standpoint joins, rotation-check pairs): a lattice-registered sequence is most of its
+  update, and a single failing frame is its whole update. The diag-lattice turn
+  (`test_a_lattice_locked_turn_is_depth_inconsistent`): f0, f3 and f4 fail their pairs (3 of the
+  7 paired frames, not most), f1, f2, f5 and f6 rested only on them and go as dependents, and f7
+  alone commits as the re-run's origin: the lattice commit never happens, but the update is not
+  rejected whole (it was until the audit counted dependents out of the share; a share of 0.4
+  rejects it whole). *Suspect*: at least `SUSPECT_MIN_FRAMES` = 3 new frames,
   each failing its pair with the keyframe, anchored (a stored keyframe among its references,
   not suspect, agrees with it: `DepthPair.agrees`, not failing and at least `MIN_AGREEING`
   counted points one way), agreeing with a stored keyframe that is not among its references
   (the one test a lattice pose fails, by P30's premise), failing no pair with another sound
-  stored keyframe, and no two of them failing with each other. Three, not two: on the client's
+  stored keyframe, and no two of them failing their pair with each other (an unevaluated pair
+  counts as agreement). Three, not two: on the client's
   look `ab8c78` two independent views contradicted keyframe 020449553_0014, which agrees with
   every other stored view (yaw scan, below): two would have marked a sound keyframe. *Mark*:
   `Keyframe.suspect` (`{contradicted_by}`, `state.json`) and the version record's frame row

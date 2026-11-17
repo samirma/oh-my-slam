@@ -2829,7 +2829,10 @@ class AnchoredMap:
         # part of the update remains (the hard limit)
         self.depth_rows: dict[tuple[str, str], dict[str, Any]] = {}
         self.depth_rejected: dict[str, tuple[str, ...]] = {}
+        self.depth_contradicting: set[str] = set()
         self.depth_suspects: dict[str, list[dict[str, Any]]] = {}
+        # the marks of a round that was not applied (the share crossed, or the run limit)
+        self.depth_pending: dict[str, list[dict[str, Any]]] = {}
         self.depth_vetoed: set[str] = set()
         self.depth_runs = 0
         self.depth_first: int | None = None
@@ -3004,6 +3007,7 @@ class AnchoredMap:
         if not self.reran:  # a second registration of the job keeps them (``_epi``)
             self._epi, self._placed, self._preps, self._digests = {}, {}, {}, {}
             self.depth_rows, self.depth_rejected, self.depth_suspects = {}, {}, {}
+            self.depth_contradicting, self.depth_pending = set(), {}
             self.depth_vetoed, self.depth_runs, self.depth_first = set(), 0, None
             self.depth_whole = False
         self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
@@ -5020,7 +5024,10 @@ class AnchoredMap:
         new frames ``depth_inconsistent`` (``_exclude``); when it changed something, the job
         registers again, at most ``DEPTH_RESOLVE_RUNS`` times. The whole-update rejection
         (``depth_whole``) ends it: more than ``DEPTH_REJECT_MAX_SHARE`` of the frames that
-        registered with sensor depth in the first registration rejected."""
+        registered with sensor depth in the first registration rejected for a contradiction
+        (step 2, dependents aside), or a decision pending when the run limit is reached. Such a
+        round is not applied: its rows (``applied`` false) and marks (``depth_pending``) are
+        reported as it decided them."""
         from oh_my_slam.mapping import standpoint
 
         if self.depth_whole:
@@ -5031,16 +5038,26 @@ class AnchoredMap:
         rows, res, n = got
         if self.depth_first is None:
             self.depth_first = n
+        if not (res.reject or res.mark or res.veto):
+            self.depth_rows.update(rows)
+            return False
+        contra = self.depth_contradicting | res.contradict
+        crossed = len(contra) > standpoint.DEPTH_REJECT_MAX_SHARE * self.depth_first
+        if crossed or self.depth_runs >= standpoint.DEPTH_RESOLVE_RUNS:
+            # no consistent part remains (a contradiction remains): the round is reported as it
+            # decided, not applied
+            kname = {k.id: k.name for k in self.keyframes}
+            names = set(res.reject) | {kname[kid] for kid in res.mark}
+            self.depth_rows.update({key: {**r, "applied": False} if r["outcome"] in (
+                "frame_rejected", "keyframe_suspect") and set(key) & names else r
+                for key, r in rows.items()})
+            self.depth_pending = dict(res.mark)
+            self.depth_whole = True
+            log.info("depth consistency: %d of %d frames contradict, run %d: no consistent part "
+                     "remains", len(contra), self.depth_first, self.depth_runs)
+            return False
         self.depth_rows.update(rows)
         rejected = {**self.depth_rejected, **res.reject}
-        if res.reject and len(rejected) > standpoint.DEPTH_REJECT_MAX_SHARE * self.depth_first:
-            self.depth_whole = True
-            log.info("depth consistency: %d of %d frames contradict: no consistent part remains",
-                     len(rejected), self.depth_first)
-            return False
-        if not (res.reject or res.mark or res.veto) \
-                or self.depth_runs >= standpoint.DEPTH_RESOLVE_RUNS:
-            return False
         for kid in res.veto:
             kf = self.keyframe(kid)
             assert kf is not None
@@ -5057,6 +5074,7 @@ class AnchoredMap:
             self._exclude[name] = Placement(name, "rejected", "depth_inconsistent",
                                             inliers=by[name].inliers, depth_with=with_)
         self.depth_rejected = rejected
+        self.depth_contradicting = contra
         self.depth_runs += 1
         self.reran.add("depth")
         log.info("depth consistency: rejects %s, marks %s suspect, unmarks %s: it registers "

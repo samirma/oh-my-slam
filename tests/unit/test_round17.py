@@ -396,11 +396,15 @@ def _no_rotated_choice(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_a_lattice_locked_turn_is_depth_inconsistent(
         client: Any, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
-    """map.md §4 "Depth consistency" (P30, P30a): the 2 m room's turn without priors registered
-    whole through a lattice pose (every measured pair agrees with it, the rotation check
-    passes), its frames 90 deg off the first: their committed views contradict the first one's
-    depth, so the job is rejected ``depth_inconsistent`` and commits nothing, its dry run
-    predicts it, and ``quality.depth_pairs`` shows the pairs that contradict."""
+    """map.md §4 "Depth consistency" (P30, P30a; oms/2.16 "Resolution"): the 2 m room's turn
+    without priors registered through a lattice pose (every measured pair agrees with it, the
+    rotation check passes), its frames 90 deg off the first: their committed views contradict
+    the first one's depth. Since oms/2.16 the frames in failing pairs (f0, f3, f4: three of the
+    seven paired, not most) are rejected ``depth_inconsistent`` and the frames registered only
+    through them go with them (f1, f2, f5, f6); the lattice commit never happens, only f7 (alone,
+    the origin of the re-run) commits; its dry run predicts it, and ``quality.depth_pairs``
+    keeps the pairs that contradicted. With a lower share (two of seven) the update is
+    rejected whole and nothing is created, as before oms/2.16."""
     from oh_my_slam.service import prior_first
     from tests.unit.test_service_prior_first import dry
 
@@ -410,16 +414,28 @@ def test_a_lattice_locked_turn_is_depth_inconsistent(
     pred = dry(client, "m", frames, files, cameras={"cam": CAM})
     job = client.update("m", frames, files, cameras={"cam": CAM})
     q = job["quality"]
-    assert job["state"] == "rejected" and "depth_inconsistent" in q["failed_checks"], q
-    assert max(r for _, r, _ in _errors(job)) > 80.0  # the lattice commit it refuses
+    st = {i["name"]: i for i in job["inputs"]}
+    assert job["state"] == "committed", q
+    assert {n for n, i in st.items() if i["reason"] == "depth_inconsistent"} == {
+        f"f{i}" for i in range(7)}
+    assert set(st["f3"]["depth_inconsistent_with"]) == {"f0"}  # a contradiction
+    assert st["f7"]["status"] == "registered"
     bad = [r for r in q["depth_pairs"] if r["fails"]]
-    assert bad and all(r["agree_ratio_ab"] is None or r["agree_ratio_ab"] <= 1.0 for r in bad)
+    assert bad and {r["outcome"] for r in bad} == {"frame_rejected"}
     assert any(min(x for x in (r["agree_ratio_ab"], r["agree_ratio_ba"]) if x is not None)
                < an.DEPTH_CONFIRM_AGREEMENT for r in bad)
-    assert "depth_inconsistent" in pred["quality"]["failed_checks"]
+    assert [r["predicted_reason"] for r in pred["frames"]] == [i["reason"] for i in job["inputs"]]
     assert pred["quality"]["depth_pairs"] == q["depth_pairs"]
     assert job["timings_s"]["depth_consistency"] < 1.0
-    assert client.http.get("/api/maps/m").status_code == 404
+    names = [f["name"] for f in client.get("/api/maps/m/frames", "Frames")["frames"]]
+    assert names == ["f7"]
+    # a share the three contradicting frames cross: rejected whole, nothing created
+    monkeypatch.setattr(sp, "DEPTH_REJECT_MAX_SHARE", 0.4)
+    job = client.update("n", frames, files, cameras={"cam": CAM})
+    q = job["quality"]
+    assert job["state"] == "rejected" and "depth_inconsistent" in q["failed_checks"], q
+    assert max(r for _, r, _ in _errors(job)) > 80.0  # the lattice commit it refuses
+    assert client.http.get("/api/maps/n").status_code == 404
 
 
 def test_the_room_turn_commits_with_its_true_rotations(

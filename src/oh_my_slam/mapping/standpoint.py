@@ -978,7 +978,8 @@ def stored_views(am: AnchoredMap, near: list[tuple[Any, Any]], exclude: list[Key
                  ) -> list[View]:
     """The map's image-confirmed keyframes (but ``exclude``) as views: those that can share a
     view (``close``) with a pose of ``near`` ((R, centre) pairs), with their features."""
-    conf = [k for k in am.confirmed() if all(k is not n for n in exclude or [])]
+    # a keyframe marked suspect (map.md §4, oms/2.16) is no reference anywhere
+    conf = [k for k in am.confirmed() if k.reference() and all(k is not n for n in exclude or [])]
     out = []
     for k in conf:
         if not any(close(R, c, k.T[:3, :3], k.centre) for R, c in near):
@@ -1202,10 +1203,12 @@ def depth_pairs(views: Sequence[tuple[Keyframe, DepthImage]], new: int) -> list[
 class DepthResolution:
     """One round of the depth-consistency resolution (``depth_resolve``, map.md §4, oms/2.16):
     the new frames it rejects (name -> the frames it contradicts, or whose rejection its
-    registration rested on, in canonical order), the stored keyframes it marks suspect (id ->
+    registration rested on, in canonical order), those of them rejected for a contradiction
+    (step 2; the others depend on rejected frames), the stored keyframes it marks suspect (id ->
     ``quality.suspect_keyframes``' ``contradicted_by``) and the earlier marks it withdraws."""
 
     reject: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    contradict: set[str] = field(default_factory=set)
     mark: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     veto: set[str] = field(default_factory=set)
 
@@ -1215,7 +1218,8 @@ def _canonical(names: Any) -> list[str]:
 
 
 def depth_resolve(pairs: list[DepthPair], new: dict[str, tuple[str, frozenset[str]]],
-                  stored: dict[str, str], fixed: set[str], marked: set[str], vetoed: set[str]
+                  stored: dict[str, str], fixed: set[str], marked: set[str], vetoed: set[str],
+                  others: dict[str, tuple[str, frozenset[str]]] | None = None
                   ) -> DepthResolution:
     """One round of the resolution (map.md §4 "Resolution", "Suspect stored keyframes"):
     ``pairs`` the round's evaluated pairs by frame name, ``new`` the update's registered frames
@@ -1260,15 +1264,17 @@ def depth_resolve(pairs: list[DepthPair], new: dict[str, tuple[str, frozenset[st
         for p in live:
             hit.setdefault(p.a, set()).add(p.b)
             hit.setdefault(p.b, set()).add(p.a)
+    out.contradict = set(hit)
     gone = {new[n][0]: n for n in hit}
+    every = {**(others or {}), **new}  # a frame of any depth kind may depend on them
     more = True
     while more:
         more = False
-        for n in _canonical(new):
-            refs = new[n][1]
+        for n in _canonical(every):
+            refs = every[n][1]
             if n not in hit and refs and refs <= gone.keys():
                 hit[n] = {gone[r] for r in refs}
-                gone[new[n][0]] = n
+                gone[every[n][0]] = n
                 more = True
     out.reject = {n: tuple(_canonical(hit[n])) for n in _canonical(hit)}
     return out
@@ -1338,7 +1344,13 @@ def depth_plan(am: AnchoredMap, placed: list[Placement]
     got = depth_pairs(views, len(new))
     newd = {k.name: (k.id, frozenset(pls[k.id].refs)) for k in new}
     stored = {k.name: k.id for k, _ in views if k.id not in pls}
-    res = depth_resolve(got, newd, stored, am.job_stored(), marked, set(am.depth_vetoed))
+    # the job's other registered frames (monocular ones, sensor ones without a depth grid): they
+    # are not paired, but may rest only on rejected frames (step 3)
+    others = {pl.name: (pl.keyframe, frozenset(pl.refs)) for pl in placed
+              if pl.status == "registered" and pl.keyframe is not None
+              and pl.name not in newd}
+    res = depth_resolve(got, newd, stored, am.job_stored(), marked, set(am.depth_vetoed),
+                        others)
     now = (marked - res.veto) | set(res.mark)
     rows = {}
     for p in got:
@@ -1371,6 +1383,8 @@ def depth_consistency(am: AnchoredMap, placed: list[Placement]
         got = depth_pairs(views, len(new))
         bad = bad or any(p.fails and not ({p.a, p.b} & sus) for p in got)
         for p in got:
+            if rows.get((p.a, p.b), {}).get("applied") is False:
+                continue  # what the round that was not applied decided (oms/2.16)
             rows[(p.a, p.b)] = p.row("keyframe_suspect" if {p.a, p.b} & sus
                                      else "update_rejected")
     if not bad:  # the update commits: an earlier round's failing pair it no longer pairs
@@ -1382,10 +1396,15 @@ def depth_consistency(am: AnchoredMap, placed: list[Placement]
 
 def suspect_keyframes(am: AnchoredMap) -> list[dict[str, Any]]:
     """``quality.suspect_keyframes`` (map.md §4, oms/2.16): the stored keyframes the job marked
-    suspect, with the frames that supported each mark, in canonical order."""
-    out = []
+    suspect, with the frames that supported each mark, in canonical order; those of a round
+    that was not applied (``AnchoredMap.depth_pending``) with ``applied`` false."""
+    out: list[dict[str, Any]] = []
     for kid, ev in am.depth_suspects.items():
         k = am.keyframe(kid)
         assert k is not None
         out.append({"name": k.name, "contradicted_by": list(ev)})
+    for kid, ev in am.depth_pending.items():  # decided by a round that was not applied
+        k = am.keyframe(kid)
+        assert k is not None
+        out.append({"name": k.name, "contradicted_by": list(ev), "applied": False})
     return sorted(out, key=lambda r: natural_key(r["name"]))

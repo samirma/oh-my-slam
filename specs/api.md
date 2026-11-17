@@ -491,15 +491,20 @@ error code `invalid_request` (§9).
   * A new frame whose view contradicts a stored keyframe is `rejected` with reason
     `depth_inconsistent` and `depth_inconsistent_with` naming the frames it contradicts; two
     new frames that contradict each other (with no frame contradicting the stored map) are
-    both rejected; a frame registered only through rejected frames is rejected with them. The
-    job registers again without them, and the rest commits when it passes every limit.
+    both rejected; a frame of any depth kind (monocular too) registered only through rejected
+    frames is rejected with them. The job registers again without them, and the rest commits
+    when it passes every limit.
   * The update is rejected whole (`failed_checks` `depth_inconsistent`, as before oms/2.16)
-    only when the rejected frames are more than half of its frames that registered with a
-    depth image (a lattice-registered sequence is most of its update), or a contradiction
-    remains after the re-runs. A one-frame update whose frame contradicts is rejected whole.
+    only when the frames rejected for a contradiction (not those rejected as dependents) are
+    more than half of its frames that registered with a depth image (a lattice-registered
+    sequence is most of its update), or a contradiction remains after the re-runs. A one-frame
+    update whose frame contradicts is rejected whole. The last round's decision is still
+    reported, flagged `applied: false` on its `depth_pairs` rows and `suspect_keyframes`
+    entries.
   * A stored keyframe contradicted by at least 3 new frames that are anchored in the stored
     map, agree with a stored keyframe they were not registered against, contradict no other
-    stored keyframe and agree with each other is marked suspect instead
+    stored keyframe, and no two of which fail their pair with each other (an unevaluated pair
+    counts as agreement) is marked suspect instead
     (`quality.suspect_keyframes[]`, `{name, contradicted_by[{name, agree_ratio_keyframe,
     agree_ratio_frame}]}`): those frames commit, and the keyframe keeps its pose and content but
     is no longer paired nor a registration or locate reference. Frames reads show the mark as

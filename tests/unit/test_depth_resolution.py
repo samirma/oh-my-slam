@@ -153,41 +153,87 @@ def test_contradictors_that_disagree_or_contradict_others_mark_nothing() -> None
 
 def test_plan_depth_rerun_rounds(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """``plan_depth_rerun`` applies a round: marks and unmarks keyframes, forces the rejected
-    frames for the next registration; ends without a change, after ``DEPTH_RESOLVE_RUNS``, or
-    with the whole update rejected when the rejected frames are most of it."""
+    frames for the next registration; ends without a change. A round that would cross the share
+    (frames rejected for a contradiction only, dependents aside) or that is pending at the run
+    limit is not applied: the update is rejected whole and the round reported ``applied``
+    false (its rows, its marks in ``depth_pending``)."""
     am = AnchoredMap(tmp_path / "m")
-    am.keyframes = [Keyframe(k, k, "cam", an.Intrinsics(1, 1, 0, 0, 2, 2), np.eye(4), 0.0, 0.0,
-                             "fused", None, "sensor") for k in ("k_s0", "k_s1")]
+    am.keyframes = [Keyframe(k, f"s{i}", "cam", an.Intrinsics(1, 1, 0, 0, 2, 2), np.eye(4), 0.0,
+                             0.0, "fused", None, "sensor") for i, k in enumerate(("k_s0", "k_s1"))]
     plans: list[Any] = []
     monkeypatch.setattr(sp, "depth_plan", lambda m, pls: plans.pop(0))
     pls = [Placement(f"n{i}", "registered", inliers=40 + i) for i in range(4)]
     plans.append(None)
     assert not am.plan_depth_rerun(pls)  # no new frame with sensor depth
     row = {("n0", "s0"): P("n0", "s0", 0.5).row("frame_rejected")}
-    plans.append((row, sp.DepthResolution(reject={"n0": ("s0",)},
+    plans.append((row, sp.DepthResolution(reject={"n0": ("s0",), "n3": ("n0",)},
+                                          contradict={"n0"},
                                           mark={"k_s0": [{"name": "n1"}]}), 4))
     assert am.plan_depth_rerun(pls) and am.depth_first == 4 and am.depth_runs == 1
     assert am.excluded()["n0"].reason == "depth_inconsistent"
     assert am.excluded()["n0"].depth_with == ("s0",) and am.excluded()["n0"].inliers == 40
+    assert am.excluded()["n3"].depth_with == ("n0",)  # a dependent: not counted for the share
+    assert am.depth_contradicting == {"n0"} and set(am.depth_rejected) == {"n0", "n3"}
     assert am.keyframes[0].suspect == {"contradicted_by": [{"name": "n1"}]}
     assert not am.keyframes[0].reference() and am.depth_rows == row and "depth" in am.reran
     plans.append(({}, sp.DepthResolution(veto={"k_s0"}), 3))
     assert am.plan_depth_rerun(pls) and am.keyframes[0].suspect is None
     assert am.depth_vetoed == {"k_s0"} and am.depth_suspects == {} and am.depth_first == 4
-    plans.append(({}, sp.DepthResolution(), 3))
-    assert not am.plan_depth_rerun(pls)  # nothing changed: the fixed point
-    am.depth_runs = sp.DEPTH_RESOLVE_RUNS
-    plans.append(({}, sp.DepthResolution(reject={"n1": ("s1",)}), 3))
-    assert not am.plan_depth_rerun(pls) and "n1" not in am.excluded()
-    am.depth_runs = 0
-    plans.append(({}, sp.DepthResolution(reject={"n1": ("s1",), "n2": ("s1",)}), 3))
-    assert not am.plan_depth_rerun(pls) and am.depth_whole  # 3 of 4 rejected: most
+    plans.append(({("n1", "n2"): P("n1", "n2").row()}, sp.DepthResolution(), 3))
+    assert not am.plan_depth_rerun(pls) and ("n1", "n2") in am.depth_rows  # the fixed point
+    # one more contradicting frame: 2 of 4, not more than half: applied
+    plans.append(({}, sp.DepthResolution(reject={"n1": ("s1",)}, contradict={"n1"}), 3))
+    assert am.plan_depth_rerun(pls) and am.depth_contradicting == {"n0", "n1"}
+    # a third would cross the share: not applied, reported as decided
+    pend = {("n2", "s1"): P("n2", "s1", 0.5).row("frame_rejected"),
+            ("n1", "s0"): P("n1", "s0", 0.5).row("keyframe_suspect"),
+            ("n2", "s0"): P("n2", "s0", 0.5).row("keyframe_suspect"),
+            ("n1", "n2"): P("n1", "n2", 0.5).row("update_rejected")}
+    plans.append((pend, sp.DepthResolution(reject={"n2": ("s1",)}, contradict={"n2"},
+                                           mark={"k_s1": [{"name": "n2"}]}), 3))
+    assert not am.plan_depth_rerun(pls) and am.depth_whole and "n2" not in am.excluded()
+    assert am.depth_rows[("n2", "s1")]["applied"] is False
+    assert am.depth_rows[("n2", "s0")]["applied"] is False  # n2 a pending rejection
+    assert "applied" not in am.depth_rows[("n1", "s0")]  # n1 applied, s0 not newly marked
+    assert "applied" not in am.depth_rows[("n1", "n2")]  # no decision of the round
+    assert am.depth_pending == {"k_s1": [{"name": "n2"}]} and am.keyframes[1].suspect is None
+    assert sp.suspect_keyframes(am) == [
+        {"name": "s1", "contradicted_by": [{"name": "n2"}], "applied": False}]
     assert not am.plan_depth_rerun(pls) and not plans  # decided: no further round
+    # the run limit with a decision pending: likewise
+    am.depth_whole, am.depth_runs = False, sp.DEPTH_RESOLVE_RUNS
+    plans.append(({}, sp.DepthResolution(veto={"k_s0"}), 3))
+    assert not am.plan_depth_rerun(pls) and am.depth_whole
     am.begin_job()  # a second registration of the job keeps it; a new job starts afresh
     assert am.depth_whole
     am.reran = set()
     am.begin_job()
     assert not am.depth_whole and am.depth_rows == {} and am.depth_first is None
+    assert am.depth_pending == {} and am.depth_contradicting == set()
+
+
+def test_a_monocular_frame_resting_on_a_rejected_frame_goes_with_it() -> None:
+    """Step 3 covers frames of any depth kind (``others``: never paired): a monocular frame
+    registered only through the rejected frame is rejected naming it; one that also rests on a
+    stored keyframe stays; only step 2's rejections are contradictions."""
+    others = _new(m1="k_n2", m2="k_n2 k_s1", m3="k_m1")
+    res = sp.depth_resolve([P("n2", "s0", 0.4)], _new(n2="k_s0"), STORED, FIXED, set(), set(),
+                           others)
+    assert res.reject == {"n2": ("s0",), "m1": ("n2",), "m3": ("m1",)}
+    assert res.contradict == {"n2"}
+
+
+def test_a_re_registered_keyframe_counts_as_stored_but_never_votes() -> None:
+    """A stored keyframe the job re-registered (in ``stored``, not ``fixed``): a failing pair
+    with it rejects the new frame; it is never marked, and a suspect-test frame failing with
+    it still supports a mark of another keyframe."""
+    pairs, new = _suspect_case()
+    stored = {**STORED, "r0": "k_r0"}
+    res = resolve([*pairs, P("n1", "r0", 0.5)], new, stored=stored)
+    assert list(res.mark) == ["k_s0"] and res.reject == {"n1": ("r0",)}
+    res = resolve([P("n1", "r0", 0.5), P("n2", "r0", 0.5), P("n3", "r0", 0.5)],
+                  _new(n1="k_s1", n2="k_s1", n3="k_s1"), stored=stored)
+    assert res.mark == {} and set(res.reject) == {"n1", "n2", "n3"}
 
 
 # -- the service end to end -------------------------------------------------------------------
@@ -248,7 +294,11 @@ def test_most_of_the_update_contradicting_rejects_it_whole(
     job = client.update("m", fr, files)
     q = job["quality"]
     assert job["state"] == "rejected" and "depth_inconsistent" in q["failed_checks"], q
-    assert {r["outcome"] for r in q["depth_pairs"] if r["fails"]} == {"update_rejected"}
+    # the round that crossed the share is reported as decided, not applied
+    bad = [r for r in q["depth_pairs"] if r["fails"]]
+    assert bad and all(r["outcome"] == "frame_rejected" and r["applied"] is False
+                       for r in bad if {"t0", "t1"} & {r["a"], r["b"]})
+    assert all(i["status"] == "registered" for i in job["inputs"])
     assert client.service.store.latest("m") == 1
 
 
@@ -300,3 +350,63 @@ def test_a_stored_keyframe_contradicted_by_a_look_is_marked_suspect(
     assert job["quality"]["depth_pairs"]
     row = next(f for f in store.version("m", 3)["frames"] if f["name"] == "b4")
     assert row["depth_suspect"]["version"] == 2
+
+
+def test_a_monocular_frame_registered_through_the_rejected_frame_goes_with_it(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """A mixed RGB-D and monocular job: the sensor frame ``t1`` contradicts the stored views
+    and is rejected; the monocular ``m0``, turned beyond the stored views' reach and registered
+    only through ``t1``, is rejected ``depth_inconsistent`` naming it; ``t0`` commits."""
+    fr, files = frames_for(client, [base_pose(30.0 * k) for k in range(3)], tag="s")
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    _corrupt(monkeypatch, {"t1"})
+    fr, files = frames_for(client, [base_pose(45.0), base_pose(105.0)], tag="t")
+    fm, fmf = frames_for(client, [base_pose(160.0)], tag="m", depth=False)
+    job = client.update("m", [*fr, *fm], {**files, **fmf})
+    st = {i["name"]: i for i in job["inputs"]}
+    assert job["state"] == "committed", job["quality"]
+    assert st["t1"]["reason"] == "depth_inconsistent" and st["t0"]["status"] == "registered"
+    assert st["m0"]["status"] == "rejected" and st["m0"]["reason"] == "depth_inconsistent"
+    assert st["m0"]["depth_inconsistent_with"] == ["t1"]
+
+
+def test_the_last_round_is_reported_when_not_applied(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """No re-run left (``DEPTH_RESOLVE_RUNS`` 0): the first round's decision is pending, so a
+    contradiction remains and the update is rejected whole; its rows show the rejection it
+    decided with ``applied`` false, and the frame keeps its status."""
+    monkeypatch.setattr(sp, "DEPTH_RESOLVE_RUNS", 0)
+    fr, files = frames_for(client, [base_pose(30.0 * k) for k in range(6)], tag="s")
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    _corrupt(monkeypatch, {"t1"})
+    fr, files = frames_for(client, [base_pose(15.0 + 30.0 * k) for k in range(4)], tag="t")
+    pred = dry(client, "m", fr, files)
+    job = client.update("m", fr, files)
+    q = job["quality"]
+    assert job["state"] == "rejected" and "depth_inconsistent" in q["failed_checks"], q
+    assert all(i["status"] == "registered" for i in job["inputs"])
+    pend = [r for r in q["depth_pairs"] if r.get("applied") is False]
+    assert pend and all("t1" in (r["a"], r["b"]) and r["outcome"] == "frame_rejected"
+                        for r in pend)
+    assert pred["quality"]["depth_pairs"] == q["depth_pairs"]
+
+
+def test_a_pending_mark_is_reported_when_not_applied(
+        client: Client, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    """The look that would mark ``b4`` suspect, with no re-run left: the update is rejected
+    whole and ``suspect_keyframes`` shows the mark it decided with ``applied`` false; nothing
+    is stored."""
+    monkeypatch.setattr(sp, "DEPTH_RESOLVE_RUNS", 0)
+    fr, files = frames_for(client, [base_pose(20.0 * k) for k in range(9)], tag="b")
+    assert client.update("m", fr, files, cameras={"cam": CAM})["state"] == "committed"
+    _corrupt(monkeypatch, {"b4"})
+    fr, files = frames_for(client, [base_pose(10.0 + 20.0 * k) for k in range(1, 7)], tag="t")
+    job = client.update("m", fr, files)
+    q = job["quality"]
+    assert job["state"] == "rejected" and "depth_inconsistent" in q["failed_checks"], q
+    assert [(s["name"], s.get("applied")) for s in q["suspect_keyframes"]] == [("b4", False)]
+    sus = [r for r in q["depth_pairs"] if "b4" in (r["a"], r["b"]) and r["fails"]]
+    assert sus and all(r["outcome"] == "keyframe_suspect" and r["applied"] is False
+                       for r in sus)
+    am = AnchoredMap.load(client.service.store.mapper_dir("m"))
+    assert all(k.suspect is None for k in am.keyframes)
