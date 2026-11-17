@@ -1576,7 +1576,7 @@ Decisions:
   the order of addition.
 * **Relative translation sigma** (drifting): hypot(hypot(`DRIFT_POS_REL` 0.10, σ_odo) × |t|,
   `KEYFRAME_BASELINE_SIGMA_MIN_M` **0.03 m**, sqrt(|σ_a² − σ_b²|)); metric: hypot(σ_a, σ_b).
-  σ_odo: 0 without a drift correction, 0.10 below 3 odometry-scale baselines, else their
+  σ_odo: 0 without any drift estimate, 0.10 below 3 odometry-scale baselines, else their
   1.4826 MAD in ln ratio / √n (e305's final value: 0.21, which excludes its forward pairs).
   The sqrt(|σ_a² − σ_b²|) term rejects pairs across a client fix (e305's live sigmas jump
   0.14-0.5 between views).

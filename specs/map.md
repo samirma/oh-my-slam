@@ -287,14 +287,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   translation is known independently of the images and of any keyframe's depth:
   * **When.** At the end of every job, once its statuses are final, for every image-confirmed
     monocular keyframe with a `metric` or `drifting` prior that the job added or re-registered,
-    and for every stored one that has such a job keyframe among its near keyframes (below),
-    measured again over all its neighbours (a measurement that no longer holds is cleared). The
+    and for every stored one with any such job keyframe within the order gap of it (below,
+    whether or not that keyframe then qualifies as a pair), measured again over all its
+    neighbours (a measurement that no longer holds is cleared). The
     measurement uses the two priors as sent, the keyframes' features and the measured keyframe's
     own raw depth only, never a committed pose, so it cannot measure back the scale a pose was
     lifted with, and a job's outcome does not depend on its frames' order.
   * **Neighbours.** The other image-confirmed keyframes of its camera with a prior of the same
-    trust, at most `KEYFRAME_PAIR_MAX_GAP` (`README.md`, 4) keyframes of that camera apart in the
-    map's order of addition (the odometry's error between two priors grows with the travel
+    trust, at most `KEYFRAME_PAIR_MAX_GAP` (`README.md`, 4) positions apart in the map's order of
+    addition of that camera's keyframes (every keyframe of the camera counts, kept or confirmed) (the odometry's error between two priors grows with the travel
     between them, which that order bounds and their distance does not), whose priors' optical
     axes lie at most `KEYFRAME_PAIR_MAX_DEG` (60°) apart. The relative pose is the two priors' as
     sent; a `drifting` pair's translation is taken in map metres (times the drift estimate's
@@ -302,8 +303,9 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     `drifting` pair, hypot(hypot(`DRIFT_POS_REL`, σ_odo) × |t|, `KEYFRAME_BASELINE_SIGMA_MIN_M`
     (0.03 m), sqrt(|σ_a² − σ_b²|)): the drift both priors share since the client's last fix
     cancels; the odometry's error over the move (the drift-grown rate of this section) and its
-    scale's error σ_odo remain (0 while the drift estimate has made no correction: the priors'
-    frame is then the map's; `DRIFT_POS_REL` with fewer than 3 odometry-scale baselines; else
+    scale's error σ_odo remain (0 while there is no drift estimate at all: the priors' frame is
+    then the map's; once there is one, `DRIFT_POS_REL` with fewer than 3 odometry-scale
+    baselines; else
     their robust spread in ln ratio over the root of their count), a walking robot's short-move
     noise is the floor, and a change of the sent sigmas between the two (a client fix between
     them, or travel the client grew them with) is part of the error. For a `metric` pair it is
@@ -319,11 +321,11 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     scale, with σ = hypot(σ_t / |t|, the fit's standard error, its spread).
   * **Combined.** Pairs whose scale lies beyond `KEYFRAME_SCALE_RANGE` (⅓ to 3 × k: beyond any
     monocular frame's spread) are false pairs and dropped. Of the rest, those within 3 of their
-    own sigmas of the pairs' weighted median in ln scale agree; more than half must agree (two
+    own sigmas of the pairs' lower weighted median in ln scale (inverse-variance weights) agree; more than half must agree (two
     pairs: both), else the pairs contradict each other and there is no measurement. The scale is
-    the agreeing pairs' inverse-variance mean in ln scale; its sigma the larger of their smallest
-    sigma and their weighted spread, never less than the best pair's (the pairs share the
-    keyframe's depth and the odometry's scale). It is **confident** when that sigma lies below
+    the agreeing pairs' inverse-variance mean in ln scale; its sigma the larger of the smallest
+    pair sigma among the agreeing pairs and their weighted spread in ln scale, never less than
+    the best agreeing pair's (the pairs share the keyframe's depth and the odometry's scale). It is **confident** when that sigma lies below
     the monocular scale bound of the floor check (§2).
   * **What it decides.** A confident measured scale decides the floor check of a job keyframe
     that the check did not judge about k (§2, Floor check): it is judged about the measured scale
@@ -437,8 +439,14 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
       for their pose only, and gives no alignment, depth confirmation or scale evidence (the
       references bullet below), locate takes its features without its depth (api.md §6), and it
       is no camera-height evidence (it was withheld from k at
-      registration, before the measurement). The verdict is its job's: a stored keyframe
-      measured again in a later job keeps the content verdict it was committed with.
+      registration, before the measurement). Nor does it register later frames with a floor
+      ratio (its floor-check scale is its content's only): the texture-aliasing guards classify
+      its lifted points as an unjudged keyframe's. The verdict is its job's: a stored keyframe
+      measured again in a later job keeps the content verdict it was committed with, also when
+      that later measurement fails and is cleared: it then keeps `stereo_judged` and its content
+      without a measured scale, which a client never sees in `inputs[]` (only the job that
+      judged it reported `stereo_scale`); its committed `depth_scale` stays its floor-check
+      scale.
 
     A frame excluded by the floor check (sensor depth) is listed in `quality.floor_inconsistent`,
     by name. A monocular frame is never listed: one whose own scale was applied reports that

@@ -3114,8 +3114,12 @@ class AnchoredMap:
         """How a reference keyframe's lifted depth (``_depth_factor``: the map's scale k) stands
         to its own floor-check scale (``Keyframe.floor_factor``, map.md §2), so where its lifted
         points put the floor (map.md §2 "Texture-aliasing guards", oms/2.13): 1 for a depth image
-        or a keyframe without its own scale."""
-        if k.depth_kind != "mono" or k.floor_factor is None or k.floor_factor <= 0:
+        or a keyframe without its own scale, and for one judged only about its measured scale
+        (``stereo_judged``, oms/2.14: it registers as an unjudged one, without a floor ratio)."""
+        if k.depth_kind != "mono" or k.floor_factor is None or k.floor_factor <= 0 \
+                or k.stereo_judged:
+            # a keyframe judged about its measured scale (oms/2.14) registers as an unjudged
+            # one: its floor-check scale is its content's only
             return 1.0
         return self._depth_factor(k) / k.floor_factor
 
@@ -4453,8 +4457,8 @@ class AnchoredMap:
 
     def _odo_sigma_rel(self) -> float:
         """The relative sigma of the odometry scale (map metres per odometry metre,
-        ``Drift.odo_scale``): 0 while the drift estimate has no correction (the priors' frame is
-        the map's: their metres are the map's), ``DRIFT_POS_REL`` with fewer than
+        ``Drift.odo_scale``): 0 while there is no drift estimate at all (``ref_T`` None: the
+        priors' frame is the map's, their metres are the map's), ``DRIFT_POS_REL`` with fewer than
         ``SCALE_EVIDENCE_MIN`` odometry-scale baselines, else their robust spread in ln ratio
         over the root of their count."""
         if self.drift.ref_T is None:

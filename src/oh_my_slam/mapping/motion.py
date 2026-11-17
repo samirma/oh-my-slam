@@ -336,7 +336,7 @@ def keyframe_scale(pairs: list[PairScale], k: float) -> KeyframeScale | None:
     """A keyframe's scale from its neighbours' measurements (map.md §1 "Keyframe depth scale"):
     the ``used`` pairs whose scale lies within ``KEYFRAME_SCALE_RANGE`` of the map's monocular
     scale ``k`` (beyond any monocular frame's spread: a pair of false matches); of those, the
-    ones within ``KEYFRAME_AGREE_K`` of their own sigmas of the pairs' weighted median in ln
+    ones within ``KEYFRAME_AGREE_K`` of their own sigmas of the pairs' lower weighted median in ln
     scale; more than half must agree (two pairs both), else the pairs contradict each other and there is no
     measurement. The scale is the agreeing pairs' inverse-variance mean in ln scale, its sigma
     the largest of their smallest sigma and their weighted spread: never less than the best

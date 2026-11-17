@@ -308,3 +308,25 @@ def test_confident_scale_rules() -> None:
     assert k.confident_scale() == 1.0
     k.stereo_sigma = None
     assert k.confident_scale() is None
+
+
+def test_a_judged_keyframe_registers_later_frames_as_an_unjudged_one(
+        tmp_path: Path, walk: list[syn.Shot]) -> None:
+    """A keyframe judged about its measured scale (``stereo_judged``, its own floor-check factor
+    set) is a reference of a later job exactly as an unjudged one: no floor ratio (the floor
+    guard's classification, ``inlier_floor_share``, the off-floor count), no lifted points as
+    scale evidence, the same pose."""
+    out = []
+    for judged in (True, False):
+        m = mapped(tmp_path / str(judged), walk, 2)
+        b = m.confirmed()[1]
+        b.floor_unjudged, b.stereo_judged = not judged, judged
+        b.floor_factor = 2.0 if judged else None
+        assert m._floor_ratio(b) == 1.0 and not b.lifts()
+        pl = m.update([frame("f2", walk[2])], lambda _: None)[0]
+        out.append((pl.status, pl.inliers, pl.inlier_floor_share,
+                    None if pl.T is None else pl.T.round(9).tolist()))
+    assert out[0] == out[1] and out[0][0] == "registered"
+    m.keyframes[0].floor_factor = 2.0  # a judged keyframe's own scale still gives its ratio
+    assert m._floor_ratio(m.keyframes[0]) == pytest.approx(
+        m._depth_factor(m.keyframes[0]) / 2.0)

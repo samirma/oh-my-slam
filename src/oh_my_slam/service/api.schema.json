@@ -469,11 +469,11 @@
         "depth_scale": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "oms/2.4. Present when a per-frame depth scale was applied to the frame's monocular depth (map.md section 2, floor check): the factor applied to its raw depth, in map metres, k x H / h_f, in place of the map's scale. Absent otherwise, also for a frame the floor check did not judge (detail floor_not_judged)."
+          "description": "oms/2.4. Present when a per-frame depth scale was applied to the frame's monocular depth (map.md section 2, floor check): the factor applied to its raw depth, in map metres, k x H / h_f, in place of the map's scale; since oms/2.14 also for a frame judged about its measured scale (stereo_scale.judged). Absent otherwise, also for a frame the floor check did not judge (detail floor_not_judged)."
         },
         "stereo_scale": {
           "$ref": "#/$defs/StereoScale",
-          "description": "oms/2.14. Present when the frame's keyframe is monocular, image-confirmed and its own depth scale was measured by motion stereo at the end of this job (map.md section 1, Keyframe depth scale). Absent otherwise: no neighbour keyframe with a usable baseline (a turning look before the robot's first straight move), pairs that disagree, or a depth image."
+          "description": "oms/2.14. Present when the frame's keyframe is monocular, image-confirmed, carries a metric or drifting prior, and its own depth scale was measured by motion stereo at the end of this job (map.md section 1, Keyframe depth scale). Absent otherwise: no neighbour keyframe with a usable baseline (a turning look before the robot's first straight move), pairs that disagree, or a depth image."
         },
         "min_distance_m": {
           "type": "number",
@@ -3514,7 +3514,7 @@
         "sigma_rel": {
           "type": "number",
           "minimum": 0,
-          "description": "One relative sigma of scale: at least the best agreeing pair's hypot(sigma_t / |t|, the fit's standard error, its spread), and at least the agreeing pairs' weighted spread in ln scale."
+          "description": "One relative sigma of scale: the larger of the smallest pair sigma among the agreeing pairs (each hypot(sigma_t / |t|, the fit's standard error, its spread)) and the agreeing pairs' weighted spread in ln scale."
         },
         "neighbours": {
           "type": "array",
