@@ -263,6 +263,10 @@ error code `invalid_request` (§9).
     registration minimum (§6); one `README.md` constant serves both (currently 15). A frame
     with a prior that passed the checks but was not placed is `kept_at_prior` with
     `no_overlap`, `detail` `no_image_pose` or `loose_image_pose`.
+  * Looseness tests: an image pose whose sigma is too wide to confirm the prior (`README.md`
+    constants) and, since oms/2.19, a rotation-only fit more than twice a `metric` prior's
+    rotation sigma from it whose depth confirmation agreed on too few points (map.md §2, Thin
+    rotation-only fits).
   * A frame with a prior whose image fails a quality check, or that is too close, is
     `kept_at_prior`. Its reason is the first failing check in the order `plain`, `blur`,
     `few_features`, `too_close`, with `min_distance_m` and `scene_distance_m` when it is

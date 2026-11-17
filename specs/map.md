@@ -704,6 +704,15 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
     confirmation and no scale evidence from those references, and the update's scale source is
     chosen from the evidence that remains (§1, Scale). Locate keeps the oms/2.6 rule: such a
     keyframe's features without its depth (api.md §6).
+  * **Thin rotation-only fits** (oms/2.19). A rotation-only fit (its centre the prior's) of a
+    frame with a `metric` prior that lies more than `ROTATION_PRIOR_K` (`README.md`, 2) times the
+    prior's rotation sigma from the prior, and whose depth confirmation (§1, Measurable pair)
+    agreed on fewer than `ROTATION_CONFIRM_MIN` (`README.md`) points in one of its directions,
+    fails a looseness test (api.md §4): the frame is `kept_at_prior`, `detail`
+    `loose_image_pose`, and is no registration reference. A rotation fitted on near clutter
+    over a thin overlap is no measurement of a metric heading: the depth confirmation of so few
+    points does not see a few degrees, and the frames registered on it inherit the error. A
+    fit without a depth confirmation (no depth image on either side) is unchanged.
   * **Texture-aliasing guards** (oms/2.13). Repeated texture (floor planks, tiles, carpet, a
     wood-grain panel) matches a frame to the wrong place with hundreds of inliers. Two guards
     apply to every points fit (PnP) of a frame against the map's lifted points, on every engine
@@ -1132,7 +1141,17 @@ becomes a job with a `job_id`. A job goes through these states:
       changes the scale on.
     * A pair fails under the depth confirmation's minimum count and agreement threshold (§1,
       Measurable pair), in either direction: at least that minimum of points agree or
-      contradict, and fewer than that threshold of them agree.
+      contradict, and fewer than that threshold of them agree. Since oms/2.19 the
+      contradiction must also be supported: fewer than a clear share of them agree (a constant
+      in `README.md`, below the agreement threshold), or at least a minimum number of points
+      contradict (a constant in `README.md`). Under a correct pose a view's depth sees through a
+      few of the other's points where the samples are least reliable: thin structures, mixed
+      pixels at depth edges, far range, a near edge moved sideways by a rotation within its
+      sigma. Those few points, scattered, are no contradiction; a wrong pose contradicts over a
+      region of the overlap. The test stays a count over the committed relative pose: it widens
+      neither the depth tolerance with range or rotation nor the lookup into a window, and it
+      searches no pose within the sigmas, since each of those excuses a lattice pose's
+      contradictions (`README.md`, Contradiction support).
     * It uses the committed poses and the depth images only, never the pairs' image
       measurements, so it catches a commit that every measured pair agrees with: a sequence
       registered through a lattice pose (an empty rectilinear room with a repeating wall

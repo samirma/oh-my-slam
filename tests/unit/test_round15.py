@@ -697,7 +697,9 @@ def test_gate_and_pair_edges(tmp_path: Any) -> None:
     s = an.Solve(base_pose(5.0)[:3, :3], base_pose(5.0)[:3, 3], np.eye(6) * 1e-6,
                  np.ones(40, bool), 0.5)
     got = am.depth_confirms(f, s, np.zeros(40, np.intp), list(am.keyframes))
-    assert got is not None and got[0] is s and got[1] is None
+    # its pose, with the fewer agreeing points of the confirmation (oms/2.19)
+    assert got is not None and got[1] is None and got[0].T.tobytes() == s.T.tobytes()
+    assert got[0].confirmed is not None and got[0].confirmed >= an.MIN_AGREEING
     mono = frame("m", base_pose(5.0), p=None, depth=False)
     assert am.depth_confirms(mono, s, np.zeros(40, np.intp), list(am.keyframes)) == (s, None)
     c = an.DepthCounts(10, 0, 0, 0, 10)

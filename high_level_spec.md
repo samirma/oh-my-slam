@@ -342,6 +342,16 @@ update does (api.md §6, Prior placement): through the located version's prior s
 estimate, a drifting prior with its drift-grown sigma, in the conflict bound and the rivals'
 `outside_prior`; new optional `prior_residual_placed_*` beside the as-sent `prior_residual_*`.
 
+**oms/2.19** changes behaviour only (no field; the schema stays oms/2.18): fewer false
+depth-consistency rejections. A depth pair fails only on a supported contradiction (map.md §4):
+below the agreement threshold, either fewer than a clear share of the counted points agree or at
+least a minimum number of points contradict; a few scattered see-through points (thin
+structures, depth edges, far range, a rotation within its sigma) no longer reject a correct
+view, while a lattice pose's contradictions, hundreds of points, still do. A rotation-only fit
+more than twice its `metric` prior's rotation sigma from it on a thin depth confirmation is too
+loose to confirm the frame (`kept_at_prior`, `loose_image_pose`; map.md §2), so it no longer
+commits a wrong heading that later frames register on.
+
 ## 8. Concurrency and latency
 
 * **Reads.** Reads never wait for an update. These are map summary, objects, grid, frames,

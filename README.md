@@ -2032,6 +2032,97 @@ map.md §1 "Prior scale", "Odometry epochs", §2 "Reference sigma"; `anchored.pr
   conflict: their sent priors are older odometry states that the current estimate does not
   describe, which a client never sends to a locate (a locate sends its current odometry).
 
+### Contradiction support and thin rotation-only fits (oms/2.19)
+
+* **Contradiction support** (map.md §4 "Depth consistency"; `standpoint.DepthPair.fails`,
+  `CONTRADICTION_CLEAR` = 0.75, `CONTRADICTION_MIN_POINTS` = 100). A direction of a depth pair
+  agreeing below `DEPTH_CONFIRM_AGREEMENT` (0.90, over at least `MIN_AGREEING` counted points)
+  fails only when fewer than 0.75 of its counted points agree or at least 100 of them are seen
+  through. The registration gate (`depth_confirmed`) and locate's depth check are unchanged.
+  *Why*: correct views were rejected `depth_inconsistent` on a few scattered see-through points.
+  `smoke_777f678_base` (a cold 17-view turn in place, the base fixed by the client's truth):
+  `_0011`-`_0013`, both correct, failed at 0.876/0.917 on 22 and 13 points of ~2500 (two new
+  frames: both rejected), the re-run turned `_0012` into a thin rotation-only fit 5° off (below)
+  that `_0010` registered on, and its pairs with `_0008`/`_0009` (154 points) rejected all three:
+  5 of 17 rejected, 4 of them false. `rev9_x3_b`: arc views placed within a few cm (client's truth)
+  failed against 8 stored keyframes each at 0.79-0.91 on 9-78 points; in the 2.18 replay the
+  post-re-anchor frames 07:42:43, 07:44:01, 07:44:33 failed at 0.84-0.89 on 15-87 points (two
+  whole jobs and one frame). *Measured* (each pair's counts under each candidate, replay with a
+  measuring hook; the client's truth used for diagnosis only):
+  | pairs | see-through points | agreement | label |
+  | --- | --- | --- | --- |
+  | lattice turn f0-f3, f0-f4 (`test_a_lattice_locked_turn_is_depth_inconsistent`) | 534, 496 | 0.80, 0.58 | wrong (90°) |
+  | smoke `_0008`-`_0010`, `_0009`-`_0010` (logged) | 154, 154 | 0.64, 0.90 | wrong (inherited) |
+  | rev9_x3_b post-re-anchor (2.18 replay) | 15-87 | 0.84-0.89 | correct |
+  | rev9_x3_b arc views (logged) | 9-78 | 0.79-0.91 | correct |
+  | smoke `_0011`-`_0013` (logged) | 22, 13 | 0.88, 0.92 | correct |
+  | rev8_wheeled v5 look (replay; rejected since 2.16) | 74-1677 | 0.38-0.90 | rejected, kept so |
+  | rev8_wheeled pre-heading-fix `12e6e9`, `fc947b` (logged) | 11-251 | 0.10-0.90 | wrong |
+  Every correct pair lies at or above 0.75 with at most 87 points (3 % of a view's 3071); the
+  wrong views keep failing pairs below 0.75 or at 154 points or more (single pairs of the
+  pre-heading-fix looks at 0.81-0.89 on 11-94 points no longer fail, their frames still fail
+  others). A clear contradiction on few points still fails
+  (rev9_x3_a `3f6ba6` at 0.00-0.01 on 68-141 points; rev8_wheeled2 `00c7a1` at 0.00 on 55).
+  *Refused candidates*, each measured where the frames are stored:
+  * a range- and rotation-aware tolerance, margin + 3 σ_rot × depth (committed rotation sigmas
+    combined): it clears the 2.18 post-re-anchor pairs (0.84-0.89 → 0.94-0.98; σ_rot 4.0-4.3°
+    combined) but also the lattice turn (0.80 → 1.000, 0.58 → 1.000 at σ_rot 1.7-2.1°): the
+    lattice's contradictions lie within 10-20 % of depth, so any depth band of that size excuses
+    them;
+  * a rigid search for a relative pose within 3 σ (rotation and position) that makes the pair
+    agree: the lattice pairs agree at 1.000 after 4.5° and 6.2° (inside 3 σ), so it excuses them
+    too. With the 2.16 refused window (README "Depth-consistency resolution"), every
+    sigma-scaled tolerance tried excuses the synthetic lattice: its evidence is the count;
+  * excluding depth-edge and mixed pixels (`edge_free`) from the counts: 0-9 % fewer see-through
+    points on the post-re-anchor pairs (87 → 79, 54 → 51, 26 → 25, 15 → 15), none passes;
+    lattice unchanged (534). No benefit measured; not adopted;
+  * support in both directions: the lattice pairs fail one way only (1.000 a→b), so it would
+    commit the lattice;
+  * blaming the new frame that fails more pairs instead of both: the lattice turn's first frame
+    fails two pairs (f3, f4), each of those one, so it would reject the true first frame and
+    commit the lattice frames (from the test's pairs; not run as a variant). Not adopted: the
+    support rule removes the smoke case's need for it (no failing pair is left in its first
+    round), and the thin rotation-only fit (below) its cause;
+  * more support at far range: the post-re-anchor see-through points lie at 1.2-2.0 m (median),
+    not far; the count rule covers both.
+  *Offline on every logged job's first round* (dependents not modelled): the arc jobs 07:42:36 and
+  07:43:54 reject 0 of 3 (2.18: 2), the smoke job 0 of 17 (2.18: 2), the 2.16 probe `b70236` 0
+  of 1 (2.18: 1); rev8_wheeled `12e6e9` still 11 of 16 and `fc947b` 12 of 16 contradict (whole
+  rejection kept); rev8_wheeled2 `3f4cb8` 5 of 17 (2.18: 9), `ab8c78` 8 of 17 (2.18: 12); the
+  rev9_x3_a job at 06:24:27 (10 points at 0.87/0.88, against a misplaced stored region) now
+  commits: 10 points cannot tell it from the arc views. *Cost*: no time (a count); a wrong view
+  that overlaps the others little contradicts few points: in the test room
+  (`test_depth_consistency_pairs_registered_sensor_frames_only`) a committed view turned 10-45°
+  still fails (0.51-0.87), turned 60° it overlaps them on ~600 points with 72 seen through (0.88)
+  and passes, where 2.18 failed it. The registration gate, which this rule leaves unchanged,
+  is what keeps such a pose from being registered.
+* **Thin rotation-only fits** (map.md §2; `AnchoredMap._image_conflict`, `Solve.confirmed`,
+  `ROTATION_PRIOR_K` = 2, `ROTATION_CONFIRM_MIN` = 200). A rotation-only image pose more than
+  2 × its `metric` prior's rotation sigma from it whose depth confirmation agreed on fewer than
+  200 points one way is too loose to confirm the frame: `kept_at_prior`, `loose_image_pose`.
+  *Why*: the smoke job's `_0012` (52 % valid depth, median 0.99 m, near clutter) registered
+  rotation-only 5.3° off its metric prior (σ 2°, conflict bound 6.6°) on 41/113 agreeing points
+  and `_0010` registered on it. Normal confirmations agree on 600-1900 points. *Replay* of the
+  smoke map's 12 stored views as one job: `_0012` registers rotation-only at 5.23° off on 57/114
+  points at 2.18; now it is kept at its prior (0.00°), the other 11 unchanged.
+* *Replays* (archived maps, stored views replayed one job per version, 2.18 = 91675c2):
+  | map | 2.18 | 2.19 |
+  | --- | --- | --- |
+  | smoke_777f678_base (12 stored views) | `_0012` rotation-only 5.23° off | kept at its prior |
+  | rev9_x3_b | jobs 07:42:43 and 07:44:33 rejected whole, 07:44:01_0004 rejected | all commit |
+  | rev9_x3_a | 061754197_0009 rejected, job 061809682 rejected whole | both commit (0.13, 0.09 m from the client's truth) |
+  | rev8_wheeled_depth | v4 `0007` rejected, v5 4 rejected | v4 `0007` commits at 0.02 m / 0.05° from its prior, `0008` registered; v5 the same 4 rejected |
+  | rev8_wheeled2_depth, smoke_9ca6a86_base, smoke_7cc680c_base | | identical |
+  | e305, e205, j3, j5, j6 (monocular) | | identical (no sensor depth) |
+  Downstream on rev9_x3_b, the committed post-re-anchor frames (2.18 places them 0.18 m from the
+  live map, σ 0.6 m) move the drift estimate's reference: 4 frames of the last two looks
+  (07:46:21, 07:46:48), registered within 4 cm of the live map at 2.18, are held at their priors
+  (0.32 m away) by the one-view rule (2 of 3 views agree). On rev9_x3_a later frames move by
+  0.2-0.4 m through the same estimate, the four looks with the client's truth unchanged or
+  closer.
+* *Not replayable*: frames rejected live were never stored (the smoke job's `_0008`-`_0011`,
+  `_0013`, the arc views); their results above come from their logged pairs.
+
 ### Objects, surfaces and relations (O8)
 
 * **Label vocabulary** (oms/2.3, map.md §5). An update's optional `labels` (at most 64, each

@@ -26,11 +26,12 @@ from tests.unit.test_service_prior_first import CAM, client, dry, frames_for  # 
 
 
 def _counts(r: float | None) -> DepthCounts:
-    """One way of a pair: 100 points agreeing or contradicting at ratio ``r``; None: too few
-    counted points (an unmeasured direction)."""
+    """One way of a pair: 1000 points agreeing or contradicting at ratio ``r`` (below the
+    agreement threshold, at least ``CONTRADICTION_MIN_POINTS`` contradict: a supported
+    contradiction, oms/2.19); None: too few counted points (an unmeasured direction)."""
     if r is None:
-        return DepthCounts(100, 5, 0, 0, 95)
-    return DepthCounts(100, round(100 * r), 100 - round(100 * r), 0, 0)
+        return DepthCounts(1000, 5, 0, 0, 995)
+    return DepthCounts(1000, round(1000 * r), 1000 - round(1000 * r), 0, 0)
 
 
 def P(a: str, b: str, ab: float | None = 1.0, ba: float | None = 1.0) -> sp.DepthPair:

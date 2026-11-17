@@ -1121,7 +1121,7 @@
               },
               "fails": {
                 "type": "boolean",
-                "description": "Whether the pair failed the depth-consistency limit: in some direction, at least the minimum count of points agreed or contradicted and fewer than the agreement threshold of them agreed."
+                "description": "Whether the pair failed the depth-consistency limit: in some direction, at least the minimum count of points agreed or contradicted and fewer than the agreement threshold of them agreed, the contradiction supported (oms/2.19: fewer than the clear share of them agreed, or at least the minimum number of points contradicted; map.md section 4)."
               },
               "outcome": {
                 "enum": [
