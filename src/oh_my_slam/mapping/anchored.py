@@ -1591,6 +1591,15 @@ class Keyframe:
     # neighbours of its measured scale whose baseline was a body link path
     body: dict[str, Any] | None = None
     stereo_links: list[str] | None = None
+    # marked suspect by the depth-consistency limit (map.md §4, oms/2.16: ``standpoint
+    # .depth_resolve``): {"contradicted_by": [{name, agree_ratio_keyframe, agree_ratio_frame}]};
+    # no reference and never paired again, its pose and content kept (``reference``)
+    suspect: dict[str, Any] | None = None
+
+    def reference(self) -> bool:
+        """Whether it is a registration reference (map.md §2): image-confirmed (``usable``) and
+        not marked suspect by the depth-consistency limit (oms/2.16)."""
+        return self.usable() and self.suspect is None
 
     def link_measured(self) -> bool:
         """Whether its measured scale rests on body-link pairs only (map.md §1 "Keyframe depth
@@ -1654,7 +1663,7 @@ class Keyframe:
                 "conflict": self.conflict, "stereo_scale": self.stereo_scale,
                 "stereo_sigma": self.stereo_sigma, "stereo_pairs": self.stereo_pairs,
                 "stereo_judged": self.stereo_judged, "body": self.body,
-                "stereo_links": self.stereo_links}
+                "stereo_links": self.stereo_links, "suspect": self.suspect}
 
     @staticmethod
     def from_json(d: dict[str, Any]) -> Keyframe:
@@ -1675,7 +1684,8 @@ class Keyframe:
                         stereo_scale=d.get("stereo_scale"), stereo_sigma=d.get("stereo_sigma"),
                         stereo_pairs=d.get("stereo_pairs"),
                         stereo_judged=bool(d.get("stereo_judged", False)),
-                        body=d.get("body"), stereo_links=d.get("stereo_links"))
+                        body=d.get("body"), stereo_links=d.get("stereo_links"),
+                        suspect=d.get("suspect"))
 
     @property
     def centre(self) -> Array:
@@ -2161,6 +2171,9 @@ class Placement:
     rival: bool = False
     # its body link's report (oms/2.15, api.md §4 ``body_link``), None: no ``body.motion``
     link: dict[str, Any] | None = None
+    # with reason depth_inconsistent (oms/2.16, map.md §4): the frames it contradicts or whose
+    # rejection its registration rested on (``depth_inconsistent_with``)
+    depth_with: tuple[str, ...] = ()
 
 
 def _lifted(corr: _Corr, cands: list[Keyframe]) -> tuple[Array, Array]:
@@ -2808,6 +2821,19 @@ class AnchoredMap:
         self._held_names: set[str] = set()
         self._rule: tuple[bool, list[str], list[str]] = (False, [], [])
         self._pair_cache: dict[str, Any] | None = None
+        # the running job's depth-consistency resolution (map.md §4, oms/2.16;
+        # ``plan_depth_rerun``): its rounds' ``quality.depth_pairs`` rows by pair, the frames it
+        # rejected (name -> the frames named), the stored keyframes it marked suspect (id -> the
+        # report's ``contradicted_by``) and those it unmarked, its re-runs, the count of frames
+        # that registered with sensor depth in its first registration, and whether no consistent
+        # part of the update remains (the hard limit)
+        self.depth_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        self.depth_rejected: dict[str, tuple[str, ...]] = {}
+        self.depth_suspects: dict[str, list[dict[str, Any]]] = {}
+        self.depth_vetoed: set[str] = set()
+        self.depth_runs = 0
+        self.depth_first: int | None = None
+        self.depth_whole = False
 
     @property
     def pair_cache(self) -> dict[str, Any]:
@@ -2977,6 +3003,9 @@ class AnchoredMap:
         self._stored_ids = {k.id for k in self.keyframes}
         if not self.reran:  # a second registration of the job keeps them (``_epi``)
             self._epi, self._placed, self._preps, self._digests = {}, {}, {}, {}
+            self.depth_rows, self.depth_rejected, self.depth_suspects = {}, {}, {}
+            self.depth_vetoed, self.depth_runs, self.depth_first = set(), 0, None
+            self.depth_whole = False
         self.drift.fresh = []  # an earlier job's confirmations are committed: they support now
         self._held, self._held_names, self._rule = [], set(), (False, [], [])
         got = self.map_floor()
@@ -3098,7 +3127,7 @@ class AnchoredMap:
         return s_b if abs(s_b - 1.0) > 2.0 * math.hypot(sigma, vis) else 1.0
 
     def _candidates(self, f: FrameIn, T0: Array | None, descriptor: Any) -> list[Keyframe]:
-        usable = [k for k in self.keyframes if k.usable()]
+        usable = [k for k in self.keyframes if k.reference()]
         if T0 is not None:
             scored = []
             for k in usable:
@@ -3712,7 +3741,7 @@ class AnchoredMap:
         if f.body is None or f.body.motion is None:
             return ()
         k = self._named(f.body.motion.source_name)
-        if k is None or not k.usable():
+        if k is None or not k.reference():
             return ()
         return k.id, k.T.tobytes(), k.sigma_pos_m, k.sigma_rot_deg
 
@@ -3744,8 +3773,9 @@ class AnchoredMap:
         link = bl.camera_link(fb.mount, b.mount, bl.compose([bl.Step(b.motion, False)]))
         row.update(baseline_m=round(link.baseline_m, 5), sigma_m=round(link.sigma_t, 5),
                    rotation_deg=round(link.rotation_deg, 3))
-        if k is None or not k.usable():
-            row["reason"] = "from_unconfirmed"  # never chained from a kept frame
+        if k is None or not k.reference():
+            # never chained from a kept frame, nor a suspect one (oms/2.16)
+            row["reason"] = "from_unconfirmed"
             return row, link, None
         row["reason"] = "no_match"
         return row, link, k
@@ -4606,7 +4636,7 @@ class AnchoredMap:
             out, used = self._register_drift(frames, prep, snap, progress)
             self._close_drift(frames, out, used)
             pls = [out[i] for i in range(len(frames))]
-            if hold or not self.plan_rerun(pls):
+            if hold or not (self.plan_rerun(pls) or self.plan_depth_rerun(pls)):
                 break
             self._restore(snap)
         if hold and self._close_base is None:
@@ -4873,7 +4903,7 @@ class AnchoredMap:
 
         again = self._rereg_ids()
         cands = [entry(k) for k in self.confirmed() if k.id in self._stored_ids
-                 and k.id not in again]
+                 and k.id not in again and k.suspect is None]
         out: dict[str, Placement] = {}
         for k in sorted((k for k in self.confirmed() if k.id not in self._stored_ids
                          or k.id in again), key=lambda k: (natural_key(k.name), k.camera_id)):
@@ -4975,6 +5005,62 @@ class AnchoredMap:
         self.reran.add("duplicates")
         log.info("pose duplicates %s served the job: it registers once more without them",
                  sorted(dups))
+        return True
+
+    def job_stored(self) -> set[str]:
+        """The keyframes image-confirmed before the running job and not re-registered by it:
+        the stored map the depth-consistency limit judges new frames against (oms/2.16)."""
+        return {k.id for k in self.confirmed() if k.id in self._stored_ids} - self._rereg_ids()
+
+    def plan_depth_rerun(self, pls: list[Placement]) -> bool:
+        """Whether the job registers once more for its depth consistency (map.md §4
+        "Resolution", oms/2.16): one round of ``standpoint.depth_plan`` over its placements
+        ``pls`` at the registration fixed point. A round marks or unmarks stored keyframes
+        suspect (``Keyframe.suspect``: no reference from the next registration on) and rejects
+        new frames ``depth_inconsistent`` (``_exclude``); when it changed something, the job
+        registers again, at most ``DEPTH_RESOLVE_RUNS`` times. The whole-update rejection
+        (``depth_whole``) ends it: more than ``DEPTH_REJECT_MAX_SHARE`` of the frames that
+        registered with sensor depth in the first registration rejected."""
+        from oh_my_slam.mapping import standpoint
+
+        if self.depth_whole:
+            return False
+        got = standpoint.depth_plan(self, pls)
+        if got is None:
+            return False
+        rows, res, n = got
+        if self.depth_first is None:
+            self.depth_first = n
+        self.depth_rows.update(rows)
+        rejected = {**self.depth_rejected, **res.reject}
+        if res.reject and len(rejected) > standpoint.DEPTH_REJECT_MAX_SHARE * self.depth_first:
+            self.depth_whole = True
+            log.info("depth consistency: %d of %d frames contradict: no consistent part remains",
+                     len(rejected), self.depth_first)
+            return False
+        if not (res.reject or res.mark or res.veto) \
+                or self.depth_runs >= standpoint.DEPTH_RESOLVE_RUNS:
+            return False
+        for kid in res.veto:
+            kf = self.keyframe(kid)
+            assert kf is not None
+            kf.suspect = None
+            del self.depth_suspects[kid]
+            self.depth_vetoed.add(kid)
+        for kid, ev in res.mark.items():
+            kf = self.keyframe(kid)
+            assert kf is not None
+            kf.suspect = {"contradicted_by": ev}
+            self.depth_suspects[kid] = ev
+        by = {pl.name: pl for pl in pls}
+        for name, with_ in res.reject.items():
+            self._exclude[name] = Placement(name, "rejected", "depth_inconsistent",
+                                            inliers=by[name].inliers, depth_with=with_)
+        self.depth_rejected = rejected
+        self.depth_runs += 1
+        self.reran.add("depth")
+        log.info("depth consistency: rejects %s, marks %s suspect, unmarks %s: it registers "
+                 "once more", sorted(res.reject), sorted(res.mark), sorted(res.veto))
         return True
 
     def _prepared(self, frames: list[FrameIn], static: bool) -> list[_Prep]:

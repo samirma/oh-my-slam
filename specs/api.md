@@ -136,7 +136,7 @@ error code `invalid_request` (§9).
   | --- | --- |
   | `name` | The frame's name. |
   | `status` | `registered`, `provisional` (registered, not yet fused: the O3 two-phase state), `kept_at_prior` or `rejected`. A `kept_at_prior` frame whose `detail` is `conflict_unsupported` contributes nothing to the map, whatever its `reason`; every other kept frame counts for free-by-rule cells only (Kept at prior, below). |
-  | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`. |
+  | `reason` | Null for `registered` and `provisional`. Set for `rejected` and `kept_at_prior`: `no_overlap`, `few_features`, `plain`, `too_close`, `blur`, `prior_conflict`, `duplicate` or `unusable_image`; since oms/2.16 also `depth_inconsistent`, for `rejected` only (Depth consistency, below). |
   | `inliers` | Number of inliers. |
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. Null for a frame whose `status` is `rejected`. For the frames of a job the gate rejected (`accept_if`, map.md §4) the frames keep their own statuses, and these fields hold the pose and sigmas that would have been committed. |
   | `depth_scale` | Optional (oms/2.4). Present when the frame's monocular depth got its own scale from the floor check (map.md §2): the factor applied to its raw depth, in map metres, in place of the map's; since oms/2.14 also for a frame judged about its measured scale (`stereo_scale.judged`). Absent otherwise, also for a frame the floor check did not judge (`detail` `floor_not_judged`). |
@@ -147,6 +147,7 @@ error code `invalid_request` (§9).
   | `inlier_floor_share` | Optional (oms/2.13). The share of the frame's image pose's inliers that are floor points (map.md §2, Texture-aliasing guards): near 1 when the pose rests on the floor's texture. Null when the frame has no points fit (no image pose, a rotation-only fit, the older mapper) or the map has no floor. |
   | `min_distance_m`, `scene_distance_m` | With reason `too_close` only: the distance limit applied, and the frame's median scene depth. |
   | `duplicate_of` | With reason `duplicate` only: the name of the frame it duplicates. |
+  | `depth_inconsistent_with` | With reason `depth_inconsistent` only (oms/2.16): the names of the frames whose sensor depth its committed view contradicts (failing pairs, map.md §4), or, for a frame rejected because its registration rested only on rejected frames, the names of those frames; in canonical order. |
   | `detail` | For a `kept_at_prior` frame whose images did not confirm it, why: `no_image_pose` (the images give no pose), `loose_image_pose` (the image pose is too loose to confirm the prior) or `conflict_unsupported` (the image pose conflicts with the prior without enough support to reject it: the frame contributes nothing, not even free-by-rule cells, since the prior is what is in doubt; the frame's `reason` may then be a failed check too, below). For a `registered` or `provisional` monocular frame the floor check did not judge (oms/2.5, map.md §2): `floor_not_judged` (its own depth scale lay beyond the monocular scale bound: it keeps the map's scale, has no `depth_scale`, is not rejected and keeps its pose, but its content is excluded: no cloud points, occupancy, `height_m` or objects from it, and its depth gives no scale evidence, only free-by-rule cells from its trusted pose; the client can retake the view; its sent camera height constrains only its own camera pose, and is never combined with its own depth or floor plane into a scale estimate (map.md §2); the keyframe stays a registration reference for image matching and pose; its depth lifts later frames' points fits for their pose only (oms/2.13), never their alignment, depth confirmation or scale evidence, and nothing in locate (map.md §2, §6 below))). A frame kept for a failed check (`reason` `plain`, `blur`, `few_features` or `too_close`) has `detail` `conflict_unsupported` when its images show a conflict with its prior beyond the conflict bound (Kept at prior, below), so that its reason does not hide that it contributes nothing; null when they show none. Null otherwise. |
 
   **Kept at prior.** `kept_at_prior` is a frame with a prior that its images did not confirm.
@@ -441,7 +442,8 @@ error code `invalid_request` (§9).
     `reason`: `from_unknown` (the
     `from` frame is neither in the request nor stored in the base version: rejected, reverted,
     or its job did not commit), `from_unconfirmed` (the `from` frame is not image-confirmed: a
-    stored `kept_at_prior` frame, or a job frame that ends unregistered), `from_no_mount` (a stored `from` frame without a mount),
+    stored `kept_at_prior` frame, or a job frame that ends unregistered; since oms/2.16 also a
+    keyframe marked suspect, map.md §4), `from_no_mount` (a stored `from` frame without a mount),
     `stale_mount`, `from_stale_mount`, `from_moving` (a `none` motion from a stored frame that
     was not standing), `no_match` (fewer epipolar inliers between the two than
     the registration minimum), `inconsistent` (the images' relative rotation disagrees with the
@@ -481,12 +483,34 @@ error code `invalid_request` (§9).
 * **Gate.** `accept_if` ([`AcceptIf`]) gates the job (map.md §4). The job's `quality` (and a
   dry run's) lists in `rotation_pairs` every measurable pair the rotation check evaluated, with
   its measured, committed and difference angles, so a client can see which pairs drove
-  `rotation_inconsistent` (map.md §4). `failed_checks` holds `depth_inconsistent` (oms/2.6) when
-  two committed views contradict each other's sensor depth images (map.md §4, Depth
-  consistency), with or without priors; a dry run predicts it. `quality.depth_pairs` (oms/2.6)
-  lists every pair that limit evaluated, `{a, b, agree_ratio_ab, agree_ratio_ba, fails}`, on jobs
-  and dry runs, so on a rejection a client sees which frames contradict and can drop or retake
-  them.
+  `rotation_inconsistent` (map.md §4). `quality.depth_pairs` (oms/2.6) lists every pair the
+  depth-consistency limit evaluated, `{a, b, agree_ratio_ab, agree_ratio_ba, fails, outcome}`,
+  on jobs and dry runs.
+* **Depth consistency** (oms/2.16; map.md §4). Committed views whose sensor depth images
+  contradict each other no longer cost the whole update:
+  * A new frame whose view contradicts a stored keyframe is `rejected` with reason
+    `depth_inconsistent` and `depth_inconsistent_with` naming the frames it contradicts; two
+    new frames that contradict each other (with no frame contradicting the stored map) are
+    both rejected; a frame registered only through rejected frames is rejected with them. The
+    job registers again without them, and the rest commits when it passes every limit.
+  * The update is rejected whole (`failed_checks` `depth_inconsistent`, as before oms/2.16)
+    only when the rejected frames are more than half of its frames that registered with a
+    depth image (a lattice-registered sequence is most of its update), or a contradiction
+    remains after the re-runs. A one-frame update whose frame contradicts is rejected whole.
+  * A stored keyframe contradicted by at least 3 new frames that are anchored in the stored
+    map, agree with a stored keyframe they were not registered against, contradict no other
+    stored keyframe and agree with each other is marked suspect instead
+    (`quality.suspect_keyframes[]`, `{name, contradicted_by[{name, agree_ratio_keyframe,
+    agree_ratio_frame}]}`): those frames commit, and the keyframe keeps its pose and content but
+    is no longer paired nor a registration or locate reference. Frames reads show the mark as
+    `depth_suspect_version`.
+  * `quality.depth_pairs[].outcome` tells what each failing pair did: `frame_rejected`,
+    `keyframe_suspect` or `update_rejected` (null for a pair that passes); pairs of rejected
+    frames stay listed.
+  * What a client does: drop or retake the frames rejected `depth_inconsistent` (a view seen
+    through glass or past a thin structure from another standpoint is the usual cause); retake
+    the view of a suspect keyframe when it matters (it is never a pose duplicate of it). A
+    single probe cannot mark a keyframe suspect: send a look (3 frames or more) of the place.
 * **Dry run.** `?dry_run=1` answers synchronously with a [`DryRun`] and writes nothing. It never
   waits behind fusion: it runs on the interactive lane, or ahead of fusion on a service with a
   single worker (inference.md). Documented limit: a job registers frames that carry depth
@@ -501,6 +525,8 @@ error code `invalid_request` (§9).
   * the predicted links to its neighbours in the request: `neighbour_inliers[]`;
   * the flags `plain` and `too_close`;
   * with `predicted_reason` `duplicate`: `duplicate_of`, as in `inputs[]`;
+  * with `predicted_reason` `depth_inconsistent` (oms/2.16): `depth_inconsistent_with`, as in
+    `inputs[]`;
   * with `predicted_reason` `too_close`: `min_distance_m` and `scene_distance_m`, as in
     `inputs[]`;
   * `stereo_scale` (oms/2.14): the keyframe depth scale the update would measure for the frame,
@@ -677,6 +703,8 @@ The versions read, revert and `--keep-versions` are O2.
 * **Provisional frames.** Locate works against a version whose newest frames are still
   provisional, using their provisional poses.
 * **Frames kept at prior.** Locate never uses a `kept_at_prior` frame as a reference.
+* **Suspect keyframes** (oms/2.16). Locate never uses a keyframe the depth-consistency limit
+  marked suspect (map.md §4) as a reference.
 * **Frames the floor check did not judge** (oms/2.6). A keyframe with `detail`
   `floor_not_judged` (map.md §2) stays a reference for image matching and pose, with its
   features used and its depth not, as in registration (map.md §2): that depth lifts no located

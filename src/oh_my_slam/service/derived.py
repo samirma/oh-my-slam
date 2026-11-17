@@ -541,8 +541,10 @@ class Derived:
         kfs: list[relocalize.Keyframe] = []
         keys: dict[str, str] = {}
         for f in frames:
-            if f.get("pose_state") == "kept_at_prior":
-                continue  # a pose the images did not confirm: never a locate reference
+            if f.get("pose_state") == "kept_at_prior" or f.get("depth_suspect"):
+                # a pose the images did not confirm, or a keyframe the depth consistency marked
+                # suspect (map.md §4, oms/2.16): never a locate reference
+                continue
             img = internal.image(f["internal"]) if internal is not None and f.get("internal") \
                 else None
             if img is None or not img.exists():

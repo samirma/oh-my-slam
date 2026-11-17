@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/samirma/oh-my-slam/specs/api.schema.json",
   "title": "oh-my-slam API bodies",
-  "description": "Schema version oms/2.15. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
+  "description": "Schema version oms/2.16. Units: metres, degrees, seconds. Map frame: x, y horizontal, z up, yaw counter-clockwise from +x. Camera frame: x right, y down, z forward. T_a_b is the 4x4 pose of b in a, row-major nested arrays. Binary arrays are base64 of little-endian data, row-major. Body frame (oms/2.15): the robot's own frame, z up (along gravity when the body stands level), x forward, y left; T_body_cam is the pose of the camera's optical frame in it.",
   "$defs": {
     "SchemaVersion": {
       "type": "string",
@@ -364,9 +364,10 @@
         "blur",
         "prior_conflict",
         "duplicate",
-        "unusable_image"
+        "unusable_image",
+        "depth_inconsistent"
       ],
-      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior; the check wins the reason only: such a conflict (evaluated only when an image-only pose exists) is shown by detail conflict_unsupported and the frame contributes nothing. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change (when its image-only pose meets the measurable-pair threshold; otherwise kept_at_prior, conflict_unsupported). In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap, both with the same confirmed or registered reference); a frame failing a looseness test is kept_at_prior with loose_image_pose, whatever else it fails; otherwise it is kept_at_prior with detail conflict_unsupported."
+      "description": "unusable_image: the image does not decode or its size is not the camera's; the only rejection for a frame with a prior whose image fails a check (plain, blur, few_features make it kept_at_prior). duplicate: a name the map or request already holds, or a pose duplicate (within 0.02 m and 2 deg of a stored confirmed keyframe or another frame registered in the job (the later-named frame of a pair is the duplicate), same camera) whose image also agrees (>= 90 % features re-matched; no detection is run); duplicate_of names that frame. prior_conflict: the images confirm a pose farther than 3 x sqrt(sigma_prior^2 + sigma_hypothesis^2) from the prior (position and rotation separately) and no supported hypothesis lies within that bound; sigma_hypothesis is the image-only calibrated sigma, before fusion with the prior and without rival inflation; for a drifting prior, sigma_prior is the drift-grown sigma. A frame with a prior that fails a check or is too close stays kept_at_prior with that reason even when its image strongly conflicts with its prior; the check wins the reason only: such a conflict (evaluated only when an image-only pose exists) is shown by detail conflict_unsupported and the frame contributes nothing. prior_conflict also: a drifting-prior frame left out of the robust drift fit, or unsupporting a refused drift change (when its image-only pose meets the measurable-pair threshold; otherwise kept_at_prior, conflict_unsupported). In an update, a frame failing its prior checks is rejected prior_conflict only when its image-only pose meets the measurable-pair threshold (>= 100 inliers and >= 10 % overlap, both with the same confirmed or registered reference); a frame failing a looseness test is kept_at_prior with loose_image_pose, whatever else it fails; otherwise it is kept_at_prior with detail conflict_unsupported. depth_inconsistent (oms/2.16, rejected only): the frame's committed view contradicts the sensor depth of a stored keyframe (or of another new frame, when no frame contradicts a stored one), or its registration rested only on frames rejected so; the job registers again without it and the rest commits (map.md section 4, Depth consistency); depth_inconsistent_with names the frames."
     },
     "InputStatus": {
       "type": "object",
@@ -497,6 +498,13 @@
           "type": "string",
           "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior. Kept even if the partner ends differently when the fixed point is re-run (at most once per job)."
         },
+        "depth_inconsistent_with": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "oms/2.16. With reason depth_inconsistent only: the frames whose sensor depth this frame's committed view contradicts (failing depth pairs), or, for a frame whose registration references were all rejected depth_inconsistent, those frames; in canonical order."
+        },
         "detail": {
           "oneOf": [
             {
@@ -623,7 +631,10 @@
             "properties": {
               "reason": {
                 "not": {
-                  "const": "duplicate"
+                  "enum": [
+                    "duplicate",
+                    "depth_inconsistent"
+                  ]
                 }
               }
             }
@@ -717,6 +728,28 @@
                   "conflict_unsupported",
                   null
                 ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "depth_inconsistent"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "depth_inconsistent_with"
+            ],
+            "properties": {
+              "status": {
+                "const": "rejected"
               }
             }
           }
@@ -927,7 +960,7 @@
               "depth_inconsistent"
             ]
           },
-          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. depth_inconsistent (oms/2.6; every update whose frames carry sensor depth images, with or without priors; every engine but the older mapper; jobs and dry runs): two committed views contradict each other's depth images, mapped under their committed relative pose. The pairs are the update's registered frames with each other and with the stored image-confirmed keyframes, where both carry sensor depth images and can share a view; a frame kept at its prior without image confirmation is not paired, and a monocular frame is not tested. A point is a contradiction only when the other view would see through it by more than the depth tolerance plus 3 x the two frames' combined committed position sigma; a pair fails when, in either direction, at least the depth confirmation's minimum count of points agree or contradict and fewer than its agreement threshold of them agree. It uses the committed poses and depth images only. hard_limit fails only an update that registers nothing and keeps nothing."
+          "description": "prior_frames_rejected: every prior-carrying frame of a map's first update was rejected; no version is committed and no map created. An engine that cannot tie kept frames to the priors' frame, when no prior-carrying frame of the first update registers, may also reject with it. rotation_inconsistent (updates without priors only, every engine): committed relative rotations of overlapping neighbours disagree with the image-measured ones by more than 3 deg in median over the pairs, or more than 10 deg on any pair. Pair limits are measured on registered frames only, over measurable pairs (>= 100 epipolar inliers of a pose confirmed by the pair's depth images where both frames carry depth, and consistent with the chain of stronger pairs); with no measurable pair, every pair limit passes. depth_inconsistent (oms/2.6; every update whose frames carry sensor depth images, with or without priors; every engine but the older mapper; jobs and dry runs): two committed views contradict each other's depth images, mapped under their committed relative pose. The pairs are the update's registered frames with each other and with the stored image-confirmed keyframes, where both carry sensor depth images and can share a view; a frame kept at its prior without image confirmation is not paired, and a monocular frame is not tested. A point is a contradiction only when the other view would see through it by more than the depth tolerance plus 3 x the two frames' combined committed position sigma; a pair fails when, in either direction, at least the depth confirmation's minimum count of points agree or contradict and fewer than its agreement threshold of them agree. It uses the committed poses and depth images only. Since oms/2.16 a contradiction rejects the new frames in it (reason depth_inconsistent) or marks a stored keyframe suspect (suspect_keyframes), and the rest commits; depth_inconsistent rejects the update only when the frames so rejected are more than half of its frames that registered with a sensor depth image, or a failing pair remains after the re-runs (a one-frame update whose frame fails included). hard_limit fails only an update that registers nothing and keeps nothing."
         },
         "reregistered": {
           "type": "array",
@@ -1072,10 +1105,72 @@
               "fails": {
                 "type": "boolean",
                 "description": "Whether the pair failed the depth-consistency limit: in some direction, at least the minimum count of points agreed or contradicted and fewer than the agreement threshold of them agreed."
+              },
+              "outcome": {
+                "enum": [
+                  "frame_rejected",
+                  "keyframe_suspect",
+                  "update_rejected",
+                  null
+                ],
+                "description": "oms/2.16. What the pair did: null when it passes; for a failing pair, frame_rejected (a frame of it was rejected depth_inconsistent, or no longer registered after a re-run), keyframe_suspect (it involves a keyframe this job marked suspect: it rejects nothing) or update_rejected (the hard limit rejected the update)."
               }
             }
           },
-          "description": "oms/2.6. Every pair the depth-consistency limit evaluated (map.md section 4), jobs and dry runs; empty when it evaluated no pair (no sensor depth, or the older mapper). On a depth_inconsistent rejection it shows which frames contradict each other, so a client can drop or retake them."
+          "description": "oms/2.6. Every pair the depth-consistency limit evaluated (map.md section 4), jobs and dry runs; empty when it evaluated no pair (no sensor depth, or the older mapper). On a depth_inconsistent rejection it shows which frames contradict each other, so a client can drop or retake them. Since oms/2.16 it lists every round of the resolution (a pair as last evaluated), the pairs of frames rejected depth_inconsistent included."
+        },
+        "suspect_keyframes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "contradicted_by"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The stored keyframe's frame name."
+              },
+              "contradicted_by": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "agree_ratio_keyframe",
+                    "agree_ratio_frame"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "A new frame of the job."
+                    },
+                    "agree_ratio_keyframe": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "Agreeing share of the keyframe's depth points seen by the frame; null below the minimum count."
+                    },
+                    "agree_ratio_frame": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "minimum": 0,
+                      "maximum": 1,
+                      "description": "Agreeing share of the frame's depth points seen by the keyframe; null below the minimum count."
+                    }
+                  }
+                },
+                "description": "The frames that supported the mark, in canonical order."
+              }
+            }
+          },
+          "description": "oms/2.16. The stored keyframes this job marked suspect (map.md section 4, Depth consistency): contradicted by at least 3 new frames, each anchored in the stored map (a registration reference among the stored keyframes agrees with it), agreeing with a stored keyframe it was not registered against, contradicting no other stored keyframe, and agreeing with each other. A suspect keyframe keeps its pose and content but is no longer paired by the limit nor a registration or locate reference; the mark is part of the committed version. Empty when none; dry runs predict it."
         },
         "scale_check": {
           "type": [
@@ -1338,6 +1433,13 @@
           "type": "string",
           "description": "With reason duplicate: the frame it duplicates. A name duplicate (a name the map or request already holds) is always rejected. A pose duplicate (registered pose within 0.02 m and 2 deg, defaults configurable below 0.05 m / 5 deg, of a stored confirmed keyframe or another frame registered in the job (one pass after the registration fixed point, in canonical name order; the later-named frame of a pair is the duplicate), same camera) is rejected only when its image also agrees: >= 90 % of features re-matched (no detection is run); otherwise it is registered. A duplicate is always rejected, never kept_at_prior. Kept even if the partner ends differently when the fixed point is re-run (at most once per job)."
         },
+        "depth_inconsistent_with": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "oms/2.16. With predicted_reason depth_inconsistent: as in inputs[]."
+        },
         "stereo_scale": {
           "$ref": "#/$defs/StereoScale",
           "description": "oms/2.14. The keyframe depth scale the update would measure for this frame (as in inputs[]); absent when it would measure none."
@@ -1380,6 +1482,23 @@
           "then": {
             "required": [
               "duplicate_of"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "predicted_reason": {
+                "const": "depth_inconsistent"
+              }
+            },
+            "required": [
+              "predicted_reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "depth_inconsistent_with"
             ]
           }
         }
@@ -1663,6 +1782,10 @@
         },
         "added_version": {
           "type": "integer"
+        },
+        "depth_suspect_version": {
+          "type": "integer",
+          "description": "oms/2.16. Present when the depth-consistency limit marked this keyframe suspect (map.md section 4): the version that marked it. It keeps its pose and content, but is no registration or locate reference and is not paired by the limit."
         }
       }
     },
@@ -3722,7 +3845,7 @@
               "type": "null"
             }
           ],
-          "description": "Null when used. from_unknown: the from frame is neither in the request nor stored in the base version (rejected, reverted, or its job did not commit). from_unconfirmed: the from frame is not image-confirmed (a stored kept_at_prior frame, or a job frame that ends unregistered). from_no_mount: the stored from frame has no mount. stale_mount / from_stale_mount: this frame's / the from frame's mount stamp lies beyond the tolerance. from_moving: a none motion from a stored frame that was not standing. no_match: fewer epipolar inliers between the two than the registration minimum. inconsistent: the images' relative rotation disagrees with the link's beyond its bound (rotation_residual_deg). engine: the older mapper uses no links."
+          "description": "Null when used. from_unknown: the from frame is neither in the request nor stored in the base version (rejected, reverted, or its job did not commit). from_unconfirmed: the from frame is not image-confirmed (a stored kept_at_prior frame, or a job frame that ends unregistered; since oms/2.16 also a keyframe marked suspect). from_no_mount: the stored from frame has no mount. stale_mount / from_stale_mount: this frame's / the from frame's mount stamp lies beyond the tolerance. from_moving: a none motion from a stored frame that was not standing. no_match: fewer epipolar inliers between the two than the registration minimum. inconsistent: the images' relative rotation disagrees with the link's beyond its bound (rotation_residual_deg). engine: the older mapper uses no links."
         },
         "baseline_m": {
           "type": [

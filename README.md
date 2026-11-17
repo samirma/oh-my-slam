@@ -850,8 +850,9 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   `test_a_job_measures_the_stored_pairs_its_chains_need`, never fires; the rotation sigma is not
   in it, since the 1.25° floor × 3 × 3 m swallows the near-exact lattice's contradictions). A
   pair fails when in either direction at least `MIN_AGREEING` = 40 points agree or contradict
-  and fewer than `DEPTH_CONFIRM_AGREEMENT` = 0.90 of them agree; one failing pair rejects the
-  update `depth_inconsistent`. Each pair is logged (`depth consistency a-b: a>b agree … through
+  and fewer than `DEPTH_CONFIRM_AGREEMENT` = 0.90 of them agree; until oms/2.16 one failing
+  pair rejected the update `depth_inconsistent` (since then: *Depth-consistency resolution*,
+  below). Each pair is logged (`depth consistency a-b: a>b agree … through
   … (margin m): ok | fails`) and listed in `quality.depth_pairs` (`agree_ratio_ab`/`_ba` null
   in a direction under 40 counted points). *Evidence* (diag-lattice, the empty room with walls
   repeating every 2 or 2.5 m whose turn the registration locked 90° off): the lattice commits'
@@ -864,6 +865,93 @@ hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)).
   lattice; the room's 2 m translational twins of a whole sub-sequence, every view of which sees
   one flat wall and the floor) still passes: the accepted degenerate case. The older mapper is
   exempt (its registrations are not depth-gated): `depth_pairs` empty.
+* **Depth-consistency resolution** (map.md §4 "Resolution", "Whole-update rejection",
+  "Suspect stored keyframes", oms/2.16; `standpoint.depth_resolve`, `standpoint.depth_plan`,
+  `AnchoredMap.plan_depth_rerun`). *Why*: an RGB-D wheeled robot with lidar-corrected metric
+  priors lost a 17-view look into its map to a few contradicting views, and a one-frame probe
+  to one stored keyframe at 0.887 against 0.90 (*Replay*, below). *Where*: the pairs are
+  evaluated at the job's registration fixed point (after both engines, before `end_job`'s
+  fusion) as one more re-run planner beside the pose-duplicate and cross-engine drift ones
+  (`update`'s loop; `prior_first`'s held loop), and again on the committed poses
+  (`standpoint.depth_consistency`, the hard limit and `quality.depth_pairs`). *A round*: (1)
+  the suspect test on every stored keyframe (`AnchoredMap.job_stored`: image-confirmed before
+  the job, not re-registered by it); (2) failing pairs that involve no keyframe marked suspect
+  in the job: a new frame's with a stored keyframe (a re-registered one counts as stored)
+  rejects that frame; only in a round without any, a pair of two new frames rejects both;
+  (3) a new frame whose `Placement.refs` all belong to rejected frames goes with them
+  (transitively); rejected frames become `_exclude` placements (`depth_inconsistent`,
+  `Placement.depth_with`), and when anything changed the job registers again from its start.
+  Monotone (rejections and withdrawn marks only grow; a withdrawn mark is never made again in
+  the job, `depth_vetoed`), at most `DEPTH_RESOLVE_RUNS` = 3 re-runs; a failing pair left after
+  them, or on the committed poses, rejects the update. *Whole update*: rejected when the frames
+  rejected `depth_inconsistent` exceed `DEPTH_REJECT_MAX_SHARE` = 0.5 of the frames that
+  registered with sensor depth in the first registration (`depth_first`; the round that
+  crosses it applies nothing, `depth_whole`): a lattice-registered sequence is most of its
+  update (the diag-lattice turn of `test_a_lattice_locked_turn_is_depth_inconsistent`: 7 of
+  its 7 paired frames rejected in the first round), and a single failing frame is its whole
+  update. *Suspect*: at least `SUSPECT_MIN_FRAMES` = 3 new frames,
+  each failing its pair with the keyframe, anchored (a stored keyframe among its references,
+  not suspect, agrees with it: `DepthPair.agrees`, not failing and at least `MIN_AGREEING`
+  counted points one way), agreeing with a stored keyframe that is not among its references
+  (the one test a lattice pose fails, by P30's premise), failing no pair with another sound
+  stored keyframe, and no two of them failing with each other. Three, not two: on the client's
+  look `ab8c78` two independent views contradicted keyframe 020449553_0014, which agrees with
+  every other stored view (yaw scan, below): two would have marked a sound keyframe. *Mark*:
+  `Keyframe.suspect` (`{contradicted_by}`, `state.json`) and the version record's frame row
+  `depth_suspect {version, contradicted_by}` (copied forward by later versions; frames read
+  `depth_suspect_version`); `Keyframe.reference()` leaves it out of `_candidates`, the
+  pose-duplicate candidates, body-link `from` frames (`from_unconfirmed`), MapAnything's anchors
+  and the locate index (`derived`), and the limit no longer pairs it. Its content stays (map.md
+  §4 gives the reasons: fused while consistent, partial causes, the newer views fuse beside it).
+  Per job only: votes do not accumulate across jobs, so a probe sent alone never marks a
+  keyframe (a client sends a look). *Reports*: `inputs[].depth_inconsistent_with`,
+  `quality.suspect_keyframes`, `quality.depth_pairs[].outcome` over every round (a pair as last
+  evaluated; an earlier round's failing pair the commit no longer pairs is `frame_rejected`).
+  *Cost*: one more registration of the job per round that changes something (none on a
+  consistent update).
+  *Replay* (rev8 RGB-D wheeled robot, metric lidar-corrected priors; archived maps
+  `arch_rev8_wheeled2_depth`, `arch_rev8_wheeled_depth`, the client's job records). The
+  rejected jobs' frames were never stored, so (a) their logged `depth_pairs` were resolved
+  offline and (b) the stored keyframes were replayed one job per version through
+  `AnchoredMap.update` (stored images, depth grids, sent priors), 7cc680c against this commit:
+  * *The 0.887 pair*: stored k000014 (`20261117T020449553_0015`, frame 15 of the first look,
+    at (1.56, −2.37) looking yaw −123°) against the probe `20261117T020921865_0000` (job
+    `b70236`, 02:09:22, 1.89 m away at the second spot, yaw −88°, 35° apart): 11 % of
+    k000014's points seen through by the probe (0.887 a→b, 0.956 b→a). The same view
+    contradicted k000014 in five more jobs (`020529579_0003` 0.836, `020649255_0000` 0.845,
+    `020847954_0000` 0.884, `021057257_0000` 0.887, `021146318_0000` 0.860), always the first
+    view of a look from the second spot, so one view sent again, never independent votes.
+    Against the stored keyframes the through points lie at the left edge of k000014's view
+    (u 5-55 px, v 130-300 px) at 2.5-3.9 m where the others see 5.5-5.9 m: the desk, chair
+    legs and glazed-door frames, thin structures. Turning k000014 by +0.5° about its centre
+    takes its agreement with the second version's keyframes from 0.962/0.934/0.940 to
+    1.000/1.000/0.991, while every other keyframe of that look is best within ±0.25° or flat
+    (a yaw scan; ratios move non-monotonically over ±2° and ±10 cm): **a pose about 0.5° off,
+    within its sigmas, on thin structures**. Not glass (the panes are transparent to this depth
+    camera in every view) and not a scene change (the desk is in every view).
+  * *What 2.16 does with the client's jobs* (offline on their logged pairs, first round only):
+    `841022` (4 frames) rejects `0003` alone, commits 3; `cbcd66` rejects `0013`, commits 2;
+    `e1a947` rejects `0009`, commits 7; `00c7a1` rejects `0006`, `0013`, `0014` (then `0015`'s
+    only failure, with `0014`, is gone), commits 7; `a738c4` rejects 2, commits 3; `6f29ec`
+    rejects 1, commits 1; `3c34b5` rejects 7 of 16, commits 9 (the client's own retries after
+    dropping frames committed the same sets for `841022`, `00c7a1`, `a738c4`, `6f29ec`). Still
+    rejected whole: the probe `b70236` (one frame), `3f4cb8` (12 of 17 contradict, across
+    k000000-k000016 and the second version), `ab8c78` (9 of 17), and on `rev8_wheeled` the
+    pre-heading-fix looks `12e6e9`, `fc947b` (12 of 16, ratios down to 0.0-0.3): must-still-
+    reject, as wanted. No keyframe would be marked: in `3f4cb8` only one of k000014's four
+    contradictors fails no other keyframe; in `ab8c78` two contradict k000013 alone (hence 3).
+  * *Replays*: `rev8_wheeled2` replayed by version is identical (31 frames, statuses and poses
+    to 1e-6; no failing pair). `rev8_wheeled` replayed: version 4's look (5 frames) failed
+    whole at 7cc680c on `020026007_0007` against `015503954_0015` (0.816); now that frame is
+    rejected alone, the re-run keeps `0008` at its prior (it had registered through `0007`),
+    and 2 commit; version 5's (9 frames) stays rejected whole (most contradict). With
+    k000014 turned −2.5° after the first look, the second version's 3 frames commit 2 and
+    reject `020529579_0002` (0.802); turned ±5°, two of three contradict: rejected whole. All
+    later 14 frames in one job against k000014 turned −5°: 2 rejected, the rest as before
+    (7cc680c: the whole job). Only two later views see k000014's view, so no mark.
+  * *Monocular replays* (one keyframe per job, through `AnchoredMap.update`): e305 11/22, e205
+    2/21, j3 10/25, j5 33/40, j6 19/39, statuses, poses and k identical to 7cc680c (no sensor
+    depth: nothing is paired).
 * **Two-view parallax on repeating textures** (map.md §1 "Two-view parallax";
   `standpoint.turn_parallax`). A turn in place satisfies every essential matrix, so on a
   repeating wall texture the largest epipolar consensus of an adjacent turn takes the walls'

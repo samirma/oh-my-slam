@@ -161,6 +161,13 @@ def parse_multipart(content_type: str, data: bytes) -> dict[str, bytes]:
     return parts
 
 
+def suspect_version(f: dict[str, Any]) -> dict[str, Any]:
+    """A frames read entry's ``depth_suspect_version`` (oms/2.16, map.md §4): the version that
+    marked the keyframe suspect, when one did."""
+    got = f.get("depth_suspect")
+    return {} if not got else {"depth_suspect_version": int(got["version"])}
+
+
 def _rotation_ok(T: list[list[float]]) -> bool:
     M = np.asarray(T, np.float64)
     R = M[:3, :3]
@@ -520,7 +527,8 @@ class Api:
                 "added_version")
         return body({"map": name, "map_version": v["version"],
                      "scale_source": v["scale_source"], "scale_sigma_rel": v["scale_sigma_rel"],
-                     "frames": [{k: f[k] for k in keys} for f in v["frames"]]})
+                     "frames": [{**{k: f[k] for k in keys}, **suspect_version(f)}
+                                for f in v["frames"]]})
 
     def _derived(self) -> Derived:
         assert self.s.derived is not None, "the service derives versions (main.serve)"

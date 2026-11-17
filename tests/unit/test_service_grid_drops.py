@@ -47,7 +47,7 @@ def _cell(g: dict[str, Any], x: float, y: float) -> tuple[int, int]:
 
 def test_the_room_floor_past_the_top_is_occupied_as_a_drop(top_map: Nav) -> None:
     g = top_map.get("/api/maps/top/grid", "Grid")
-    assert g["schema"] == schema.SCHEMA_VERSION == "oms/2.15"
+    assert g["schema"] == schema.SCHEMA_VERSION == "oms/2.16"
     assert g["blind_disc"] == "full"  # the default, echoed
     assert g["floor_z_m"] == pytest.approx(0.0, abs=0.01)  # the top: where the priors' origin is
     state, floor, height, past = _layers(g)

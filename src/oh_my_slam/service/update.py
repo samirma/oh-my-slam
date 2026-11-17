@@ -1430,6 +1430,7 @@ class Updater:
             "rotation_pairs": list(rotation_pairs or []),
             # the depth-consistency limit is not the older mapper's (map.md §4, P30)
             "depth_pairs": [],
+            "suspect_keyframes": [],
             "drift_correction": mapper_drift_correction(frames, drift_sim),
             "prior_residuals": prior_res, "previous_residuals": prev_res,
             "rejected_share": round(rejected / len(frames), 4),

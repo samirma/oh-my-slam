@@ -215,6 +215,7 @@ def dry_run(up: Updater, w: UpdateWork) -> dict[str, Any]:
         "floor_inconsistent": floors,
         "rotation_pairs": rotation_pairs,
         "depth_pairs": depth_rows,
+        "suspect_keyframes": [] if am is None else standpoint.suspect_keyframes(am),
         "drift_correction": drift,
         "prior_residuals": residual_stats(prior_res),
         "previous_residuals": residual_stats([(0.0, 0.0)] * len(prev["frames"])) if prev
@@ -367,6 +368,8 @@ def _frame(fr: _Frame, neighbours: list[dict[str, Any]], pl: Placement | None, a
                                                 and pl.scene_m < TOO_CLOSE_M)
         if reason == "duplicate" and status == "rejected":
             row["duplicate_of"] = pl.duplicate_of or fr.work.name
+        if reason == "depth_inconsistent":  # oms/2.16 (map.md §4 "Resolution")
+            row["depth_inconsistent_with"] = list(pl.depth_with)
         if reason == "too_close" and status != "registered":
             row["min_distance_m"] = TOO_CLOSE_M
             row["scene_distance_m"] = round(pl.scene_m or fr.scene_m or 0.0, 3)

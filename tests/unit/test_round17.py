@@ -328,7 +328,8 @@ def test_depth_pairs_pieces() -> None:
     assert got and all(not p.fails for p in got)
     rows = [p.row() for p in got]
     assert {(r["a"], r["b"]) for r in rows} >= {("f0", "f1"), ("f1", "f2")}
-    assert all(set(r) == {"a", "b", "agree_ratio_ab", "agree_ratio_ba", "fails"} for r in rows)
+    assert all(set(r) == {"a", "b", "agree_ratio_ab", "agree_ratio_ba", "fails", "outcome"}
+               for r in rows)
     # f3 committed 90 deg off about its own centre: it contradicts the views it now overlaps
     R = an.exp_so3(np.array([0.0, 0.0, np.radians(-90.0)])) @ POSES[3][:3, :3]
     off = [*truth[:3], (_kf("f3", an.pose(R, POSES[3][:3, 3])), (z[3], K))]
@@ -371,6 +372,9 @@ def test_depth_consistency_pairs_registered_sensor_frames_only(tmp_path: Any) ->
     more = am.update([frame("c", base_pose(30.0)), frame("m", base_pose(20.0), depth=False)])
     bad, rows = sp.depth_consistency(am, more)
     assert not bad and {(r["a"], r["b"]) for r in rows} == {("a", "c"), ("b", "c")}
+    # the job's resolution rows (oms/2.16) are reported with its committed poses' pairs
+    assert sp.depth_consistency(am, [])[1] == rows
+    am.depth_rows = {}
     assert sp.depth_consistency(am, []) == (False, [])
     kept = dataclasses.replace(pls[0], status="kept_at_prior")
     assert sp.depth_consistency(am, [kept]) == (False, [])

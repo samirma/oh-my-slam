@@ -566,7 +566,10 @@ Part of the [high-level specification](../high_level_spec.md) (§5). Field names
   * Only image-confirmed keyframes are registration references for new
     frames; `kept_at_prior` frames of earlier versions are not, nor are frames that end the job
     kept. Within a job, a job frame counts as an edge once it is registered (match graph,
-    below).
+    below). A keyframe marked suspect by the depth-consistency limit (oms/2.16, §4) is no
+    reference either, from the round of the job that marks it on: not for new frames,
+    re-registration, the pose-duplicate pass, a body link's `from` frame or MapAnything's
+    anchors. Its pose and content stay (§4).
   * **A `floor_not_judged` keyframe as a reference** (oms/2.6). An image-confirmed keyframe whose
     `detail` is `floor_not_judged` (its own depth scale lay beyond the monocular scale bound,
     above) stays a registration reference for image matching and pose. Its pose is trusted, its
@@ -897,7 +900,19 @@ becomes a job with a `job_id`. A job goes through these states:
     fewer than the depth confirmation's minimum count of such points; and whether the pair
     failed the limit. Empty when the limit evaluated no pair (no sensor depth, or the older
     mapper). On a `depth_inconsistent` rejection it shows which frames contradict each other,
-    so a client can drop or retake them;
+    so a client can drop or retake them. Since oms/2.16 it lists every pair of every round of
+    the resolution (below; a pair evaluated in several rounds as last evaluated), the pairs of
+    frames rejected `depth_inconsistent` included, and each row carries `outcome`: null for a
+    pair that passes; `frame_rejected` (a frame of it was rejected `depth_inconsistent`, or no
+    longer registered after a re-run),
+    `keyframe_suspect` (it involves a keyframe this job marked suspect) or `update_rejected`
+    (the hard limit rejected the update) for a failing pair;
+  * `suspect_keyframes` (oms/2.16): one `{name, contradicted_by}` per stored keyframe the job
+    marked suspect (below, Depth consistency), `contradicted_by` the frames that supported the
+    mark, each `{name, agree_ratio_keyframe, agree_ratio_frame}`: the agreeing share of the
+    keyframe's depth points seen by the frame and of the frame's seen by the keyframe (as
+    `depth_pairs`' ratios, null below the minimum count). Empty when none; a dry run predicts
+    it;
   * `reregistered`: one `{name, displacement_m, displacement_deg}` per stored `kept_at_prior`
     frame this job's images confirmed (§2): how far confirmation moved the frame from its
     prior-placed pose. Empty when there are none; a dry run predicts it. This movement is not
@@ -940,13 +955,18 @@ becomes a job with a `job_id`. A job goes through these states:
       joint solve. It uses the pair's images, its depth images when both frames carry them,
       and the cycle-consistency rule (§1, Measurable pair), nothing else.
   * **Depth consistency** (every update whose frames carry sensor depth images, with or without
-    priors: wide drifting priors do not exclude a 90° lattice pose): a hard limit rejects the
-    update, `failed_checks` holding `depth_inconsistent`, when two committed views contradict
-    each other's depth images. A dry run predicts it, as it does the other limits.
+    priors: wide drifting priors do not exclude a 90° lattice pose): two committed views must
+    not contradict each other's depth images. Since oms/2.16 a contradiction rejects the new
+    frames that cause it (`rejected`, reason `depth_inconsistent`, api.md §4), or marks a
+    stored keyframe suspect, and the rest of the update commits; the hard limit rejects the
+    whole update, `failed_checks` holding `depth_inconsistent`, only where no consistent part
+    of it remains (Resolution, below). A dry run predicts all of it, as it does the other
+    limits.
     * The pairs: the update's registered (image-confirmed) frames with each other and with the
       stored image-confirmed keyframes, where both carry sensor depth images and the two can
       share a view under their committed poses (the test is in `README.md`). A frame kept at
-      its prior without image confirmation is not paired.
+      its prior without image confirmation is not paired, nor is a stored keyframe marked
+      suspect by an earlier version (below).
     * Each view's depth points are mapped into the other under the pair's **committed**
       relative pose (§1, Depth agreement). A point is a contradiction only when the other view
       would see through it by more than the depth tolerance of the depth confirmation (a
@@ -966,6 +986,76 @@ becomes a job with a `job_id`. A job goes through these states:
       remains the accepted degenerate case.
     * Every engine but the older mapper (§1, Every engine), whose registrations are not
       depth-gated.
+    * **Resolution** (oms/2.16). The pairs are evaluated at the job's registration fixed point
+      (both engines' frames placed, before the job's fusion), in rounds; a pair that involves
+      a keyframe marked suspect in this job (below) counts for no rejection. One round:
+      1. The suspect test (below) runs on every stored keyframe.
+      2. A failing pair of a new frame with a stored keyframe rejects that new frame. Only in a
+         round with no such pair, a failing pair of two new frames rejects both: the stored
+         map is the reference, and between two new frames nothing tells which is wrong.
+      3. A new frame whose registration references (the keyframes its image pose rests on)
+         are all frames that step 2 rejected depends on them: it is rejected too, repeatedly
+         until none is left.
+      4. Each frame rejected in steps 2-3 is `rejected`, reason `depth_inconsistent`, naming in
+         `depth_inconsistent_with` the frames it contradicts or depends on (api.md §4).
+      5. When a round rejected a frame or changed a mark, the job's registration runs again
+         from the job's start (as a pose-duplicate re-run does, §2 Match graph step 6), the
+         rejected frames forced to their rejection and the keyframes marked suspect left out of
+         the references, and the next round evaluates its result: removing frames can change
+         the others' poses. A round that changes nothing ends the resolution.
+      Every decision is a function of the set of pairs and of each frame's references, frames
+      named in canonical order, so the outcome does not depend on the request's order. At most
+      `DEPTH_RESOLVE_RUNS` re-runs (`README.md`) follow the first registration.
+    * **Whole-update rejection.** No consistent part of the update remains, and the hard limit
+      rejects it (`failed_checks` `depth_inconsistent`, nothing committed, every frame keeping
+      its status as resolved), when:
+      * the frames rejected `depth_inconsistent` are more than `DEPTH_REJECT_MAX_SHARE`
+        (`README.md`: half) of the update's frames that registered with a sensor depth image in
+        its first registration: a sequence registered through a lattice pose is most of its
+        update, and what remains of it would be the lattice pose's own frames; or
+      * a failing pair that involves no suspect keyframe remains after the last re-run, or on
+        the committed poses at the job's end.
+      A one-frame update whose frame fails is rejected whole: the empty set is its only
+      consistent part. Frames rejected in an update that commits are not part of the version.
+    * **Suspect stored keyframes** (oms/2.16). A stored keyframe (image-confirmed in the base
+      version, with a sensor depth image, not re-registered in this job) is marked **suspect**
+      instead of rejecting the new frames that contradict it when at least
+      `SUSPECT_MIN_FRAMES` (`README.md`: 3) of the update's frames each:
+      * fail their pair with it;
+      * are anchored in the stored map: one of their registration references is another stored
+        keyframe (not suspect) whose pair with the frame agrees;
+      * agree with a stored keyframe they were never measured against: another stored keyframe
+        (not suspect) that is not among their registration references, whose pair with the
+        frame agrees. A sequence registered through a lattice pose agrees with the references
+        it was measured against and contradicts the frames it was not (above): this is the
+        agreement it cannot give, so floating or lattice-registered frames cannot outvote a
+        true keyframe;
+      * fail no pair with any other stored keyframe that is not suspect;
+      and no two of those frames fail their pair with each other. A pair *agrees* when it does
+      not fail and at least the minimum count of points agree or contradict in one direction.
+      Several stored keyframes may be marked in one round; a frame that fails pairs with two of
+      them supports neither. A keyframe marked in an earlier round of the job whose test no
+      longer holds is unmarked and is not marked again in that job, so the rounds end.
+      * Its pairs in this job reject nothing (`quality.depth_pairs` `outcome`
+        `keyframe_suspect`); the job reports it in `quality.suspect_keyframes` with the
+        frames that contradicted it (api.md §4).
+      * The mark is part of the version the job commits (versions are immutable: the base
+        version keeps the keyframe unmarked) and of the mapper's store; a revert to an earlier
+        version returns to that version's marks. It is never removed by a later update, and the
+        keyframe is never deleted.
+      * From then on the keyframe is not paired by the depth-consistency limit, and it is no
+        registration reference: not for new frames, re-registration, the pose-duplicate pass,
+        a body link's `from` frame (`body_link.reason` `from_unconfirmed`), MapAnything's
+        anchors, nor locate (api.md §6).
+      * Its pose, sigmas and content stay: its cloud points, grid evidence, heights, objects
+        and detection votes. Its content was fused when it agreed with every keyframe it was
+        paired with; the likely causes of a later contradiction (a scene change, a
+        view-dependent depth artefact such as glass, a pose slightly off within its sigmas on
+        thin structures) concern part of its view, while removing it would drop the rest of
+        its view and rebuild the fusion. The new frames that contradicted it commit, and their
+        newer content enters the fusion beside it under the usual rules (free space seen
+        through, objects moved or struck, §5, §6). The mark tells a client which view to
+        retake; a retaken view is never a pose duplicate of a suspect keyframe.
   * Pair limits (rotation consistency and any other limit on pairs of frames) are measured on
     registered frames only, over measurable pairs (§1: at least 100 epipolar inliers,
     depth-confirmed where both frames carry depth and consistent with the chain of stronger

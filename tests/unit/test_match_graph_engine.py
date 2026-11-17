@@ -204,10 +204,14 @@ def test_a_kept_frame_re_registers_in_the_same_job(tmp_path: Path) -> None:
     assert m4.reregistered == [] and not m4.keyframes[1].usable()
 
 
-def test_the_height_gate_keeps_a_registered_frame_out_of_content(tmp_path: Path) -> None:
+def test_the_height_gate_keeps_a_registered_frame_out_of_content(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """map.md §2: a frame whose committed camera height disagrees with the one sent by more than
     3 × sqrt(height_sigma² + σ_z²) stays registered (a reference) but adds nothing to the
-    cloud, and is listed in ``height_inconsistent``."""
+    cloud, and is listed in ``height_inconsistent``. (Its committed pose, 0.3 m high, also
+    contradicts the others' depth: since oms/2.16 the depth-consistency resolution would reject
+    it ``depth_inconsistent``, map.md §4; left out here, the gate is the subject.)"""
+    monkeypatch.setattr(AnchoredMap, "plan_depth_rerun", lambda self, pls: False)
     m = new_map(tmp_path)
     m.update([frame("a0", base_pose(0), height=0.5)])
     n = len(m.cloud.keys)

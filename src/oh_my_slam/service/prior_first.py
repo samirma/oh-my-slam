@@ -151,7 +151,8 @@ class _MaRun:
                                      k.depth_kind == "sensor" and k.lifts(),
                                      functools.partial(am.ignore_of, k.id))
                   for i, k in enumerate(am.keyframes)
-                  if k.state == "fused" for img in [am.image_path(k.id)] if img is not None]
+                  # a suspect keyframe is no anchor (map.md §2, §4, oms/2.16)
+                  if k.reference() for img in [am.image_path(k.id)] if img is not None]
         if not stored:  # nothing confirmed to register against (a camera-only map, no origin)
             for fr in self.frames:
                 self.got[fr.work.index] = Placement(fr.work.name, "rejected", "no_overlap")
@@ -485,6 +486,8 @@ def _input(fr: _Frame, pl: Placement | None, am: AnchoredMap | None = None) -> d
     got = stereo_scale(k)
     if got is not None:
         row["stereo_scale"] = got
+    if pl.reason == "depth_inconsistent":  # oms/2.16 (map.md §4 "Resolution")
+        row["depth_inconsistent_with"] = list(pl.depth_with)
     link = body_link(fr, pl, am)
     if link is not None:
         row["body_link"] = link
@@ -746,7 +749,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                 job_pls = [placements[fr.work.index] for fr in todo
                            if fr.work.index in placements]
                 if not am.plan_drift_rerun(ins, [placements[fr.work.index] for fr in geo]) \
-                        and not am.plan_rerun(job_pls):
+                        and not am.plan_rerun(job_pls) and not am.plan_depth_rerun(job_pls):
                     break
                 # once more from the job's start, without what the plan leaves out
                 am.job_restart(start)
@@ -845,6 +848,10 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
                          "floor_inconsistent": k.floor_withheld()})
             continue
         row = r if k is None else {**r, "T_map_cam": k.T.tolist()}
+        if k is not None and k.suspect is not None and "depth_suspect" not in row:
+            # marked suspect by this job's depth consistency (map.md §4, oms/2.16): part of
+            # the version it commits
+            row = {**row, "depth_suspect": {"version": version, **k.suspect}}
         shifts.append(pose_residual(np.asarray(row["T_map_cam"]), np.asarray(r["T_map_cam"])))
         rows.append(row)
     for fr, pl in kept:
@@ -904,6 +911,7 @@ def run_anchored(up: Updater, job: Job, w: UpdateWork, frames: list[_Frame],
         "floor_inconsistent": [] if am is None else list(am.floor_inconsistent),
         "rotation_pairs": rotation_pairs,
         "depth_pairs": depth_rows,
+        "suspect_keyframes": [] if am is None else standpoint.suspect_keyframes(am),
         "drift_correction": job_drift_correction(
             am if am is not None or prev is None or not up.store.mapper_dir(w.map).exists()
             else AnchoredMap.load(up.store.mapper_dir(w.map)), frames),
