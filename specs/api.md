@@ -600,12 +600,12 @@ The versions read, revert and `--keep-versions` are O2.
   | `T_map_cam`, `sigma_pos_m`, `sigma_rot_deg` | The pose and its uncertainty. The sigmas describe the chosen hypothesis only, not the spread of rivals; they include the image-registration noise, calibrated so that `locate.sigma_containment` (evaluation.md) is met. |
   | `inlier_ratio` | The share of inliers. |
   | `ambiguity` | `{pos_m, rot_deg}` of the strongest supported rival, or null; see below. |
-  | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. |
+  | `rivals` | `[{pos_m, rot_deg, support}]`, every supported rival; empty when none. Since oms/2.17 each entry of a frame sent with a prior also carries `outside_prior` (Ambiguity, below); `ambiguity` repeats it. |
   | `consistent_with_prior` | Null without a prior; always true for a located frame with a prior (see below). |
   | `height_consistent` | With a camera-height scale (see below): whether the located camera height agrees with the expected one within 3 sigma; null otherwise. |
   | `prior_residual_m`, `prior_residual_deg` | Optional (oms/2.13). The located pose against the frame's prior as sent; null without a prior or a pose. |
   | `inlier_floor_share` | Optional (oms/2.13). The share of the located pose's inliers that are floor points (Floor points, below); null for a turn fit, without a pose or without a map floor. |
-  | `depth_check` | Optional (oms/2.17). Present only when the frame sent `depth`: `{pose, refused}` (Query depth, below). `pose` is `confirmed` or `untested` for the reported pose, null without a pose; `refused` counts the distinct hypotheses the depth refused. Absent for a frame without depth. |
+  | `depth_check` | Optional (oms/2.17). Present only when the frame sent `depth`: `{pose, refused}` (Query depth, below). `pose` is `confirmed` or `untested` for the reported pose, null without a pose; `refused` counts the distinct hypotheses the depth refused, those within the rival tolerance (0.10 m and 5°) of each other counting once. Absent for a frame without depth. |
 
 * **With a prior.** The reported pose is the hypothesis nearest the prior among those with
   support at least 0.25, nearest by hypot(dp / sqrt(σp² + σh,p²), dr / sqrt(σr² + σh,r²)): the
@@ -673,9 +673,12 @@ The versions read, revert and `--keep-versions` are O2.
     left the hypothesis is untested;
   * between confirmed hypotheses the depth tells which pose the scene is, as the parallax does
     for translational twins in registration (map.md §1): each is measured against every
-    reference that decided one of them, its agreement the lowest ratio over the pairs' ways
-    that measure at least `MIN_AGREEING` points, and one whose agreement falls short of the best
-    one's by more than a margin (`README.md`, 0.05) is refused too. On a tiled wall the twin
+    reference that decided (confirmed) one of the confirmed hypotheses, its agreement the lowest
+    ratio over the pairs' ways that measure at least `MIN_AGREEING` points (agreeing or
+    contradicting; a way measuring fewer is left out, so a reference that measures neither way
+    of the hypothesis is out of its score, which is over the references that do measure it; with
+    none it has no score and is kept), and one whose agreement falls short of the best score by more
+    than a margin (`README.md`, 0.05) is refused too. On a tiled wall the twin
     shifted by one tile agrees at about 0.9, the true pose at 1.0;
   * a refused hypothesis is no hypothesis: it is neither the reported pose nor a rival, nor the
     best hypothesis that support is counted against. When every hypothesis is refused the frame
@@ -731,6 +734,15 @@ The versions read, revert and `--keep-versions` are O2.
     rival: only the strongest of them is listed.
   * So a supported rival 0.2 m away is never silent, nor is the 90° flip of a symmetric room.
     The client then asks for a second frame.
+  * **Outside the prior** (oms/2.17). For a frame sent with a prior, each `rivals` entry (and
+    `ambiguity`) carries `outside_prior`: true when the rival lies outside the prior's conflict
+    bound, the bound of a prior conflict in updates (§4, Choosing a status) and of the reported
+    pose (With a prior, above): 3 × sqrt(σ_prior² + σ_rival²), position and rotation tested
+    separately (pitch and roll against the prior's `sigma_tilt_deg` when it gives one), with the
+    prior's sigmas (its trust's defaults when it sent none) and the rival's own calibrated
+    sigmas (a turn fit's: its standpoint's position sigma and its own rotation sigma). The rival
+    is listed all the same: the flag tells the client which rivals its prior already excludes.
+    Absent without a prior.
 * **Reasons.**
   * `depth_inconsistent` (oms/2.17): the frame's depth refused every hypothesis (Query depth).
   * `few_features`: the frame has fewer keypoints than a pose needs inliers, counted as

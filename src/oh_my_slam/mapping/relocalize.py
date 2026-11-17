@@ -446,11 +446,11 @@ class Outcome:
     sigma_rot_deg: float | None = None
     inlier_ratio: float | None = None
     inliers: int = 0
-    ambiguity: dict[str, float] | None = None
+    ambiguity: dict[str, Any] | None = None
     consistent_with_prior: bool | None = None
     method: str = ""
     reason: str | None = None  # "prior_conflict": no supported hypothesis agrees with the prior
-    rivals: list[dict[str, float]] = field(default_factory=list)  # strongest first
+    rivals: list[dict[str, Any]] = field(default_factory=list)  # strongest first
     nearest: int | None = None  # keyframe index most similar by votes (for no_overlap)
     votes: NDArray[np.int64] = field(default_factory=lambda: np.zeros(0, np.int64))
     height_sigma_m: float | None = None  # the height_sigma its height test used (``z_sigma``)
@@ -772,14 +772,16 @@ def choose(q: Query, poses: Sequence[Array], inliers: Sequence[int],
     return max(level or sup, key=lambda k: (inliers[k], -k))
 
 
-def rivals_of(T: Array, poses: Sequence[Array], inliers: Sequence[int], best: int
-              ) -> list[dict[str, float]]:
+def rivals_of(T: Array, poses: Sequence[Array], inliers: Sequence[int], best: int,
+              outside: Sequence[bool] | None = None) -> list[dict[str, Any]]:
     """The supported rivals of the reported pose ``T`` (api.md §6), strongest first: the
     hypotheses farther than ``RIVAL_POS_M`` or ``RIVAL_ROT_DEG`` from it with support (inliers
     over ``best``, the best hypothesis's) at least ``SUPPORT_MIN``, whatever else their inliers
     explain. Hypotheses within that distance of a stronger rival are that rival again (the same
-    solve from other keyframes) and are listed once."""
-    out: list[dict[str, float]] = []
+    solve from other keyframes) and are listed once. With ``outside`` (a frame with a prior:
+    per hypothesis, whether it lies outside the prior's conflict bound, ``outside_prior``) each
+    entry says so (api.md §6, oms/2.17)."""
+    out: list[dict[str, Any]] = []
     kept: list[Array] = []
     for k in sorted(range(len(poses)), key=lambda k: (-inliers[k], k)):
         if best <= 0 or inliers[k] < SUPPORT_MIN * best:
@@ -792,7 +794,20 @@ def rivals_of(T: Array, poses: Sequence[Array], inliers: Sequence[int], best: in
         kept.append(poses[k])
         out.append({"pos_m": round(dp, 4), "rot_deg": round(dr, 3),
                     "support": round(min(inliers[k] / best, 1.0), 4)})
+        if outside is not None:
+            out[-1]["outside_prior"] = bool(outside[k])
     return out
+
+
+def outside_prior(q: Query, poses: Sequence[Array], sig: Sequence[tuple[float, float]]
+                  ) -> list[bool] | None:
+    """Per hypothesis (its calibrated sigmas ``sig``), whether it lies outside the frame's
+    prior's conflict bound (``within_prior``: ``K_SIGMA`` x sqrt(σ_prior² + σ_hypothesis²),
+    position and rotation each, the bound of api.md §4 "Choosing a status"); None without a
+    prior (api.md §6 ``rivals[].outside_prior``, oms/2.17)."""
+    if q.prior is None:
+        return None
+    return [not within_prior(q, T, s) for T, s in zip(poses, sig, strict=True)]
 
 
 def _same_pose(A: Array, B: Array) -> bool:
@@ -916,9 +931,11 @@ def locate(q: Query, index: Index) -> Outcome:
         if not within_prior(q, main.T, (sp, sr)) or not (standing(main)
                                                          or confirms(q, main.T, (sp, sr))):
             main, (sp, sr) = cands[k], sig[k]
-        others = [h for h in hyps if h is not cands[k]]
+        rest = [j for j, h in enumerate(hyps) if h is not cands[k]]
+        others = [hyps[j] for j in rest]
         best = max([main.inliers, *(h.inliers for h in others)])
-        out.rivals = rivals_of(main.T, [h.T for h in others], [h.inliers for h in others], best)
+        out.rivals = rivals_of(main.T, [h.T for h in others], [h.inliers for h in others], best,
+                               outside_prior(q, [h.T for h in others], [every[j] for j in rest]))
         out.inliers = main.inliers
         out.inlier_ratio = round(main.inliers / int(np.unique(iq).size), 4)
         out.method = "points"
@@ -1048,8 +1065,8 @@ def _finish(q: Query, o: Outcome) -> Outcome:
     """A located outcome's prior agreement (true: ``choose`` keeps only poses within the
     combined conflict bound) and its ambiguity, the strongest rival."""
     o.consistent_with_prior = None if q.prior is None else True
-    o.ambiguity = None if not o.rivals else {"pos_m": o.rivals[0]["pos_m"],
-                                             "rot_deg": o.rivals[0]["rot_deg"]}
+    o.ambiguity = None if not o.rivals else {k: v for k, v in o.rivals[0].items()
+                                             if k != "support"}
     return o
 
 
@@ -1069,7 +1086,10 @@ def plausible(h: Hypothesis, kfs: NDArray[np.int64], index: Index) -> bool:
 
 
 def _with_votes(o: Outcome, base: Outcome) -> Outcome:
+    """A turn fit's outcome with what the frame's points stage found: its votes, nearest
+    keyframe and the hypotheses its depth refused (oms/2.17)."""
     o.votes, o.nearest = base.votes, base.nearest
+    o.depth_refused = base.depth_refused
     return o
 
 
@@ -1295,7 +1315,8 @@ def _turn(q: Query, index: Index, iq: NDArray[np.int64], uv_k: NDArray[Any],
                   height_sigma_m=zs)
     others = [h for j, h in enumerate(hyps) if j != k]
     out.rivals = rivals_of(T, [h[0] for h in others], [h[1] for h in others],
-                           max(h[1] for h in hyps))
+                           max(h[1] for h in hyps),
+                           outside_prior(q, [h[0] for h in others], [(sp, h[2]) for h in others]))
     return _finish(q, out)
 
 

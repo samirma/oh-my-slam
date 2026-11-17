@@ -2232,6 +2232,14 @@ server.
     references' depth scale: the client saw two locates of a standing robot 0.9 m apart, both
     0.15 m and without ambiguity, on a camera-height map of monocular keyframes. The camera-height
     scale's term (above) is added after it.
+* **Outside the prior** (oms/2.17, `relocalize.outside_prior`). For a frame sent with a prior
+  every `rivals` entry, and `ambiguity`, carries `outside_prior`: whether that rival lies outside
+  the prior's conflict bound, `within_prior` (`sigmas.conflicts`), the bound that gates the
+  reported pose and an update frame's prior conflict: 3 × sqrt(σ_prior² + σ_rival²), position
+  and rotation each (pitch and roll by `sigma_tilt_deg` when given), the prior's sigmas or its
+  trust's defaults, the rival's own calibrated sigmas (a turn fit's: the standpoint's position
+  sigma, its own rotation sigma). Rivals are still all listed (api.md §6); on the smoke maps a
+  drifting 1 cm prior marks the ~1 m tile twins `outside_prior: true`. Absent without a prior.
 * **Rivals and ambiguity.** A rival is any other plausible hypothesis farther than **0.10 m** or
   **5°** from the reported pose (`RIVAL_POS_M`, `RIVAL_ROT_DEG`) with support ≥ 0.25, whatever
   else its inliers explain (`relocalize.rivals_of`). `rivals` lists them strongest first with
@@ -2272,15 +2280,23 @@ server.
     where a candidate pose without a confirmation is no placement): a locate answer is read-only,
     and "untested" is reported.
   * **Twins.** Between the confirmed hypotheses, each is measured again against every reference
-    that decided one of them (`agreement_over`: the lowest ratio over the pairs' ways measuring
-    ≥ 40 points), and one more than **`DEPTH_AGREEMENT_MARGIN` = 0.05** below the best is
-    refused. Measured on `smoke_9ca6a86_base` (below): a twin shifted one wall tile (1 m) agrees
+    that confirmed one of them (only references that decided a *confirmed* hypothesis; an
+    untested or refused one contributes none), `agreement_over`: the lowest ratio over the
+    pairs' ways measuring ≥ 40 points (agree + contradict). A way measuring fewer is left out, so
+    a reference that measures neither way of a hypothesis is out of that hypothesis's score,
+    which is over the references that do measure it; a hypothesis that no reference measures has
+    no score and is kept. One more than **`DEPTH_AGREEMENT_MARGIN` = 0.05** below the best score
+    is refused. Measured on `smoke_9ca6a86_base` (below): a twin shifted one wall tile (1 m) agrees
     at 0.90–0.93 with the reference that sees the doorway beside the wall, the true pose at 1.00
     with every reference; the registration threshold alone (0.90) left those twins standing.
     The rule relies on the map's references agreeing with each other's depth (map.md §4, the
     depth-consistency limit and suspect keyframes).
   * **Refused** hypotheses are dropped before the floor rule and the choice: not reported, not
-    rivals, not the support's base. All refused: `depth_inconsistent`.
+    rivals, not the support's base. All refused: `depth_inconsistent`. `depth_check.refused`
+    counts them as distinct poses at the rival tolerance (`relocalize.distinct`: within 0.10 m
+    and 5° of an earlier counted one, the same pose again). A turn fit (reached only when no
+    points fit was made, so nothing was refused) carries the count over as well
+    (`_with_votes`).
   * **Not done in oms/2.17.** Monocular references are not tested and the query depth measures
     no reference's scale (locate never writes the map; a monocular depth's scale is estimated,
     and the depth-consistency limit tests sensor pairs only for that reason). The located pose,
@@ -2291,7 +2307,10 @@ server.
   * **Index.** `locate.npz` keeps each sensor keyframe's depth on a grid of ≤ 160 per side
     (`relocalize.SENSOR_SIDE`, every s-th pixel; float16 metres, `s<i>`, with the marker
     `sensor`); an index written before oms/2.17 takes it from the version's mapper map while
-    that map is kept (`Derived._sensor_grids`), else its references test nothing.
+    that map is kept (`Derived._sensor_grids`), else its references test nothing. The sampled
+    pixel lies up to half a full-resolution pixel off its block's centre, at most 0.1 reduced
+    pixel at a stride of 4 to 5, against `K` resized to the grid: negligible next to the 10 %
+    depth tolerance.
   * `depth_check` `{pose, refused}` is answered only for a frame that sent depth, so a frame
     without one gets the same fields and values as before, `schema` aside (checked on `arch_e305` and `arch_e205`).
 * **Index.** The derivation worker builds each version's locate index, its nearest-neighbour

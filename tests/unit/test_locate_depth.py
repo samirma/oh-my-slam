@@ -427,3 +427,50 @@ def test_a_rival_planted_at_another_depth_through_the_service_index(
     res = app.locate("room", {"frames": [f]}, files)["frames"][0]
     assert res["status"] == "located" and res["depth_check"]["pose"] == "confirmed"
     assert math.isfinite(res["sigma_pos_m"])
+
+
+# -- outside the prior (api.md §6 "Ambiguity", oms/2.17) -------------------------------------------
+
+
+def _prior(q: rl.Query, pos: float, rot: float) -> rl.Query:
+    q.prior = TRUTH.copy()
+    q.prior_sigma_pos_m, q.prior_sigma_rot_deg = pos, rot
+    return q
+
+
+def test_each_rival_says_whether_the_prior_s_conflict_bound_excludes_it() -> None:
+    P, D = scene()
+    idx = index(P, D, BOX)
+    bare = rl.locate(query(P, D, AHEAD, None), idx)
+    assert bare.rivals and all("outside_prior" not in r for r in bare.rivals)
+    assert bare.ambiguity is not None and "outside_prior" not in bare.ambiguity
+    tight = rl.locate(_prior(query(P, D, AHEAD, None), 0.01, 1.0), idx)
+    assert tight.located and _near(tight, TRUTH)
+    assert [r["outside_prior"] for r in tight.rivals] == [True] * len(tight.rivals)
+    assert tight.ambiguity is not None and tight.ambiguity["outside_prior"] is True
+    assert set(tight.ambiguity) == {"pos_m", "rot_deg", "outside_prior"}
+    # the rivals are the same, only flagged; a prior wide enough holds the rival within its bound
+    assert [(r["pos_m"], r["support"]) for r in tight.rivals] == [
+        (r["pos_m"], r["support"]) for r in bare.rivals]
+    wide = rl.locate(_prior(query(P, D, AHEAD, None), 1.0, 30.0), idx)
+    assert wide.rivals and wide.rivals[0]["outside_prior"] is False
+
+
+def test_outside_prior_is_the_conflict_bound_and_rivals_of_carries_it() -> None:
+    q = rl.Query(np.zeros((0, 2), np.float32), np.zeros((0, 128), np.uint8), K, W, H)
+    assert rl.outside_prior(q, [TRUTH], [(0.01, 0.1)]) is None
+    _prior(q, 0.05, 2.0)
+    far = _shifted(TRUTH, np.array([0.3, 0.0, 0.0]))
+    near = _shifted(TRUTH, np.array([0.12, 0.0, 0.0]))
+    # 3 x hypot(0.05, 0.02) = 0.16 m: 0.12 m within, 0.3 m outside; the rival's own sigma widens it
+    assert rl.outside_prior(q, [near, far, far], [(0.02, 0.1), (0.02, 0.1), (0.2, 0.1)]) == [
+        False, True, False]
+    got = rl.rivals_of(TRUTH, [near, far], [10, 8], 10, [False, True])
+    assert [r["outside_prior"] for r in got] == [False, True]
+    assert "outside_prior" not in rl.rivals_of(TRUTH, [far], [8], 10)[0]
+
+
+def test_a_turn_fit_keeps_the_points_stage_s_refused_count() -> None:
+    base = rl.Outcome(votes=np.array([3, 1]), nearest=0, depth_refused=2)
+    got = rl._with_votes(rl.Outcome(T=TRUTH, method="turn"), base)
+    assert (got.depth_refused, got.nearest, list(got.votes)) == (2, 0, [3, 1])

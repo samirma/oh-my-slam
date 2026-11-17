@@ -2677,6 +2677,10 @@
                 },
                 "rot_deg": {
                   "type": "number"
+                },
+                "outside_prior": {
+                  "type": "boolean",
+                  "description": "oms/2.17. As rivals[0].outside_prior; absent without a prior."
                 }
               }
             },
@@ -2709,10 +2713,14 @@
                 "minimum": 0.25,
                 "maximum": 1,
                 "description": "Rival's inlier count over the best hypothesis's inlier count."
+              },
+              "outside_prior": {
+                "type": "boolean",
+                "description": "oms/2.17. Present only for a frame sent with a prior: whether this rival lies outside the prior's conflict bound, 3 x sqrt(sigma_prior^2 + sigma_rival^2) tested separately for position and rotation with the prior's sigmas (its trust's defaults when it sent none; its sigma_tilt_deg for pitch and roll) and the rival's own calibrated sigmas: the bound of a prior conflict in updates (api.md section 4, Choosing a status) and of the reported pose. Absent without a prior."
               }
             }
           },
-          "description": "Every supported rival (support >= 0.25, farther than 0.10 m or 5 deg), strongest first; empty when none. Rivals within 0.10 m and 5 deg of each other are de-duplicated: only the strongest is listed."
+          "description": "Every supported rival (support >= 0.25, farther than 0.10 m or 5 deg), strongest first; empty when none. Rivals within 0.10 m and 5 deg of each other are de-duplicated: only the strongest is listed. oms/2.17: each carries outside_prior when the frame was sent with a prior."
         },
         "consistent_with_prior": {
           "type": [
